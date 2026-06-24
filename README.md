@@ -240,6 +240,19 @@ cd /home/colin/work/actors/mesh
 cargo build --release --target wasm32-unknown-unknown
 ```
 
+### Unit tests
+
+```sh
+cargo test
+```
+
+Runs on the host (the crate is `#![cfg_attr(not(test), no_std)]`, so `std` is
+available under `cfg(test)` and the wasm guest bindings are gated out). Covers
+the pure logic — event encode/decode round-trips + signature checks
+(`event.rs`), DAG state derivation, validation rules, and finality/consensus
+(`dag.rs`), and the persistence round-trip (`codec.rs`). The two scenarios
+below exercise the live actor over TCP.
+
 ### Single-node smoke
 
 ```sh
@@ -275,10 +288,11 @@ mesh/
 ├── README.md           # you are here — current v2 spec
 ├── DESIGN.md           # the design conversation that led to v2
 ├── src/
-│   ├── lib.rs          # actor entry + connection state machine
-│   ├── event.rs        # event types, encoding, signing
+│   ├── lib.rs          # actor exports + init + connection/handshake logic
+│   ├── event.rs        # event types, canonical encoding, signing
 │   ├── dag.rs          # DAG storage, state derivation, finality, consensus
-│   ├── state.rs        # re-exports from dag.rs
+│   ├── conn.rs         # per-connection handshake state
+│   ├── codec.rs        # ActorState persistence (JSON) + hex helpers
 │   └── wire.rs         # frame format
 ├── smoke/              # single-node end-to-end test
 └── multi-node-test/    # two-mesh integration test

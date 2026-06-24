@@ -11,9 +11,8 @@
 //!   0x80 CHALLENGE   nonce[32]
 //!   0x81 ACCEPTED    state_hash[32]
 //!   0x82 REJECTED    utf8 error message
-//!   0x90 DELIVERED   event_bytes (a Send addressed to us)
+//!   0x90 DELIVERED   event_bytes (broadcast of any ingested event)
 //!   0x91 ACK         event_hash[32] + ok_byte + utf8 error if !ok
-//!   0x92 STATE       state_hash[32]                  (sent after any state change)
 
 use alloc::format;
 use alloc::string::String;
@@ -30,7 +29,6 @@ pub const FRAME_ACCEPTED: u8 = 0x81;
 pub const FRAME_REJECTED: u8 = 0x82;
 pub const FRAME_DELIVERED: u8 = 0x90;
 pub const FRAME_ACK: u8 = 0x91;
-pub const FRAME_STATE: u8 = 0x92;
 
 pub fn encode_frame(kind: u8, payload: &[u8]) -> Vec<u8> {
     let len = (payload.len() + 1) as u32;
@@ -51,10 +49,6 @@ pub fn encode_accepted(state_hash: &[u8; 32]) -> Vec<u8> {
 
 pub fn encode_challenge(nonce: &[u8; 32]) -> Vec<u8> {
     encode_frame(FRAME_CHALLENGE, nonce)
-}
-
-pub fn encode_state(state_hash: &[u8; 32]) -> Vec<u8> {
-    encode_frame(FRAME_STATE, state_hash)
 }
 
 pub fn encode_delivered(event_bytes: &[u8]) -> Vec<u8> {

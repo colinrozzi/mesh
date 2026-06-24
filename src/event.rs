@@ -118,25 +118,57 @@ impl Event {
     }
 
     pub fn decode(buf: &[u8]) -> Result<Self, String> {
-        if buf.len() < 32 + 32 + 1 + 64 {
-            return Err("event too short".to_string());
-        }
-        let mut pos = 0;
-        let mut parent = [0u8; 32];
-        parent.copy_from_slice(&buf[pos..pos + 32]);
-        pos += 32;
-        let mut author = [0u8; 32];
-        author.copy_from_slice(&buf[pos..pos + 32]);
-        pos += 32;
-        let kind = buf[pos];
-        pos += 1;
-        let op = decode_op_payload(kind, buf, &mut pos)?;
-        if buf.len() < pos + 64 {
-            return Err("event missing signature".to_string());
-        }
-        let mut signature = [0u8; 64];
-        signature.copy_from_slice(&buf[pos..pos + 64]);
+        let mut cur = Cursor::new(buf);
+        let parent = cur.take_array::<32>()?;
+        let author = cur.take_array::<32>()?;
+        let kind = cur.take(1)?[0];
+        let op = decode_op(kind, &mut cur)?;
+        let signature = cur.take_array::<64>()?;
         Ok(Event { parent, author, op, signature })
+    }
+}
+
+/// A forward-only reader over a byte slice with centralized bounds-checking,
+/// so the hand-rolled decoders below can't run off the end of the buffer.
+struct Cursor<'a> {
+    buf: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> Cursor<'a> {
+    fn new(buf: &'a [u8]) -> Self {
+        Cursor { buf, pos: 0 }
+    }
+
+    fn take(&mut self, n: usize) -> Result<&'a [u8], String> {
+        let end = self.pos.checked_add(n).ok_or("length overflow")?;
+        if end > self.buf.len() {
+            return Err(format!(
+                "unexpected end of input: need {} bytes at offset {}, have {}",
+                n,
+                self.pos,
+                self.buf.len() - self.pos
+            ));
+        }
+        let slice = &self.buf[self.pos..end];
+        self.pos = end;
+        Ok(slice)
+    }
+
+    fn take_array<const N: usize>(&mut self) -> Result<[u8; N], String> {
+        let mut out = [0u8; N];
+        out.copy_from_slice(self.take(N)?);
+        Ok(out)
+    }
+
+    fn take_u16(&mut self) -> Result<usize, String> {
+        let b = self.take(2)?;
+        Ok(u16::from_be_bytes([b[0], b[1]]) as usize)
+    }
+
+    fn take_u32(&mut self) -> Result<usize, String> {
+        let b = self.take(4)?;
+        Ok(u32::from_be_bytes([b[0], b[1], b[2], b[3]]) as usize)
     }
 }
 
@@ -164,76 +196,127 @@ fn encode_op_payload(op: &Op, out: &mut Vec<u8>) {
     }
 }
 
-fn decode_op_payload(kind: u8, buf: &[u8], pos: &mut usize) -> Result<Op, String> {
+fn decode_op(kind: u8, cur: &mut Cursor) -> Result<Op, String> {
     match kind {
+        // 0 = NodeIntroduce, 1 = MailboxCreate — same payload shape.
         0 | 1 => {
-            // NodeIntroduce | MailboxCreate — same payload shape
-            if buf.len() < *pos + 32 + 2 {
-                return Err("introduce/create truncated header".to_string());
-            }
-            let mut subject = [0u8; 32];
-            subject.copy_from_slice(&buf[*pos..*pos + 32]);
-            *pos += 32;
-            let name_len = u16::from_be_bytes([buf[*pos], buf[*pos + 1]]) as usize;
-            *pos += 2;
-            if buf.len() < *pos + name_len {
-                return Err("introduce/create truncated name".to_string());
-            }
-            let name = core::str::from_utf8(&buf[*pos..*pos + name_len])
-                .map_err(|_| "name not utf-8")?
+            let subject = cur.take_array::<32>()?;
+            let name_len = cur.take_u16()?;
+            let name = core::str::from_utf8(cur.take(name_len)?)
+                .map_err(|_| "name not utf-8".to_string())?
                 .to_string();
-            *pos += name_len;
             Ok(if kind == 0 {
                 Op::NodeIntroduce { subject, name }
             } else {
                 Op::MailboxCreate { subject, name }
             })
         }
-        2 => {
-            if buf.len() < *pos + 32 {
-                return Err("revoke truncated".to_string());
-            }
-            let mut subject = [0u8; 32];
-            subject.copy_from_slice(&buf[*pos..*pos + 32]);
-            *pos += 32;
-            Ok(Op::Revoke { subject })
-        }
+        2 => Ok(Op::Revoke {
+            subject: cur.take_array::<32>()?,
+        }),
         3 => {
-            if buf.len() < *pos + 32 + 4 {
-                return Err("send truncated header".to_string());
-            }
-            let mut recipient = [0u8; 32];
-            recipient.copy_from_slice(&buf[*pos..*pos + 32]);
-            *pos += 32;
-            let plen = u32::from_be_bytes([
-                buf[*pos], buf[*pos + 1], buf[*pos + 2], buf[*pos + 3],
-            ]) as usize;
-            *pos += 4;
-            if buf.len() < *pos + plen {
-                return Err("send truncated payload".to_string());
-            }
-            let payload = buf[*pos..*pos + plen].to_vec();
-            *pos += plen;
+            let recipient = cur.take_array::<32>()?;
+            let payload_len = cur.take_u32()?;
+            let payload = cur.take(payload_len)?.to_vec();
             Ok(Op::Send { recipient, payload })
         }
         4 => {
-            if buf.len() < *pos + 2 {
-                return Err("witness truncated header".to_string());
-            }
-            let count = u16::from_be_bytes([buf[*pos], buf[*pos + 1]]) as usize;
-            *pos += 2;
-            if buf.len() < *pos + count * 32 {
-                return Err("witness truncated also_cite".to_string());
-            }
+            let count = cur.take_u16()?;
             let mut also_cite = Vec::with_capacity(count);
             for _ in 0..count {
-                let mut h = [0u8; 32];
-                h.copy_from_slice(&buf[*pos..*pos + 32]);
-                *pos += 32;
-                also_cite.push(h);
+                also_cite.push(cur.take_array::<32>()?);
             }
             Ok(Op::Witness { also_cite })
         }
         _ => Err(format!("unknown op kind: {}", kind)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ed25519_dalek::{Signer, SigningKey};
+
+    fn key(seed: u8) -> SigningKey {
+        SigningKey::from_bytes(&[seed; 32])
+    }
+
+    fn signed(sk: &SigningKey, parent: Hash, op: Op) -> Event {
+        let author = sk.verifying_key().to_bytes();
+        let signing_hash = Event::signing_hash(&parent, &author, &op);
+        let signature = sk.sign(&signing_hash).to_bytes();
+        Event { parent, author, op, signature }
+    }
+
+    fn sample_ops() -> Vec<Op> {
+        alloc::vec![
+            Op::NodeIntroduce { subject: [2u8; 32], name: "node-b".to_string() },
+            Op::MailboxCreate { subject: [3u8; 32], name: "alice".to_string() },
+            Op::MailboxCreate { subject: [3u8; 32], name: String::new() }, // empty name
+            Op::Revoke { subject: [3u8; 32] },
+            Op::Send { recipient: [3u8; 32], payload: b"hello bob".to_vec() },
+            Op::Send { recipient: [3u8; 32], payload: Vec::new() }, // empty payload
+            Op::Witness { also_cite: alloc::vec![[4u8; 32], [5u8; 32]] },
+            Op::Witness { also_cite: Vec::new() }, // no citations
+        ]
+    }
+
+    #[test]
+    fn round_trips_and_verifies_every_op() {
+        let sk = key(1);
+        for op in sample_ops() {
+            let kind = op.kind_byte();
+            let ev = signed(&sk, [9u8; 32], op);
+            let bytes = ev.encode();
+            let decoded = Event::decode(&bytes).expect("decode");
+            // Re-encoding the decoded event must reproduce the exact bytes.
+            assert_eq!(decoded.encode(), bytes, "re-encode mismatch for kind {}", kind);
+            decoded.verify_signature().expect("signature verifies");
+        }
+    }
+
+    #[test]
+    fn decode_rejects_every_truncation() {
+        let sk = key(1);
+        let ev = signed(&sk, [0u8; 32], Op::Send { recipient: [3u8; 32], payload: b"abc".to_vec() });
+        let bytes = ev.encode();
+        for n in 0..bytes.len() {
+            assert!(Event::decode(&bytes[..n]).is_err(), "prefix of len {} should fail", n);
+        }
+        assert!(Event::decode(&bytes).is_ok(), "full bytes should decode");
+    }
+
+    #[test]
+    fn decode_rejects_unknown_op_kind() {
+        let sk = key(1);
+        let bytes = signed(&sk, [0u8; 32], Op::Revoke { subject: [3u8; 32] }).encode();
+        let mut bad = bytes.clone();
+        bad[64] = 0xff; // op_kind byte sits right after parent(32)+author(32)
+        assert!(Event::decode(&bad).is_err());
+    }
+
+    #[test]
+    fn tampered_signature_fails_verification() {
+        let sk = key(1);
+        let mut ev = signed(&sk, [0u8; 32], Op::Revoke { subject: [3u8; 32] });
+        ev.signature[0] ^= 0xff;
+        assert!(ev.verify_signature().is_err());
+    }
+
+    #[test]
+    fn wrong_author_fails_verification() {
+        let sk = key(1);
+        let mut ev = signed(&sk, [0u8; 32], Op::Revoke { subject: [3u8; 32] });
+        ev.author = key(2).verifying_key().to_bytes();
+        assert!(ev.verify_signature().is_err());
+    }
+
+    #[test]
+    fn event_hash_is_stable_and_distinct() {
+        let sk = key(1);
+        let a = signed(&sk, [0u8; 32], Op::Revoke { subject: [3u8; 32] });
+        let b = signed(&sk, [0u8; 32], Op::Revoke { subject: [4u8; 32] });
+        assert_eq!(a.event_hash(), a.event_hash());
+        assert_ne!(a.event_hash(), b.event_hash());
     }
 }
