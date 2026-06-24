@@ -1,0 +1,13 @@
+[package]
+name = "mesh-smoke"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "mesh-smoke"
+path = "src/main.rs"
+
+[dependencies]
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+sha2 = "0.10"
+rand = "0.8"

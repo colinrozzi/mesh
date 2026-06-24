@@ -1,0 +1,16 @@
+name = "mesh"
+version = "0.1.0"
+package = "/home/colin/work/actors/mesh/target/wasm32-unknown-unknown/release/mesh.wasm"
+static_package = true
+initial_state = '{"node_seed":"mesh-smoke-v1:root"}'
+
+[[handler]]
+type = "runtime"
+
+[[handler]]
+type = "tcp"
+
+[[handler]]
+type = "store"
+base_path = "/tmp/mesh-smoke-store"
+store_id = "mesh"

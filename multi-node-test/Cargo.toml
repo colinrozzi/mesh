@@ -1,0 +1,12 @@
+[package]
+name = "mesh-multi-node-test"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "mesh-multi-node-test"
+path = "src/main.rs"
+
+[dependencies]
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+sha2 = "0.10"
