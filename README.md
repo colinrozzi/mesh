@@ -286,7 +286,8 @@ mesh/
 ├── manifest.toml       # theater actor manifest (single-node default)
 ├── flake.nix           # nix build + dev shell
 ├── README.md           # you are here — current v2 spec
-├── DESIGN.md           # the design conversation that led to v2
+├── DESIGN.md           # the design conversation that led to v2 (history)
+├── DESIGN-v3.md        # next-version spec: self-rooted logs + state-machine substrate
 ├── src/
 │   ├── lib.rs          # actor exports + init + connection/handshake logic
 │   ├── event.rs        # event types, canonical encoding, signing

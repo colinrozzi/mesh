@@ -1,16 +1,12 @@
-//! mesh multi-node integration test.
+//! mesh v3 multi-node integration test.
 //!
-//! Spawns two mesh instances (Node A on :9447, Node B on :9448), each
-//! pre-admitting the other as a Node in genesis. Node B opens an outbound
-//! connection to Node A on startup. Then:
-//!
-//!   1. Test client connects to mesh A authenticated as Node A
-//!   2. Test client connects to mesh B authenticated as Node B
-//!   3. Test client (as A) submits Send(NodeB, "hello from A across the mesh")
-//!   4. Mesh A broadcasts DELIVERED → mesh B's outbound conn receives it
-//!   5. Mesh B ingests, broadcasts DELIVERED to its connections (including
-//!      the test client connected as B)
-//!   6. Test verifies the message arrived at the B-side client
+//! Spawns two member nodes (A on :9447, B on :9448), each knowing the other is
+//! a member; B dials A. Then:
+//!   1. test client authenticates to A as node A, and to B as node B
+//!   2. client (to A) SUBMITs a message
+//!   3. A authors it and gossips to B; B grafts it (witness) → it finalizes
+//!   4. B's committed delivery NOTIFYs the message to the B-side client
+//!   5. test verifies the message arrived cross-mesh
 
 use ed25519_dalek::{Signer, SigningKey};
 use sha2::{Digest, Sha256};
@@ -21,33 +17,25 @@ use std::time::{Duration, Instant};
 
 const FRAME_HELLO: u8 = 0x01;
 const FRAME_AUTH: u8 = 0x02;
-const FRAME_SUBMIT: u8 = 0x10;
+const FRAME_SUBMIT: u8 = 0x11;
 const FRAME_CHALLENGE: u8 = 0x80;
 const FRAME_ACCEPTED: u8 = 0x81;
-const FRAME_DELIVERED: u8 = 0x90;
 const FRAME_ACK: u8 = 0x91;
-const OP_SEND: u8 = 3;
-const GENESIS_PARENT: [u8; 32] = [0u8; 32];
+const FRAME_NOTIFY: u8 = 0x92;
 
 const THEATER_BIN: &str = "/home/colin/work/theater/target/release/theater";
 const MESH_DIR: &str = "/home/colin/work/actors/mesh";
-
 const ADDR_A: &str = "127.0.0.1:9447";
 const ADDR_B: &str = "127.0.0.1:9448";
 
-fn seeded_signing_key(seed: &str) -> SigningKey {
+fn seeded_key(seed: &str) -> SigningKey {
     let mut h = Sha256::new();
     h.update(seed.as_bytes());
-    let bytes: [u8; 32] = h.finalize().into();
-    SigningKey::from_bytes(&bytes)
+    SigningKey::from_bytes(&h.finalize().into())
 }
 
 fn hex(b: &[u8]) -> String {
-    let mut s = String::with_capacity(b.len() * 2);
-    for &x in b {
-        s.push_str(&format!("{:02x}", x));
-    }
-    s
+    b.iter().map(|x| format!("{:02x}", x)).collect()
 }
 
 fn encode_frame(kind: u8, payload: &[u8]) -> Vec<u8> {
@@ -68,31 +56,13 @@ fn read_frame(s: &mut TcpStream) -> std::io::Result<(u8, Vec<u8>)> {
     Ok((buf[0], buf[1..].to_vec()))
 }
 
-fn make_send_event(
-    signer: &SigningKey,
-    parent: &[u8; 32],
-    recipient: &[u8; 32],
-    body: &[u8],
-) -> Vec<u8> {
-    let author = signer.verifying_key().to_bytes();
-    let mut op_payload = Vec::new();
-    op_payload.extend_from_slice(recipient);
-    op_payload.extend_from_slice(&(body.len() as u32).to_be_bytes());
-    op_payload.extend_from_slice(body);
-    let mut h = Sha256::new();
-    h.update(parent);
-    h.update(&author);
-    h.update([OP_SEND]);
-    h.update(&op_payload);
-    let sig_hash: [u8; 32] = h.finalize().into();
-    let sig = signer.sign(&sig_hash).to_bytes();
-    let mut event = Vec::new();
-    event.extend_from_slice(parent);
-    event.extend_from_slice(&author);
-    event.push(OP_SEND);
-    event.extend_from_slice(&op_payload);
-    event.extend_from_slice(&sig);
-    event
+fn read_until(s: &mut TcpStream, kind: u8) -> std::io::Result<Vec<u8>> {
+    loop {
+        let (k, payload) = read_frame(s)?;
+        if k == kind {
+            return Ok(payload);
+        }
+    }
 }
 
 fn handshake(addr: &str, signer: &SigningKey) -> std::io::Result<TcpStream> {
@@ -100,14 +70,10 @@ fn handshake(addr: &str, signer: &SigningKey) -> std::io::Result<TcpStream> {
     s.set_read_timeout(Some(Duration::from_secs(5)))?;
     let pk = signer.verifying_key().to_bytes();
     s.write_all(&encode_frame(FRAME_HELLO, &pk))?;
-    let (kind, payload) = read_frame(&mut s)?;
-    assert_eq!(kind, FRAME_CHALLENGE, "expected CHALLENGE, got {:#x}: {}",
-        kind, String::from_utf8_lossy(&payload));
-    let sig = signer.sign(&payload).to_bytes();
+    let nonce = read_until(&mut s, FRAME_CHALLENGE)?;
+    let sig = signer.sign(&nonce).to_bytes();
     s.write_all(&encode_frame(FRAME_AUTH, &sig))?;
-    let (kind, payload) = read_frame(&mut s)?;
-    assert_eq!(kind, FRAME_ACCEPTED, "expected ACCEPTED, got {:#x}: {}",
-        kind, String::from_utf8_lossy(&payload));
+    read_until(&mut s, FRAME_ACCEPTED)?;
     Ok(s)
 }
 
@@ -164,48 +130,32 @@ store_id = "mesh-multi-node"
 }
 
 fn main() {
-    // Derive both Node keypairs.
-    let node_a = seeded_signing_key("mesh-multi-node-a-seed");
-    let node_b = seeded_signing_key("mesh-multi-node-b-seed");
+    let node_a = seeded_key("mesh-multi-node-a-seed");
+    let node_b = seeded_key("mesh-multi-node-b-seed");
     let pk_a = node_a.verifying_key().to_bytes();
     let pk_b = node_b.verifying_key().to_bytes();
     println!("Node A pubkey: {}", hex(&pk_a));
     println!("Node B pubkey: {}", hex(&pk_b));
 
-    // Build both init_state JSON blobs. Node A doesn't outbound-connect (waits);
-    // Node B opens an outbound connection to A once spawned.
+    // A knows B is a member but doesn't dial; B knows A and dials it.
     let init_a = format!(
-        r#"{{"node_seed":"mesh-multi-node-a-seed","listen_addr":"{addr}","peer_node_pubkeys":[{{"pubkey":"{pk_b}","name":"node-b"}}]}}"#,
+        r#"{{"node_seed":"mesh-multi-node-a-seed","listen_addr":"{addr}","members":["{pk_b}"]}}"#,
         addr = ADDR_A,
         pk_b = hex(&pk_b),
     );
     let init_b = format!(
-        r#"{{"node_seed":"mesh-multi-node-b-seed","root_pubkey":"{pk_a}","listen_addr":"{addr}","peer_node_pubkeys":[{{"pubkey":"{pk_b}","name":"node-b"}}],"peer_meshes":[{{"pubkey":"{pk_a}","address":"{addr_a}"}}]}}"#,
+        r#"{{"node_seed":"mesh-multi-node-b-seed","listen_addr":"{addr}","members":["{pk_a}"],"dial":[{{"pubkey":"{pk_a}","address":"{addr_a}"}}]}}"#,
         addr = ADDR_B,
         pk_a = hex(&pk_a),
-        pk_b = hex(&pk_b),
         addr_a = ADDR_A,
     );
 
-    // Clean up + write manifests.
     let _ = std::fs::remove_dir_all("/tmp/mesh-node-a-store");
     let _ = std::fs::remove_dir_all("/tmp/mesh-node-b-store");
-    write_manifest(
-        "/tmp/mesh-node-a-manifest.toml",
-        &init_a,
-        "/tmp/mesh-node-a-store",
-    );
-    write_manifest(
-        "/tmp/mesh-node-b-manifest.toml",
-        &init_b,
-        "/tmp/mesh-node-b-store",
-    );
+    write_manifest("/tmp/mesh-node-a-manifest.toml", &init_a, "/tmp/mesh-node-a-store");
+    write_manifest("/tmp/mesh-node-b-manifest.toml", &init_b, "/tmp/mesh-node-b-store");
 
-    // Spawn mesh A first; wait for it to listen.
-    let mut child_a = spawn_mesh(
-        "/tmp/mesh-node-a-manifest.toml",
-        "/tmp/mesh-node-a.log",
-    );
+    let mut child_a = spawn_mesh("/tmp/mesh-node-a-manifest.toml", "/tmp/mesh-node-a.log");
     if !wait_for_port(ADDR_A, Duration::from_secs(5)) {
         eprintln!("mesh A failed to listen");
         let _ = child_a.kill();
@@ -213,11 +163,7 @@ fn main() {
     }
     println!("✓ Node A listening on {}", ADDR_A);
 
-    // Spawn mesh B; it'll outbound-connect to A.
-    let mut child_b = spawn_mesh(
-        "/tmp/mesh-node-b-manifest.toml",
-        "/tmp/mesh-node-b.log",
-    );
+    let mut child_b = spawn_mesh("/tmp/mesh-node-b-manifest.toml", "/tmp/mesh-node-b.log");
     if !wait_for_port(ADDR_B, Duration::from_secs(5)) {
         eprintln!("mesh B failed to listen");
         let _ = child_a.kill();
@@ -226,67 +172,36 @@ fn main() {
     }
     println!("✓ Node B listening on {}", ADDR_B);
 
-    // Give B a moment to complete its outbound handshake.
-    std::thread::sleep(Duration::from_millis(500));
+    // Give B time to dial A and exchange genesis.
+    std::thread::sleep(Duration::from_millis(800));
 
     let result = (|| -> Result<(), String> {
-        // Connect test clients to both meshes.
         let mut client_a = handshake(ADDR_A, &node_a).map_err(|e| format!("handshake A: {}", e))?;
         println!("✓ test client authenticated to A as Node A");
         let mut client_b = handshake(ADDR_B, &node_b).map_err(|e| format!("handshake B: {}", e))?;
         println!("✓ test client authenticated to B as Node B");
+        client_b.set_read_timeout(Some(Duration::from_secs(8))).unwrap();
 
-        // Set a generous read timeout on B so we can wait for the cross-mesh
-        // delivery to arrive.
-        client_b.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-
-        // Submit a Send(Node B, "hello...") via client_a.
-        let payload = b"hello from A across the mesh";
-        let event = make_send_event(&node_a, &GENESIS_PARENT, &pk_b, payload);
-        client_a.write_all(&encode_frame(FRAME_SUBMIT, &event))
+        // SUBMIT a message (recipient is an app identity; here we just use pk_b).
+        let body = b"hello from A across the mesh";
+        let mut payload = pk_b.to_vec();
+        payload.extend_from_slice(body);
+        client_a.write_all(&encode_frame(FRAME_SUBMIT, &payload))
             .map_err(|e| format!("submit: {}", e))?;
-        let (kind, ack) = read_frame(&mut client_a).map_err(|e| format!("read ack: {}", e))?;
-        if kind != FRAME_ACK || ack[32] != 1 {
-            return Err(format!(
-                "submit not ACKed cleanly: kind={:#x} ok={}: {}",
-                kind,
-                ack[32],
-                String::from_utf8_lossy(&ack[33..])
-            ));
+        let ack = read_until(&mut client_a, FRAME_ACK).map_err(|e| format!("read ack: {}", e))?;
+        if ack.len() != 33 || ack[32] != 1 {
+            return Err(format!("submit not ACKed cleanly: {}", String::from_utf8_lossy(&ack)));
         }
         println!("✓ Send submitted to A and ACKed");
 
-        // Drain client_a's DELIVERED echo of its own event (since broadcast
-        // hits the submitter too).
-        let _ = read_frame(&mut client_a);
-
-        // Now: client_b should receive a DELIVERED frame containing the Send.
-        loop {
-            let (kind, payload) = read_frame(&mut client_b)
-                .map_err(|e| format!("client_b read: {}", e))?;
-            if kind != FRAME_DELIVERED {
-                // Could be a STATE or other frame; keep reading.
-                continue;
-            }
-            // Layout: parent[32]+author[32]+kind[1]+...
-            if payload.len() < 65 || payload[64] != OP_SEND {
-                continue; // some other event delivered (e.g. a Witness)
-            }
-            // Extract Send body.
-            let body_len = u32::from_be_bytes([
-                payload[97], payload[98], payload[99], payload[100],
-            ]) as usize;
-            let body = &payload[101..101 + body_len];
-            if body != b"hello from A across the mesh" {
-                return Err(format!(
-                    "B received unexpected body: {:?}",
-                    String::from_utf8_lossy(body)
-                ));
-            }
-            println!("✓ B received cross-mesh Send: {:?}", String::from_utf8_lossy(body));
-            break;
+        // B should deliver the finalized message to its client.
+        let notify = read_until(&mut client_b, FRAME_NOTIFY)
+            .map_err(|e| format!("client_b notify: {}", e))?;
+        let got = &notify[32..];
+        if got != body {
+            return Err(format!("B got unexpected body: {:?}", String::from_utf8_lossy(got)));
         }
-
+        println!("✓ B received cross-mesh message: {:?}", String::from_utf8_lossy(got));
         Ok(())
     })();
 

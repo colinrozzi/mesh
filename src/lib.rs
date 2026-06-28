@@ -1,34 +1,27 @@
-//! mesh v2 — DAG-based identity + message-passing actor.
+//! mesh v3 — DAG-based replicated state-machine substrate.
 //!
-//! See DESIGN.md for the protocol spec. Every event is a signed node in a
-//! content-addressed DAG (parent: EventHash). State is purely derived by
-//! walking the DAG and applying state-mutating ops in canonical order.
+//! See DESIGN-v3.md. Each node is a self-rooted log; events carry
+//! `self_parent ∪ refs` back-edges; membership is static config; finality is
+//! "every member has witnessed." Message-passing rides on top as a reducer.
 //!
-//! Connection lifecycle: HELLO(pubkey) → CHALLENGE(nonce) → AUTH(sig) → ACCEPTED.
-//! After accept, the client may SUBMIT signed events. Ingested events are
-//! broadcast as DELIVERED to all authenticated connections (peer meshes
-//! re-ingest and re-broadcast).
-//!
-//! Witnesses are emitted on a timer (default every 2s) referencing all events
-//! received since the last witness. They cite freshly-seen events, letting the
-//! network derive who-has-seen-what just by watching the DAG grow. State-
-//! mutating events additionally get an inline witness so single-node consensus
-//! is reached before `on_data` returns.
-//!
-//! Module map:
-//!   event — canonical, signed binary event encoding (hand-rolled)
-//!   wire  — length-prefixed frame protocol (hand-rolled)
-//!   dag   — DAG storage, state derivation, finality + consensus
-//!   conn  — per-connection handshake state
-//!   codec — persistence of ActorState <-> JSON strings, plus hex helpers
+//! Actor flow:
+//!   - init: derive key, build the static member set, author this node's
+//!     genesis, listen, dial configured peers (client-side handshake).
+//!   - connections authenticate by membership (HELLO → CHALLENGE → AUTH →
+//!     ACCEPTED), then exchange FRONTIER/WANT to catch up.
+//!   - DELIVER gossips events; on a newly-seen *payload* event a node forwards
+//!     it, NOTIFYs its app clients (optimistic delivery), and authors a graft
+//!     (its witness). WANT backfills missing ancestry.
+//!   - SUBMIT lets an app client ask this node to author a payload event.
 
 #![cfg_attr(not(test), no_std)]
 extern crate alloc;
 
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
+use ed25519_dalek::{Signer, SigningKey};
 use packr_guest::{export, import, pack_types, GraphValue, Value};
 use sha2::{Digest, Sha256};
 
@@ -39,18 +32,25 @@ mod codec;
 mod conn;
 mod dag;
 mod event;
+mod message;
+mod reducer;
 mod wire;
 
 use codec::{
-    connections_from_json, connections_to_json, dag_from_json, dag_to_json, from_hex32, hex,
-    peer_nodes_to_json, pending_from_json, pending_to_json,
+    connections_from_json, connections_to_json, dag_from_json, dag_to_json, events_from_json,
+    events_to_json, from_hex32, hashes_from_json, hashes_to_json, hex, members_from_json,
+    members_to_json,
 };
 use conn::{ConnState, Phase};
 use dag::Dag;
-use event::{Event, Hash, PubKey, GENESIS_PARENT};
+use event::{Event, Hash, PubKey};
+use message::Mailboxes;
+use reducer::fold;
 use wire::{
-    encode_accepted, encode_ack, encode_challenge, encode_delivered, encode_rejected,
-    try_parse_frame, ParsedFrame, FRAME_AUTH, FRAME_DELIVERED, FRAME_HELLO, FRAME_SUBMIT,
+    decode_hashes, encode_ack, encode_auth, encode_challenge, encode_deliver, encode_hashes,
+    encode_hello, encode_notify, encode_rejected, try_parse_frame, ParsedFrame, FRAME_ACCEPTED,
+    FRAME_AUTH, FRAME_CHALLENGE, FRAME_DELIVER, FRAME_FRONTIER, FRAME_HELLO, FRAME_SUBMIT,
+    FRAME_WANT,
 };
 
 #[derive(Clone, GraphValue)]
@@ -58,25 +58,19 @@ use wire::{
 pub struct ActorState {
     pub listener_id: String,
     pub listen_addr: String,
-    /// Mesh's own signing key, derived from init_state.node_seed. Pubkey =
-    /// network root for v2-single-node. Kept hex-encoded so it round-trips
-    /// through theater's value serialization without losing bytes.
+    /// This node's signing key (hex), derived from `node_seed`.
     pub signing_key_hex: String,
-    pub root_pubkey_hex: String,
-    /// Pre-admitted peer Nodes at genesis, JSON: [[pubkey_hex, name], ...]
-    pub peer_nodes_json: String,
-    /// Hash of the most recent event mesh itself authored. Used as the
-    /// `parent` for the next event mesh creates (Witnesses chain into mesh's
-    /// own per-author timeline). Starts at GENESIS_PARENT.
-    pub mesh_head_hex: String,
-    /// Witness cadence in milliseconds (also the timer interval).
-    pub witness_interval_ms: u64,
-    /// Encoded DAG (events) — we re-hydrate the in-memory structure each call.
+    /// The static, configured member set, JSON `[pubkey_hex, ...]`.
+    pub members_json: String,
+    /// This node's own chain head (hex event hash).
+    pub self_head_hex: String,
+    /// Persisted DAG (admitted events).
     pub dag_json: String,
+    /// Persisted orphan buffer (events awaiting missing dependencies).
+    pub pending_json: String,
+    /// Event hashes of messages already delivered to clients (NOTIFY dedup).
+    pub delivered_json: String,
     pub connections_json: String,
-    /// Hashes of events received since the last Witness — gathered into the
-    /// next emitted Witness's also_cite field.
-    pub witness_pending_json: String,
 }
 
 pack_types! {
@@ -109,145 +103,106 @@ pack_types! {
 
 #[import(module = "theater:simple/runtime", name = "log")]
 fn log(msg: String);
-
 #[import(module = "theater:simple/tcp", name = "listen")]
 fn tcp_listen(address: String) -> Result<String, String>;
-
 #[import(module = "theater:simple/tcp", name = "connect")]
 fn tcp_connect(address: String) -> Result<String, String>;
-
 #[import(module = "theater:simple/tcp", name = "activate")]
 fn tcp_activate(conn_id: String) -> Result<(), String>;
-
 #[import(module = "theater:simple/tcp", name = "set-active")]
 fn tcp_set_active(conn_id: String, mode: String) -> Result<(), String>;
-
 #[import(module = "theater:simple/tcp", name = "send")]
 fn tcp_send(conn_id: String, data: Vec<u8>) -> Result<u64, String>;
-
 #[import(module = "theater:simple/tcp", name = "receive")]
 fn tcp_receive(conn_id: String, max_bytes: u32) -> Result<Vec<u8>, String>;
-
 #[import(module = "theater:simple/tcp", name = "close")]
 fn tcp_close(conn_id: String) -> Result<(), String>;
-
 #[import(module = "theater:simple/timer", name = "set-interval")]
 fn timer_set_interval(name: String, interval_ms: u64) -> Result<String, String>;
-
 #[import(module = "theater:simple/timer", name = "now")]
 fn now_ms() -> u64;
 
 const LISTEN_ADDR: &str = "127.0.0.1:9447";
-const WITNESS_TIMER_NAME: &str = "witness-tick";
-const DEFAULT_WITNESS_INTERVAL_MS: u64 = 2000;
+const HEARTBEAT_TIMER: &str = "heartbeat";
+const DEFAULT_INTERVAL_MS: u64 = 2000;
 
 // ---- init ----
 
 #[derive(serde::Deserialize)]
 struct InitConfig {
-    /// Seed material for mesh's own signing key.
     node_seed: String,
-    /// The network's root pubkey. Same on all nodes participating in this
-    /// network. If absent, defaults to this node's own pubkey (this node is
-    /// the founding root).
+    /// All other member pubkeys (hex). These, plus this node's own, form the
+    /// static member set. Membership is independent of who we dial.
     #[serde(default)]
-    root_pubkey: Option<String>,
-    /// Listen address (defaults to 127.0.0.1:9447 if absent).
+    members: Vec<String>,
+    /// Peers to outbound-connect to on init: pubkey + address. Must be a subset
+    /// of `members`.
+    #[serde(default)]
+    dial: Vec<PeerEntry>,
     #[serde(default)]
     listen_addr: Option<String>,
-    /// Additional Nodes pre-admitted at genesis (besides root). On any node
-    /// participating in this network, this list must be identical so all nodes
-    /// derive the same genesis state.
     #[serde(default)]
-    peer_node_pubkeys: Vec<PeerNodeEntry>,
-    /// Peer mesh endpoints to open outbound connections to on init.
-    #[serde(default)]
-    peer_meshes: Vec<PeerMeshEntry>,
-    #[serde(default)]
-    witness_interval_ms: Option<u64>,
+    heartbeat_ms: Option<u64>,
 }
 
 #[derive(serde::Deserialize)]
-struct PeerNodeEntry {
-    pubkey: String,
-    name: String,
-}
-
-#[derive(serde::Deserialize)]
-struct PeerMeshEntry {
+struct PeerEntry {
     pubkey: String,
     address: String,
 }
 
 #[export(name = "theater:simple/actor.init")]
 fn init(state: Value) -> Result<(ActorState, ()), String> {
-    log(String::from("[mesh] init (v2)"));
+    log(String::from("[mesh] init (v3)"));
     let cfg: InitConfig = match state {
         Value::String(s) if !s.is_empty() => {
             serde_json::from_str(&s).map_err(|e| format!("parse init_state: {}", e))?
         }
         _ => return Err("missing init_state (need {\"node_seed\":\"...\"})".to_string()),
     };
-    let witness_interval_ms = cfg.witness_interval_ms.unwrap_or(DEFAULT_WITNESS_INTERVAL_MS);
-    let listen_addr = cfg.listen_addr.unwrap_or_else(|| LISTEN_ADDR.to_string());
+    let heartbeat_ms = cfg.heartbeat_ms.unwrap_or(DEFAULT_INTERVAL_MS);
+    let listen_addr = cfg.listen_addr.clone().unwrap_or_else(|| LISTEN_ADDR.to_string());
 
-    // Derive mesh's signing key + pubkey from node_seed.
-    use ed25519_dalek::SigningKey;
     let mut h = Sha256::new();
     h.update(cfg.node_seed.as_bytes());
     let key_bytes: [u8; 32] = h.finalize().into();
     let signing_key = SigningKey::from_bytes(&key_bytes);
     let self_pubkey = signing_key.verifying_key().to_bytes();
-    let self_pubkey_hex = hex(&self_pubkey);
-    let signing_key_hex = hex(&key_bytes);
 
-    // Root pubkey = explicit if provided, else this node's own pubkey.
-    let root_pubkey = match &cfg.root_pubkey {
-        Some(s) => from_hex32(s)?,
-        None => self_pubkey,
-    };
-    let root_pubkey_hex = hex(&root_pubkey);
-    let is_root = root_pubkey == self_pubkey;
-
-    // Parse peer Nodes and pre-admit them at genesis.
-    let mut peer_nodes: Vec<(PubKey, String)> = Vec::new();
-    for entry in &cfg.peer_node_pubkeys {
-        peer_nodes.push((from_hex32(&entry.pubkey)?, entry.name.clone()));
+    // Member set = configured members ∪ self.
+    let mut members = members_from_json("[]");
+    for m in &cfg.members {
+        members.insert(from_hex32(m)?);
     }
-    let dag = Dag::new(root_pubkey, peer_nodes.clone());
+    members.insert(self_pubkey);
+
+    // Author this node's genesis so it has a chain head.
+    let mut dag = Dag::new(members.clone());
+    let genesis = author_genesis(&mut dag, &signing_key);
+    let self_head = genesis.event_hash();
 
     let listener_id =
         tcp_listen(listen_addr.clone()).map_err(|e| format!("listen failed: {}", e))?;
     log(format!(
-        "[mesh] listening on {} (id={}); self_pubkey={}; root_pubkey={}{}; peer_nodes={}; witness_interval_ms={}",
+        "[mesh] listening on {} (id={}); self={}; members={}",
         &listen_addr,
         listener_id,
-        &self_pubkey_hex,
-        &root_pubkey_hex,
-        if is_root { " (self)" } else { "" },
-        peer_nodes.len(),
-        witness_interval_ms,
+        &hex(&self_pubkey),
+        members.len(),
     ));
-
-    if let Err(e) = timer_set_interval(WITNESS_TIMER_NAME.to_string(), witness_interval_ms) {
+    if let Err(e) = timer_set_interval(HEARTBEAT_TIMER.to_string(), heartbeat_ms) {
         log(format!("[mesh] set-interval failed: {}", e));
     }
 
-    // Open outbound connections to peer meshes, run the client-side handshake,
-    // and register them as authed peer connections.
+    // Dial peers, handshake from the client side, register them as authed.
     let mut conns: BTreeMap<String, ConnState> = BTreeMap::new();
-    for peer in &cfg.peer_meshes {
-        match open_peer_connection(&peer.address, &peer.pubkey, &signing_key) {
+    for p in &cfg.dial {
+        match open_peer_connection(&p.address, &signing_key, &dag) {
             Ok(conn_id) => {
-                log(format!(
-                    "[mesh] outbound peer connected: {} via conn {}",
-                    &peer.address, conn_id
-                ));
-                conns.insert(conn_id, ConnState::authed(peer.pubkey.clone()));
+                log(format!("[mesh] dialed peer {} (conn {})", &p.address, conn_id));
+                conns.insert(conn_id, ConnState::authed(p.pubkey.clone()));
             }
-            Err(e) => {
-                log(format!("[mesh] outbound peer {} failed: {}", &peer.address, e));
-            }
+            Err(e) => log(format!("[mesh] dial {} failed: {}", &p.address, e)),
         }
     }
 
@@ -255,77 +210,63 @@ fn init(state: Value) -> Result<(ActorState, ()), String> {
         ActorState {
             listener_id,
             listen_addr,
-            signing_key_hex,
-            root_pubkey_hex,
-            peer_nodes_json: peer_nodes_to_json(&peer_nodes),
-            mesh_head_hex: hex(&GENESIS_PARENT),
-            witness_interval_ms,
+            signing_key_hex: hex(&key_bytes),
+            members_json: members_to_json(&members),
+            self_head_hex: hex(&self_head),
             dag_json: dag_to_json(&dag),
+            pending_json: "[]".to_string(),
+            delivered_json: "[]".to_string(),
             connections_json: connections_to_json(&conns),
-            witness_pending_json: "[]".to_string(),
         },
         (),
     ))
 }
 
-/// Open an outbound TCP connection to a peer mesh, run the client-side
-/// handshake (HELLO → CHALLENGE → AUTH → ACCEPTED), then switch to active mode
-/// so future on-data callbacks handle the event stream.
+/// Dial a peer and run the client side of the handshake, then kick off catch-up
+/// (WANT what its ACCEPTED frontier shows we lack, and announce our own
+/// frontier). Returns the live, active connection id.
 fn open_peer_connection(
     address: &str,
-    expected_pubkey_hex: &str,
-    signing_key: &ed25519_dalek::SigningKey,
+    signing_key: &SigningKey,
+    dag: &Dag,
 ) -> Result<String, String> {
     let conn_id =
         tcp_connect(address.to_string()).map_err(|e| format!("connect {}: {}", address, e))?;
     let pk = signing_key.verifying_key().to_bytes();
 
-    // HELLO(pubkey)
-    let hello = wire::encode_frame(FRAME_HELLO, &pk);
-    tcp_send(conn_id.clone(), hello).map_err(|e| format!("send HELLO: {}", e))?;
-
-    // Read CHALLENGE
+    tcp_send(conn_id.clone(), encode_hello(&pk)).map_err(|e| format!("send HELLO: {}", e))?;
     let (kind, nonce) = recv_one_frame(&conn_id)?;
-    if kind != wire::FRAME_CHALLENGE || nonce.len() != 32 {
+    if kind != FRAME_CHALLENGE || nonce.len() != 32 {
         let _ = tcp_close(conn_id);
-        return Err(format!("expected CHALLENGE(nonce), got kind={:#x}", kind));
+        return Err(format!("expected CHALLENGE, got {:#x}", kind));
     }
-
-    // AUTH(sig over nonce)
-    use ed25519_dalek::Signer;
     let sig = signing_key.sign(&nonce).to_bytes();
-    let auth = wire::encode_frame(FRAME_AUTH, &sig);
-    tcp_send(conn_id.clone(), auth).map_err(|e| format!("send AUTH: {}", e))?;
-
-    // Read ACCEPTED
+    tcp_send(conn_id.clone(), encode_auth(&sig)).map_err(|e| format!("send AUTH: {}", e))?;
     let (kind, payload) = recv_one_frame(&conn_id)?;
-    if kind != wire::FRAME_ACCEPTED {
+    if kind != FRAME_ACCEPTED {
         let _ = tcp_close(conn_id);
-        return Err(format!(
-            "peer rejected: kind={:#x} payload={:?}",
-            kind,
-            core::str::from_utf8(&payload).unwrap_or("<binary>")
-        ));
+        return Err(format!("peer rejected: {:#x}", kind));
     }
-    // (peer's reported head_hash is in payload — we don't need to verify it)
-    let _ = expected_pubkey_hex; // (future: verify peer's pubkey matches)
 
-    // Switch to active mode so on-data fires for live event flow.
+    // Catch up against the peer's advertised frontier, and announce ours.
+    for want in decode_hashes(&payload).into_iter().filter(|h| !dag.has(h)) {
+        let _ = tcp_send(conn_id.clone(), encode_hashes(FRAME_WANT, &[want]));
+    }
+    let _ = tcp_send(conn_id.clone(), encode_hashes(FRAME_FRONTIER, &all_heads(dag)));
+
     tcp_set_active(conn_id.clone(), "active".to_string())
         .map_err(|e| format!("set-active: {}", e))?;
-
     Ok(conn_id)
 }
 
-/// Read one complete length-prefixed frame from a connection. Used during the
-/// outbound handshake — the caller is doing blocking I/O so passive mode is fine.
+/// Blocking read of one full frame (used during the synchronous dial handshake).
 fn recv_one_frame(conn_id: &str) -> Result<(u8, Vec<u8>), String> {
     let mut buf = Vec::with_capacity(4);
     while buf.len() < 4 {
         let chunk = tcp_receive(conn_id.to_string(), 4 - buf.len() as u32)
             .map_err(|e| format!("receive len: {}", e))?;
         if chunk.is_empty() {
-            return Err("connection closed during frame length read".to_string());
+            return Err("closed during frame length".to_string());
         }
         buf.extend_from_slice(&chunk);
     }
@@ -338,49 +279,40 @@ fn recv_one_frame(conn_id: &str) -> Result<(u8, Vec<u8>), String> {
         let chunk = tcp_receive(conn_id.to_string(), (len - body.len()) as u32)
             .map_err(|e| format!("receive body: {}", e))?;
         if chunk.is_empty() {
-            return Err("connection closed during frame body read".to_string());
+            return Err("closed during frame body".to_string());
         }
         body.extend_from_slice(&chunk);
     }
-    let kind = body[0];
-    let payload = body[1..].to_vec();
-    Ok((kind, payload))
+    Ok((body[0], body[1..].to_vec()))
 }
 
 // ---- connection lifecycle ----
 
 #[export(name = "theater:simple/tcp-client.handle-connection")]
 fn handle_connection(state: ActorState, conn_id: String) -> Result<(ActorState, ()), String> {
-    if let Err(e) = tcp_activate(conn_id.clone()) {
-        log(format!("[mesh] activate {} failed: {}", conn_id, e));
-        let _ = tcp_close(conn_id);
-        return Ok((state, ()));
-    }
-    if let Err(e) = tcp_set_active(conn_id.clone(), "active".to_string()) {
-        log(format!("[mesh] set-active {} failed: {}", conn_id, e));
+    if tcp_activate(conn_id.clone()).is_err()
+        || tcp_set_active(conn_id.clone(), "active".to_string()).is_err()
+    {
         let _ = tcp_close(conn_id);
         return Ok((state, ()));
     }
     let mut conns = connections_from_json(&state.connections_json);
     conns.insert(conn_id.clone(), ConnState::awaiting_hello());
     log(format!("[mesh] conn {} opened", conn_id));
-    Ok((
-        ActorState {
-            connections_json: connections_to_json(&conns),
-            ..state
-        },
-        (),
-    ))
+    Ok((ActorState { connections_json: connections_to_json(&conns), ..state }, ()))
 }
 
 #[export(name = "theater:simple/tcp-client.on-data")]
 fn on_data(state: ActorState, conn_id: String, data: Vec<u8>) -> Result<(ActorState, ()), String> {
+    let signing_key = SigningKey::from_bytes(&from_hex32(&state.signing_key_hex)?);
+    let mut dag = dag_from_json(&state.dag_json, &state.members_json)?;
+    for ev in events_from_json(&state.pending_json) {
+        let _ = dag.ingest(ev); // re-buffer or resolve persisted orphans
+    }
     let mut conns = connections_from_json(&state.connections_json);
-    let mut dag = dag_from_json(&state.dag_json, &state.root_pubkey_hex, &state.peer_nodes_json)?;
-    let mut witness_pending: Vec<Hash> = pending_from_json(&state.witness_pending_json);
+    let mut self_head = from_hex32(&state.self_head_hex)?;
+    let mut delivered: BTreeSet<Hash> = hashes_from_json(&state.delivered_json).into_iter().collect();
 
-    // Pull this connection out of the map so we can mutate it freely; it's
-    // re-inserted at the end unless the connection is being closed.
     let mut conn_state = match conns.remove(&conn_id) {
         Some(c) => c,
         None => {
@@ -390,11 +322,7 @@ fn on_data(state: ActorState, conn_id: String, data: Vec<u8>) -> Result<(ActorSt
         }
     };
     conn_state.recv_buf_mut().extend_from_slice(&data);
-
     let mut should_close = false;
-    // Mesh's own per-author head advances as it inline-witnesses state changes;
-    // we thread the running value here and sweep it into ActorState after the loop.
-    let mut mesh_head = state.mesh_head_hex.clone();
 
     loop {
         let frame = match try_parse_frame(conn_state.recv_buf()) {
@@ -408,12 +336,12 @@ fn on_data(state: ActorState, conn_id: String, data: Vec<u8>) -> Result<(ActorSt
                 break;
             }
         };
-        let kept: Vec<u8> = conn_state.recv_buf()[frame.total_len..].to_vec();
+        let kept = conn_state.recv_buf()[frame.total_len..].to_vec();
         *conn_state.recv_buf_mut() = kept;
 
         match conn_state.phase.clone() {
             Phase::AwaitingHello => match step_hello(&conn_id, &frame, &dag) {
-                Step::Advance(phase) => conn_state.phase = phase,
+                Step::Advance(p) => conn_state.phase = p,
                 Step::Close => {
                     should_close = true;
                     break;
@@ -421,26 +349,29 @@ fn on_data(state: ActorState, conn_id: String, data: Vec<u8>) -> Result<(ActorSt
             },
             Phase::AwaitingAuth { pubkey_hex, nonce_hex } => {
                 match step_auth(&conn_id, &frame, &pubkey_hex, &nonce_hex, &dag)? {
-                    Step::Advance(phase) => conn_state.phase = phase,
+                    Step::Advance(p) => {
+                        conn_state.phase = p;
+                        // Announce our frontier so the peer can catch up.
+                        let _ = tcp_send(
+                            conn_id.clone(),
+                            encode_hashes(FRAME_FRONTIER, &all_heads(&dag)),
+                        );
+                    }
                     Step::Close => {
                         should_close = true;
                         break;
                     }
                 }
             }
-            Phase::Authed { pubkey_hex } => {
-                if let Some(new_head) = handle_authed_frame(
+            Phase::Authed { .. } => {
+                self_head = handle_authed_frame(
                     &mut dag,
                     &conns,
                     &conn_id,
-                    &pubkey_hex,
+                    &signing_key,
+                    self_head,
                     &frame,
-                    &mut witness_pending,
-                    &state.signing_key_hex,
-                    &mesh_head,
-                )? {
-                    mesh_head = new_head;
-                }
+                );
             }
         }
     }
@@ -448,28 +379,45 @@ fn on_data(state: ActorState, conn_id: String, data: Vec<u8>) -> Result<(ActorSt
     if !should_close {
         conns.insert(conn_id.clone(), conn_state);
     }
+    // Deliver any newly-finalized messages (committed delivery via the reducer).
+    deliver_committed(&dag, &conns, &mut delivered);
+
+    let delivered_vec: Vec<Hash> = delivered.iter().copied().collect();
     Ok((
         ActorState {
             dag_json: dag_to_json(&dag),
+            pending_json: events_to_json(&dag.pending_events()),
+            delivered_json: hashes_to_json(&delivered_vec),
             connections_json: connections_to_json(&conns),
-            witness_pending_json: pending_to_json(&witness_pending),
-            mesh_head_hex: mesh_head,
+            self_head_hex: hex(&self_head),
             ..state
         },
         (),
     ))
 }
 
-/// Result of handling one frame during the handshake.
+#[export(name = "theater:simple/tcp-client.on-close")]
+fn on_close(state: ActorState, conn_id: String, reason: String) -> Result<(ActorState, ()), String> {
+    log(format!("[mesh] conn {} closed: {}", conn_id, reason));
+    let mut conns = connections_from_json(&state.connections_json);
+    conns.remove(&conn_id);
+    Ok((ActorState { connections_json: connections_to_json(&conns), ..state }, ()))
+}
+
+#[export(name = "theater:simple/timer.handle-tick")]
+fn handle_tick(state: ActorState, _timer_name: String) -> Result<(ActorState, ()), String> {
+    // Timed heartbeat / batched emission is deferred (DESIGN-v3.md). For now,
+    // emission is purely on-event; the tick is a no-op.
+    Ok((state, ()))
+}
+
+// ---- handshake steps ----
+
 enum Step {
-    /// Move the connection to a new phase.
     Advance(Phase),
-    /// Reject and close the connection.
     Close,
 }
 
-/// Handle a HELLO frame: verify the claimed pubkey is a member, then issue a
-/// challenge and advance to AwaitingAuth.
 fn step_hello(conn_id: &str, frame: &ParsedFrame, dag: &Dag) -> Step {
     if frame.kind != FRAME_HELLO || frame.payload.len() != 32 {
         let _ = tcp_send(conn_id.to_string(), encode_rejected("expected HELLO(pubkey)"));
@@ -478,24 +426,16 @@ fn step_hello(conn_id: &str, frame: &ParsedFrame, dag: &Dag) -> Step {
     }
     let mut pk = [0u8; 32];
     pk.copy_from_slice(&frame.payload);
-    if !dag.consensus_state().is_member(&pk) {
-        let _ = tcp_send(
-            conn_id.to_string(),
-            encode_rejected(&format!("not a member: {}", hex(&pk))),
-        );
+    if !dag.members.contains(&pk) {
+        let _ = tcp_send(conn_id.to_string(), encode_rejected("not a member"));
         let _ = tcp_close(conn_id.to_string());
         return Step::Close;
     }
     let nonce = challenge_nonce(conn_id);
     let _ = tcp_send(conn_id.to_string(), encode_challenge(&nonce));
-    Step::Advance(Phase::AwaitingAuth {
-        pubkey_hex: hex(&pk),
-        nonce_hex: hex(&nonce),
-    })
+    Step::Advance(Phase::AwaitingAuth { pubkey_hex: hex(&pk), nonce_hex: hex(&nonce) })
 }
 
-/// Handle an AUTH frame: verify the signature over the issued nonce, then
-/// accept (reporting the consensus head) and advance to Authed.
 fn step_auth(
     conn_id: &str,
     frame: &ParsedFrame,
@@ -504,7 +444,7 @@ fn step_auth(
     dag: &Dag,
 ) -> Result<Step, String> {
     if frame.kind != FRAME_AUTH || frame.payload.len() != 64 {
-        let _ = tcp_send(conn_id.to_string(), encode_rejected("expected AUTH(sig[64])"));
+        let _ = tcp_send(conn_id.to_string(), encode_rejected("expected AUTH(sig)"));
         let _ = tcp_close(conn_id.to_string());
         return Ok(Step::Close);
     }
@@ -513,227 +453,232 @@ fn step_auth(
     let mut sig = [0u8; 64];
     sig.copy_from_slice(&frame.payload);
     use ed25519_dalek::{Signature, Verifier, VerifyingKey};
-    let vk = VerifyingKey::from_bytes(&pk).map_err(|e| format!("bad pubkey at auth: {}", e))?;
-    if let Err(e) = vk.verify(&nonce, &Signature::from_bytes(&sig)) {
-        let _ = tcp_send(
-            conn_id.to_string(),
-            encode_rejected(&format!("auth failed: {}", e)),
-        );
+    let vk = VerifyingKey::from_bytes(&pk).map_err(|e| format!("bad pubkey: {}", e))?;
+    if vk.verify(&nonce, &Signature::from_bytes(&sig)).is_err() {
+        let _ = tcp_send(conn_id.to_string(), encode_rejected("auth failed"));
         let _ = tcp_close(conn_id.to_string());
         return Ok(Step::Close);
     }
-    let _ = tcp_send(conn_id.to_string(), encode_accepted(&dag.consensus_state_head()));
-    log(format!("[mesh] conn {} authenticated as {}", conn_id, pubkey_hex));
-    Ok(Step::Advance(Phase::Authed {
-        pubkey_hex: pubkey_hex.to_string(),
-    }))
+    let _ = tcp_send(conn_id.to_string(), encode_hashes(FRAME_ACCEPTED, &all_heads(dag)));
+    log(format!("[mesh] conn {} authed as {}", conn_id, pubkey_hex));
+    Ok(Step::Advance(Phase::Authed { pubkey_hex: pubkey_hex.to_string() }))
 }
 
-/// Handle a post-handshake frame. Two kinds are accepted:
-///   SUBMIT     — the authed client submits a signed event for ingestion
-///   DELIVERED  — a peer mesh forwards an event for us to ingest
-/// Both get ingested + re-broadcast, but only SUBMIT gets an ACK back, and
-/// SUBMIT additionally requires the event's author to match the connection's
-/// authenticated identity (DELIVERED carries events from many authors, so we
-/// trust the signature rather than the connection).
-///
-/// Returns `Some(new_mesh_head)` if an inline Witness was authored.
-#[allow(clippy::too_many_arguments)]
+// ---- post-handshake frame handling ----
+
+/// Handle one authenticated frame. Returns the (possibly advanced) self_head.
 fn handle_authed_frame(
     dag: &mut Dag,
     conns: &BTreeMap<String, ConnState>,
     conn_id: &str,
-    pubkey_hex: &str,
+    signing_key: &SigningKey,
+    self_head: Hash,
     frame: &ParsedFrame,
-    witness_pending: &mut Vec<Hash>,
-    signing_key_hex: &str,
-    mesh_head_hex: &str,
-) -> Result<Option<String>, String> {
-    let is_submit = frame.kind == FRAME_SUBMIT;
-    let is_delivered = frame.kind == FRAME_DELIVERED;
-    if !is_submit && !is_delivered {
-        let _ = tcp_send(conn_id.to_string(), encode_rejected("expected SUBMIT or DELIVERED"));
-        return Ok(None);
-    }
-
-    let event_obj = match Event::decode(&frame.payload) {
-        Ok(e) => e,
-        Err(e) => {
-            if is_submit {
-                let _ = tcp_send(
-                    conn_id.to_string(),
-                    encode_ack(&[0u8; 32], false, &format!("decode: {}", e)),
-                );
-            } else {
-                log(format!("[mesh] DELIVERED decode failed: {}", e));
+) -> Hash {
+    match frame.kind {
+        FRAME_DELIVER => match Event::decode(&frame.payload) {
+            Ok(ev) => ingest_and_propagate(dag, conns, conn_id, signing_key, self_head, ev),
+            Err(e) => {
+                log(format!("[mesh] DELIVER decode failed: {}", e));
+                self_head
             }
-            return Ok(None);
-        }
-    };
-
-    if is_submit && hex(&event_obj.author) != pubkey_hex {
-        let _ = tcp_send(
-            conn_id.to_string(),
-            encode_ack(
-                &event_obj.event_hash(),
-                false,
-                "author doesn't match authenticated identity",
-            ),
-        );
-        return Ok(None);
-    }
-
-    let event_hash = event_obj.event_hash();
-    let is_state_mutating = Dag::is_state_mutating(&event_obj.op);
-    match dag.ingest(event_obj.clone()) {
-        Ok(true) => {
-            if is_submit {
-                let _ = tcp_send(conn_id.to_string(), encode_ack(&event_hash, true, ""));
-            }
-            witness_pending.push(event_hash);
-            // Broadcast to all other authed connections; the submitter (pulled
-            // out of `conns` during on-data) gets it via the explicit re-send.
-            broadcast_delivered(conns, conn_id, &event_obj.encode());
-
-            // State changes get an inline witness so single-node consensus is
-            // reached before on_data returns — the submitter can re-handshake
-            // and see their change applied without waiting for the timer tick.
-            if is_state_mutating {
-                if let Some(witness) =
-                    mesh_author_witness(dag, signing_key_hex, mesh_head_hex, witness_pending)?
-                {
-                    broadcast_delivered(conns, "", &witness.encode());
-                    witness_pending.clear();
-                    return Ok(Some(hex(&witness.event_hash())));
+        },
+        FRAME_SUBMIT => {
+            // App client asks us to author a payload event on our own chain.
+            match author_event(dag, signing_key, self_head, frame.payload.clone()) {
+                Ok(ev) => {
+                    let h = ev.event_hash();
+                    let _ = tcp_send(conn_id.to_string(), encode_ack(&h, true, ""));
+                    broadcast(conns, conn_id, &encode_deliver(&ev.encode()));
+                    h
+                }
+                Err(e) => {
+                    let _ = tcp_send(conn_id.to_string(), encode_ack(&[0u8; 32], false, &e));
+                    self_head
                 }
             }
-            Ok(None)
+        }
+        FRAME_WANT => {
+            for h in decode_hashes(&frame.payload) {
+                if let Some(ev) = dag.events.get(&h) {
+                    let _ = tcp_send(conn_id.to_string(), encode_deliver(&ev.encode()));
+                }
+            }
+            self_head
+        }
+        FRAME_FRONTIER => {
+            let missing: Vec<Hash> =
+                decode_hashes(&frame.payload).into_iter().filter(|h| !dag.has(h)).collect();
+            if !missing.is_empty() {
+                let _ = tcp_send(conn_id.to_string(), encode_hashes(FRAME_WANT, &missing));
+            }
+            self_head
+        }
+        // ACK / NOTIFY are responses meant for app clients; a node ignores them.
+        _ => self_head,
+    }
+}
+
+/// Ingest a gossiped event: dedup, backfill on missing deps, else admit +
+/// forward + (for payload events) NOTIFY clients and author a witnessing graft.
+fn ingest_and_propagate(
+    dag: &mut Dag,
+    conns: &BTreeMap<String, ConnState>,
+    from_conn: &str,
+    signing_key: &SigningKey,
+    self_head: Hash,
+    event: Event,
+) -> Hash {
+    if dag.has(&event.event_hash()) {
+        return self_head; // dedup — already have it
+    }
+    let payload_nonempty = !event.payload.is_empty();
+    let encoded = event.encode();
+    let missing = missing_deps(dag, &event); // compute before `ingest` consumes it
+
+    match dag.ingest(event) {
+        Ok(true) => {
+            // Forward to every other peer (the source is excluded — it's not in
+            // `conns` right now, having been removed for the duration of on-data).
+            broadcast(conns, from_conn, &encode_deliver(&encoded));
+            if payload_nonempty {
+                // Witness it: author a graft whose refs cover the new head.
+                // (Delivery happens on finality, via deliver_committed.)
+                match author_event(dag, signing_key, self_head, Vec::new()) {
+                    Ok(graft) => {
+                        broadcast(conns, "", &encode_deliver(&graft.encode()));
+                        return graft.event_hash();
+                    }
+                    Err(e) => log(format!("[mesh] graft failed: {}", e)),
+                }
+            }
+            self_head
         }
         Ok(false) => {
-            if is_submit {
-                let _ = tcp_send(
-                    conn_id.to_string(),
-                    encode_ack(&event_hash, true, "buffered pending parent"),
-                );
+            // Missing a dependency — ask the source for it.
+            if !missing.is_empty() {
+                let _ = tcp_send(from_conn.to_string(), encode_hashes(FRAME_WANT, &missing));
             }
-            Ok(None)
+            self_head
         }
         Err(e) => {
-            if is_submit {
-                let _ = tcp_send(conn_id.to_string(), encode_ack(&event_hash, false, &e));
-            } else {
-                log(format!("[mesh] DELIVERED ingest failed: {}", e));
-            }
-            Ok(None)
+            log(format!("[mesh] ingest rejected: {}", e));
+            self_head
         }
     }
 }
 
-#[export(name = "theater:simple/tcp-client.on-close")]
-fn on_close(state: ActorState, conn_id: String, reason: String) -> Result<(ActorState, ()), String> {
-    log(format!("[mesh] conn {} closed: {}", conn_id, reason));
-    let mut conns = connections_from_json(&state.connections_json);
-    conns.remove(&conn_id);
-    Ok((
-        ActorState {
-            connections_json: connections_to_json(&conns),
-            ..state
-        },
-        (),
-    ))
-}
+// ---- authoring + helpers ----
 
-// ---- timer-driven witness emission ----
-
-#[export(name = "theater:simple/timer.handle-tick")]
-fn handle_tick(state: ActorState, timer_name: String) -> Result<(ActorState, ()), String> {
-    if timer_name != WITNESS_TIMER_NAME {
-        return Ok((state, ()));
-    }
-    let pending: Vec<Hash> = pending_from_json(&state.witness_pending_json);
-    if pending.is_empty() {
-        return Ok((state, ()));
-    }
-    let mut dag = dag_from_json(&state.dag_json, &state.root_pubkey_hex, &state.peer_nodes_json)?;
-    let conns = connections_from_json(&state.connections_json);
-    let Some(witness) =
-        mesh_author_witness(&mut dag, &state.signing_key_hex, &state.mesh_head_hex, &pending)?
-    else {
-        return Ok((state, ()));
-    };
-    let w_hash = witness.event_hash();
-    log(format!(
-        "[mesh] witness-tick: emitted Witness citing {} events (hash={}...)",
-        pending.len(),
-        &hex(&w_hash)[..16]
-    ));
-    broadcast_delivered(&conns, "", &witness.encode());
-    Ok((
-        ActorState {
-            dag_json: dag_to_json(&dag),
-            mesh_head_hex: hex(&w_hash),
-            witness_pending_json: "[]".to_string(),
-            ..state
-        },
-        (),
-    ))
-}
-
-/// Build, sign, and ingest a Witness event covering `cite_hashes`, parented on
-/// `mesh_head_hex`. Returns Ok(Some(event)) on success, Ok(None) if there's
-/// nothing to cite.
-fn mesh_author_witness(
-    dag: &mut Dag,
-    signing_key_hex: &str,
-    mesh_head_hex: &str,
-    cite_hashes: &[Hash],
-) -> Result<Option<Event>, String> {
-    if cite_hashes.is_empty() {
-        return Ok(None);
-    }
-    use ed25519_dalek::{Signer, SigningKey};
-    let key_bytes = from_hex32(signing_key_hex)?;
-    let signing_key = SigningKey::from_bytes(&key_bytes);
+fn author_genesis(dag: &mut Dag, signing_key: &SigningKey) -> Event {
     let author = signing_key.verifying_key().to_bytes();
-    let parent = from_hex32(mesh_head_hex)?;
-    let op = event::Op::Witness { also_cite: cite_hashes.to_vec() };
-    let signing_hash = Event::signing_hash(&parent, &author, &op);
-    let signature = signing_key.sign(&signing_hash).to_bytes();
-    let witness = Event { parent, author, op, signature };
-    match dag.ingest(witness.clone()) {
-        Ok(true) => Ok(Some(witness)),
-        Ok(false) => {
-            log(String::from(
-                "[mesh] mesh_author_witness: ingest buffered — should not happen for self-signed",
-            ));
-            Ok(None)
-        }
-        Err(e) => Err(format!("mesh_author_witness ingest: {}", e)),
+    let sh = Event::signing_hash(&author, &None, &[], &[]);
+    let ev = Event {
+        author,
+        self_parent: None,
+        refs: Vec::new(),
+        payload: Vec::new(),
+        signature: signing_key.sign(&sh).to_bytes(),
+    };
+    let _ = dag.ingest(ev.clone());
+    ev
+}
+
+/// Author an event on this node's chain: self_parent = current head, refs =
+/// foreign heads we've seen, with the given payload. Ingests and returns it.
+fn author_event(
+    dag: &mut Dag,
+    signing_key: &SigningKey,
+    self_head: Hash,
+    payload: Vec<u8>,
+) -> Result<Event, String> {
+    let author = signing_key.verifying_key().to_bytes();
+    let refs = foreign_heads(dag, &author);
+    let self_parent = Some(self_head);
+    let sh = Event::signing_hash(&author, &self_parent, &refs, &payload);
+    let ev = Event { author, self_parent, refs, payload, signature: signing_key.sign(&sh).to_bytes() };
+    match dag.ingest(ev.clone())? {
+        true => Ok(ev),
+        false => Err("authored event buffered (missing dep)".to_string()),
     }
 }
 
-/// Send a DELIVERED frame to every authed connection. `submitter` is excluded
-/// from the iteration (it was pulled out of `conns` during on-data) and gets an
-/// explicit re-send unless empty — empty means there's no submitter, e.g. when
-/// mesh itself emits a Witness via the timer tick.
-fn broadcast_delivered(conns: &BTreeMap<String, ConnState>, submitter: &str, event_bytes: &[u8]) {
-    let frame = encode_delivered(event_bytes);
+/// Heads of every member other than `me` that we currently hold.
+fn foreign_heads(dag: &Dag, me: &PubKey) -> Vec<Hash> {
+    let mut out = Vec::new();
+    for m in &dag.members {
+        if m == me {
+            continue;
+        }
+        out.extend(dag.heads_of(m));
+    }
+    out
+}
+
+/// All current heads across all members — our advertised frontier.
+fn all_heads(dag: &Dag) -> Vec<Hash> {
+    let mut out = Vec::new();
+    for m in &dag.members {
+        out.extend(dag.heads_of(m));
+    }
+    out
+}
+
+fn missing_deps(dag: &Dag, ev: &Event) -> Vec<Hash> {
+    let mut out = Vec::new();
+    if let Some(sp) = ev.self_parent {
+        if !dag.has(&sp) {
+            out.push(sp);
+        }
+    }
+    for r in &ev.refs {
+        if !dag.has(r) {
+            out.push(*r);
+        }
+    }
+    out
+}
+
+/// Broadcast a frame to every authed connection except `exclude`.
+fn broadcast(conns: &BTreeMap<String, ConnState>, exclude: &str, frame: &[u8]) {
     for (cid, cs) in conns {
-        if matches!(cs.phase, Phase::Authed { .. }) {
-            let _ = tcp_send(cid.clone(), frame.clone());
+        if cid == exclude {
+            continue;
         }
-    }
-    if !submitter.is_empty() {
-        let _ = tcp_send(submitter.to_string(), frame);
+        if matches!(cs.phase, Phase::Authed { .. }) {
+            let _ = tcp_send(cid.clone(), frame.to_vec());
+        }
     }
 }
 
-/// Per-connection challenge value: sha256(now_ms ‖ conn_id). NOTE: this is
-/// derived, not cryptographically random — it's predictable from timing. It's
-/// adequate as a possession/liveness check (the client must sign it with the
-/// claimed key) but should be replaced with a real CSPRNG nonce before relying
-/// on it for replay resistance.
+/// Deliver newly-finalized messages to connected app clients via NOTIFY. Folds
+/// the finalized event stream through the message reducer and NOTIFYs any
+/// committed message not yet delivered (tracked in `delivered`). This is the
+/// committed-delivery path — finality-gated, exactly-once per message.
+fn deliver_committed(
+    dag: &Dag,
+    conns: &BTreeMap<String, ConnState>,
+    delivered: &mut BTreeSet<Hash>,
+) {
+    let inboxes = fold::<Mailboxes>(dag);
+    for msgs in inboxes.by_recipient.values() {
+        for msg in msgs {
+            if delivered.insert(msg.event) {
+                let frame = encode_notify(&msg.from, &msg.body);
+                for (cid, cs) in conns {
+                    if matches!(cs.phase, Phase::Authed { .. }) {
+                        let _ = tcp_send(cid.clone(), frame.clone());
+                    }
+                }
+            }
+        }
+    }
+}
+
 fn challenge_nonce(conn_id: &str) -> [u8; 32] {
+    // Derived, not cryptographically random (predictable from timing); adequate
+    // as a possession check, replace with a CSPRNG before relying on replay
+    // resistance. Same caveat as v2.
     let mut h = Sha256::new();
     h.update(now_ms().to_be_bytes());
     h.update(conn_id.as_bytes());

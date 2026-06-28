@@ -1,13 +1,13 @@
 //! Persistence layer: converts between the in-memory structures and the flat
 //! JSON strings stored in `ActorState`, plus the hex helpers they share.
 //!
-//! IMPORTANT: this is NOT the wire/event format. The event and frame encodings
-//! (event.rs, wire.rs) are hand-rolled and canonical because they're signed and
-//! sent across the network. This module only serializes the actor's *own* state
-//! for theater's value store, so it uses serde_json freely — nothing here is
-//! signed, hashed, or language-portable.
+//! IMPORTANT: this is NOT the wire/event format. The event encoding (event.rs)
+//! is hand-rolled and canonical because it's signed and sent across the network.
+//! This module only serializes the actor's *own* state for theater's value
+//! store, so it uses serde_json freely — nothing here is signed or
+//! language-portable.
 
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
@@ -59,30 +59,43 @@ pub fn connections_from_json(s: &str) -> BTreeMap<String, ConnState> {
     serde_json::from_str(s).unwrap_or_default()
 }
 
-// ---- witness-pending hashes ----
+// ---- members (the static configured set) ----
 
-pub fn pending_to_json(hashes: &[Hash]) -> String {
-    let hexed: Vec<String> = hashes.iter().map(|h| hex(h)).collect();
+pub fn members_to_json(members: &BTreeSet<PubKey>) -> String {
+    let hexed: Vec<String> = members.iter().map(|pk| hex(pk)).collect();
     serde_json::to_string(&hexed).unwrap_or_else(|_| "[]".to_string())
 }
 
-pub fn pending_from_json(s: &str) -> Vec<Hash> {
+pub fn members_from_json(s: &str) -> BTreeSet<PubKey> {
     let hexed: Vec<String> = serde_json::from_str(s).unwrap_or_default();
     hexed.into_iter().filter_map(|h| from_hex32(&h).ok()).collect()
 }
 
-// ---- peer nodes (genesis pre-admits), stored as [[pubkey_hex, name], ...] ----
+// ---- hash lists (orphan buffer / frontier persistence — wired in Step 4) ----
 
-pub fn peer_nodes_to_json(peers: &[(PubKey, String)]) -> String {
-    let mapped: Vec<(String, String)> =
-        peers.iter().map(|(pk, name)| (hex(pk), name.clone())).collect();
-    serde_json::to_string(&mapped).unwrap_or_else(|_| "[]".to_string())
+pub fn hashes_to_json(hashes: &[Hash]) -> String {
+    let hexed: Vec<String> = hashes.iter().map(|h| hex(h)).collect();
+    serde_json::to_string(&hexed).unwrap_or_else(|_| "[]".to_string())
 }
 
-pub fn peer_nodes_from_json(s: &str) -> Vec<(PubKey, String)> {
-    let raw: Vec<(String, String)> = serde_json::from_str(s).unwrap_or_default();
-    raw.into_iter()
-        .filter_map(|(pk_hex, name)| from_hex32(&pk_hex).ok().map(|pk| (pk, name)))
+pub fn hashes_from_json(s: &str) -> Vec<Hash> {
+    let hexed: Vec<String> = serde_json::from_str(s).unwrap_or_default();
+    hexed.into_iter().filter_map(|h| from_hex32(&h).ok()).collect()
+}
+
+// ---- event lists (the persisted orphan buffer) ----
+
+pub fn events_to_json(events: &[Event]) -> String {
+    let hexed: Vec<String> = events.iter().map(|e| hex(&e.encode())).collect();
+    serde_json::to_string(&hexed).unwrap_or_else(|_| "[]".to_string())
+}
+
+pub fn events_from_json(s: &str) -> Vec<Event> {
+    let hexed: Vec<String> = serde_json::from_str(s).unwrap_or_default();
+    hexed
+        .into_iter()
+        .filter_map(|h| from_hex(&h).ok())
+        .filter_map(|b| Event::decode(&b).ok())
         .collect()
 }
 
@@ -102,18 +115,13 @@ pub fn dag_to_json(dag: &Dag) -> String {
     serde_json::to_string(&DagBlob { events_hex }).unwrap_or_else(|_| "{}".to_string())
 }
 
-/// Rebuild a Dag from persisted state. These events were already validated
-/// when first ingested, so we `rehydrate` (rebuild indices) instead of
-/// re-running signature + rule checks on every callback.
-pub fn dag_from_json(
-    s: &str,
-    root_pubkey_hex: &str,
-    peer_nodes_json: &str,
-) -> Result<Dag, String> {
+/// Rebuild a Dag from persisted state. These events were already validated when
+/// first ingested, so we `rehydrate` (rebuild indices) instead of re-running
+/// signature + rule checks on every callback.
+pub fn dag_from_json(s: &str, members_json: &str) -> Result<Dag, String> {
     let blob: DagBlob =
         serde_json::from_str(s).unwrap_or(DagBlob { events_hex: BTreeMap::new() });
-    let root = from_hex32(root_pubkey_hex)?;
-    let peer_nodes = peer_nodes_from_json(peer_nodes_json);
+    let members = members_from_json(members_json);
     let mut events = Vec::with_capacity(blob.events_hex.len());
     for ev_hex in blob.events_hex.values() {
         let bytes = from_hex(ev_hex)?;
@@ -121,13 +129,12 @@ pub fn dag_from_json(
             events.push(ev);
         }
     }
-    Ok(Dag::rehydrate(root, peer_nodes, events))
+    Ok(Dag::rehydrate(members, events))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::event::{Op, GENESIS_PARENT};
     use ed25519_dalek::{Signer, SigningKey};
 
     #[test]
@@ -144,39 +151,41 @@ mod tests {
     }
 
     #[test]
-    fn pending_round_trips() {
+    fn hashes_round_trip() {
         let hashes = alloc::vec![[1u8; 32], [2u8; 32]];
-        assert_eq!(pending_from_json(&pending_to_json(&hashes)), hashes);
+        assert_eq!(hashes_from_json(&hashes_to_json(&hashes)), hashes);
     }
 
     #[test]
-    fn peer_nodes_round_trip() {
-        let peers = alloc::vec![([3u8; 32], "node-b".to_string())];
-        assert_eq!(peer_nodes_from_json(&peer_nodes_to_json(&peers)), peers);
+    fn members_round_trip() {
+        let m: BTreeSet<PubKey> = BTreeSet::from([[3u8; 32], [4u8; 32]]);
+        assert_eq!(members_from_json(&members_to_json(&m)), m);
     }
 
     #[test]
     fn dag_persists_and_rehydrates() {
-        let root = SigningKey::from_bytes(&[1u8; 32]);
-        let root_pk = root.verifying_key().to_bytes();
-        let mut dag = Dag::new(root_pk, Vec::new());
+        let a = SigningKey::from_bytes(&[1u8; 32]);
+        let apk = a.verifying_key().to_bytes();
+        let members = BTreeSet::from([apk]);
+        let mut dag = Dag::new(members.clone());
 
-        let op = Op::MailboxCreate { subject: [7u8; 32], name: "alice".to_string() };
-        let signing_hash = Event::signing_hash(&GENESIS_PARENT, &root_pk, &op);
-        let create = Event {
-            parent: GENESIS_PARENT,
-            author: root_pk,
-            op,
-            signature: root.sign(&signing_hash).to_bytes(),
+        let payload = b"hi".to_vec();
+        let sh = Event::signing_hash(&apk, &None, &[], &payload);
+        let g = Event {
+            author: apk,
+            self_parent: None,
+            refs: Vec::new(),
+            payload,
+            signature: a.sign(&sh).to_bytes(),
         };
-        let h = create.event_hash();
-        dag.ingest(create).unwrap();
+        let h = g.event_hash();
+        dag.ingest(g).unwrap();
 
         let json = dag_to_json(&dag);
-        let restored = dag_from_json(&json, &hex(&root_pk), "[]").unwrap();
-        assert!(restored.events.contains_key(&h));
+        let restored = dag_from_json(&json, &members_to_json(&members)).unwrap();
+        assert!(restored.has(&h));
         assert_eq!(restored.events.len(), dag.events.len());
-        // The rehydrated DAG derives the same state.
-        assert!(restored.state_at(&h).unwrap().is_member(&[7u8; 32]));
+        // A single-member network finalizes its own event.
+        assert!(restored.is_finalized(&h));
     }
 }

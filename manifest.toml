@@ -11,6 +11,9 @@ type = "runtime"
 type = "tcp"
 
 [[handler]]
+type = "timer"
+
+[[handler]]
 type = "store"
 base_path = "/tmp/mesh-smoke-store"
 store_id = "mesh"

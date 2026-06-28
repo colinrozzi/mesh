@@ -1,163 +1,104 @@
-//! DAG storage + traversal + state derivation.
+//! DAG storage + finality, over a multi-parent event graph (v3).
 //!
-//! Events form a content-addressed DAG via `parent: EventHash`. The
-//! genesis pubkey (root Node) is implicitly a member; the first real
-//! event branches off `GENESIS_PARENT`.
-//!
-//! State distinguishes two member kinds: **Nodes** and **Mailboxes**.
-//! Their roles differ:
-//!   - Nodes may sign any op. Their Witnesses count for consensus.
-//!   - Mailboxes may sign Send only. They are addressable identities,
-//!     not consensus participants.
-//!
-//! State derivation: walk the DAG from genesis to a chosen head, sort
-//! events causally (parents before children, hash-sort for siblings),
-//! apply state-mutating ops.
+//! Each event has back-edges `self_parent ∪ refs` (see event.rs): `self_parent`
+//! is the author's own previous event, `refs` are foreign heads it grafted.
+//! Membership is **static configuration** — the substrate is told the member
+//! set; it does not derive it from the log. The substrate's only jobs here are
+//! to admit valid events, track reverse-reachability (who has witnessed what),
+//! decide finality (every member has witnessed an event), and produce the
+//! canonical finalized order for a reducer to consume. See DESIGN-v3.md.
 
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::format;
-use alloc::string::{String, ToString};
+use alloc::string::String;
 use alloc::vec::Vec;
 
 use crate::codec::hex;
-use crate::event::{Event, Hash, Op, PubKey, GENESIS_PARENT};
+use crate::event::{Event, Hash, PubKey};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum MemberKind {
-    Node,
-    Mailbox,
+/// The back-edges of an event: its `self_parent` (if any) and its `refs`,
+/// de-duplicated (an honest event won't repeat, but decode permits it).
+fn dep_set(ev: &Event) -> BTreeSet<Hash> {
+    let mut deps = BTreeSet::new();
+    if let Some(sp) = ev.self_parent {
+        deps.insert(sp);
+    }
+    for r in &ev.refs {
+        deps.insert(*r);
+    }
+    deps
 }
 
 #[derive(Clone, Debug)]
-pub struct MemberInfo {
-    pub kind: MemberKind,
-    /// Human label carried by the NodeIntroduce/MailboxCreate op. Captured
-    /// from the wire protocol; not yet surfaced by any query path.
-    #[allow(dead_code)]
-    pub name: String,
-}
-
-#[derive(Clone, Debug, Default)]
-pub struct State {
-    pub members: BTreeMap<PubKey, MemberInfo>,
-}
-
-impl State {
-    /// Genesis state: just the root Node.
-    pub fn genesis(root: PubKey) -> Self {
-        let mut members = BTreeMap::new();
-        members.insert(
-            root,
-            MemberInfo {
-                kind: MemberKind::Node,
-                name: "root".to_string(),
-            },
-        );
-        State { members }
-    }
-
-    /// Genesis state with additional pre-admitted peer Nodes (founding members).
-    /// Used to bootstrap multi-node networks without a runtime NodeIntroduce dance.
-    pub fn genesis_with_peers(root: PubKey, peers: &[(PubKey, String)]) -> Self {
-        let mut state = Self::genesis(root);
-        for (pk, name) in peers {
-            if *pk == root {
-                continue;
-            }
-            state.members.insert(
-                *pk,
-                MemberInfo {
-                    kind: MemberKind::Node,
-                    name: name.clone(),
-                },
-            );
-        }
-        state
-    }
-
-    pub fn is_member(&self, pk: &PubKey) -> bool {
-        self.members.contains_key(pk)
-    }
-
-    pub fn is_node(&self, pk: &PubKey) -> bool {
-        matches!(self.members.get(pk), Some(m) if m.kind == MemberKind::Node)
-    }
-}
-
-/// The DAG: indexed by event hash, with children index + pending buffer
-/// for events whose parents arrive later.
-#[derive(Clone, Debug, Default)]
 pub struct Dag {
-    pub root_pubkey: PubKey,
-    /// Additional pre-admitted Nodes at genesis (besides root). Used to bootstrap
-    /// multi-node networks. Each is (pubkey, name).
-    pub peer_nodes: Vec<(PubKey, String)>,
+    /// Static, configured member set. Identical on every node in the network.
+    pub members: BTreeSet<PubKey>,
     pub events: BTreeMap<Hash, Event>,
-    pub children: BTreeMap<Hash, BTreeSet<Hash>>,
-    pub pending_by_missing_parent: BTreeMap<Hash, Vec<Event>>,
+    /// Reverse adjacency: for each event hash, the events that directly
+    /// reference it (via `self_parent` or `refs`) — "who observes me."
+    /// Maintained incrementally; drives `events_that_see`.
+    observed_by: BTreeMap<Hash, BTreeSet<Hash>>,
+    /// Events held until a missing dependency arrives, keyed by one missing
+    /// dependency hash. When that hash lands, the waiters are re-ingested.
+    pending: BTreeMap<Hash, Vec<Event>>,
 }
 
 impl Dag {
-    pub fn new(root_pubkey: PubKey, peer_nodes: Vec<(PubKey, String)>) -> Self {
+    pub fn new(members: BTreeSet<PubKey>) -> Self {
         Dag {
-            root_pubkey,
-            peer_nodes,
+            members,
             events: BTreeMap::new(),
-            children: BTreeMap::new(),
-            pending_by_missing_parent: BTreeMap::new(),
+            observed_by: BTreeMap::new(),
+            pending: BTreeMap::new(),
         }
     }
 
-    /// Rebuild from persisted, already-validated events: insert each one and
-    /// rebuild the children index. Unlike `ingest`, this skips signature and
-    /// rule checks — the events passed validation when first received, so
-    /// reloading our own store is O(n) inserts rather than a full
-    /// re-verification on every callback.
-    pub fn rehydrate(
-        root_pubkey: PubKey,
-        peer_nodes: Vec<(PubKey, String)>,
-        events: Vec<Event>,
-    ) -> Self {
-        let mut dag = Self::new(root_pubkey, peer_nodes);
+    /// Rebuild from persisted, already-validated events: insert each and
+    /// rebuild the reverse index. Skips signature + rule checks (they passed
+    /// when first ingested), so reloading is O(n) inserts.
+    pub fn rehydrate(members: BTreeSet<PubKey>, events: Vec<Event>) -> Self {
+        let mut dag = Self::new(members);
         for ev in events {
             let h = ev.event_hash();
-            dag.children.entry(ev.parent).or_default().insert(h);
-            dag.events.insert(h, ev);
+            dag.insert(h, ev);
         }
         dag
     }
 
-    fn genesis_state(&self) -> State {
-        State::genesis_with_peers(self.root_pubkey, &self.peer_nodes)
-    }
-
-    /// Ingest one event. Ok(true) on accept, Ok(false) on parent-buffer,
-    /// Err on hard validation failure.
+    /// Ingest one event. `Ok(true)` on accept (or already-present),
+    /// `Ok(false)` when buffered pending a missing dependency, `Err` on hard
+    /// validation failure.
     pub fn ingest(&mut self, event: Event) -> Result<bool, String> {
         event.verify_signature()?;
+        if !self.members.contains(&event.author) {
+            return Err(format!("author {} is not a member", hex(&event.author)));
+        }
         let h = event.event_hash();
         if self.events.contains_key(&h) {
-            return Ok(true);
+            return Ok(true); // dedup — idempotent
         }
-        let parent = event.parent;
-        let parent_present = parent == GENESIS_PARENT || self.events.contains_key(&parent);
-        if !parent_present {
-            self.pending_by_missing_parent
-                .entry(parent)
-                .or_insert_with(Vec::new)
-                .push(event);
+
+        // Buffer until every dependency (self_parent + refs) is present.
+        if let Some(missing) = dep_set(&event)
+            .into_iter()
+            .find(|d| !self.events.contains_key(d))
+        {
+            self.pending.entry(missing).or_default().push(event);
             return Ok(false);
         }
-        let state_at_parent = self.state_at(&parent)?;
-        validate_event(&event, &state_at_parent, &self.root_pubkey)?;
 
-        self.children
-            .entry(parent)
-            .or_insert_with(BTreeSet::new)
-            .insert(h);
-        self.events.insert(h, event);
+        // self_parent must be one of the author's own events.
+        if let Some(sp) = event.self_parent {
+            let parent = self.events.get(&sp).expect("dep present");
+            if parent.author != event.author {
+                return Err("self_parent must be authored by the same node".into());
+            }
+        }
 
-        if let Some(waiters) = self.pending_by_missing_parent.remove(&h) {
+        self.insert(h, event);
+
+        // Re-drive anything that was waiting on this event.
+        if let Some(waiters) = self.pending.remove(&h) {
             for w in waiters {
                 let _ = self.ingest(w);
             }
@@ -165,116 +106,68 @@ impl Dag {
         Ok(true)
     }
 
-    /// State *at* a given event (i.e. inclusive — including that event's
-    /// own state-mutating op if any). Genesis returns the bare-root state.
-    pub fn state_at(&self, h: &Hash) -> Result<State, String> {
-        if *h == GENESIS_PARENT {
-            return Ok(self.genesis_state());
+    /// Insert an event and update the reverse index. (No validation — callers
+    /// validate, or trust persisted input via `rehydrate`.)
+    fn insert(&mut self, h: Hash, event: Event) {
+        for dep in dep_set(&event) {
+            self.observed_by.entry(dep).or_default().insert(h);
         }
-        let ancestors = self.ancestors_including(h)?;
-        let ordered = self.topo_sort(&ancestors)?;
-        let mut state = self.genesis_state();
-        for eh in &ordered {
-            let ev = self.events.get(eh).ok_or_else(|| "missing event in walk".to_string())?;
-            apply_op(&mut state, ev, &self.root_pubkey);
-        }
-        Ok(state)
+        self.events.insert(h, event);
     }
 
-    fn ancestors_including(&self, h: &Hash) -> Result<BTreeSet<Hash>, String> {
-        let mut out = BTreeSet::new();
-        let mut stack = alloc::vec![*h];
-        while let Some(cur) = stack.pop() {
-            if cur == GENESIS_PARENT { continue; }
-            if !out.insert(cur) { continue; }
-            let ev = self.events.get(&cur).ok_or_else(|| {
-                format!("ancestors_including: missing event {}", hex(&cur))
-            })?;
-            stack.push(ev.parent);
-        }
-        Ok(out)
+    pub fn has(&self, h: &Hash) -> bool {
+        self.events.contains_key(h)
     }
 
-    fn topo_sort(&self, set: &BTreeSet<Hash>) -> Result<Vec<Hash>, String> {
-        let mut indeg: BTreeMap<Hash, usize> = BTreeMap::new();
-        for h in set {
-            let ev = self.events.get(h).ok_or_else(|| "topo: missing event".to_string())?;
-            let parent_in_set = set.contains(&ev.parent);
-            indeg.insert(*h, if parent_in_set { 1 } else { 0 });
-        }
-        let mut ready: BTreeSet<Hash> = indeg
-            .iter()
-            .filter_map(|(h, d)| if *d == 0 { Some(*h) } else { None })
-            .collect();
-        let mut out = Vec::with_capacity(set.len());
-        while !ready.is_empty() {
-            let cur = *ready.iter().next().unwrap();
-            ready.remove(&cur);
-            out.push(cur);
-            if let Some(kids) = self.children.get(&cur) {
-                for k in kids {
-                    if let Some(d) = indeg.get_mut(k) {
-                        *d -= 1;
-                        if *d == 0 && set.contains(k) {
-                            ready.insert(*k);
-                        }
-                    }
-                }
-            }
-        }
-        if out.len() != set.len() {
-            return Err(format!(
-                "topo: cycle or unreachable ({} sorted of {})",
-                out.len(),
-                set.len()
-            ));
-        }
-        Ok(out)
+    /// Events buffered awaiting a missing dependency. Persisted across callbacks
+    /// so backfilled children survive until their parents arrive.
+    pub fn pending_events(&self) -> Vec<Event> {
+        self.pending.values().flatten().cloned().collect()
     }
 
-    // ===== Finality + consensus state ============================================
-    //
-    // An event E is "seen" by another event E' if E is reachable from E'
-    // via either the parent chain or Witness.also_cite edges. Witnesses
-    // from Nodes that see E are E's finality votes.
-    //
-    // E is "finalized" iff the set of Node-authors of Witnesses seeing E
-    // is a superset of "current Nodes at E.parent" (the Nodes that existed
-    // when E was proposed).
-    //
-    // Consensus state = state walked from genesis through the linear chain
-    // of finalized state-changing events. Sequential consensus = one
-    // state-changing event extends the chain at a time; ties broken by
-    // lowest-hash.
-
-    /// All events that transitively "see" `target` — either descendant via
-    /// parent chain, OR Witness whose `also_cite` includes `target`, OR
-    /// (recursively) a Witness whose `also_cite` includes such an event.
-    ///
-    /// Computed as a reverse-reachability BFS: build the "observed-by" graph
-    /// (for each event, who points at it via parent or also_cite), then walk
-    /// outward from `target`. O(events + edges) rather than the O(events²) of
-    /// a repeated fixpoint scan.
-    pub fn events_that_see(&self, target: &Hash) -> BTreeSet<Hash> {
-        // observed_by[x] = events that *directly* see x (x is their parent, or
-        // a Witness cites x).
-        let mut observed_by: BTreeMap<Hash, Vec<Hash>> = BTreeMap::new();
+    /// The author's head(s): events authored by `author` that no other event of
+    /// that author builds on. Exactly one under honest operation; a set if the
+    /// author has forked.
+    pub fn heads_of(&self, author: &PubKey) -> BTreeSet<Hash> {
+        let mut heads = BTreeSet::new();
         for (h, ev) in &self.events {
-            observed_by.entry(ev.parent).or_default().push(*h);
-            if let Op::Witness { also_cite } = &ev.op {
-                for cited in also_cite {
-                    observed_by.entry(*cited).or_default().push(*h);
-                }
+            if ev.author != *author {
+                continue;
+            }
+            let extended = self
+                .observed_by
+                .get(h)
+                .map(|obs| {
+                    obs.iter().any(|o| {
+                        self.events
+                            .get(o)
+                            .is_some_and(|e| e.author == *author && e.self_parent == Some(*h))
+                    })
+                })
+                .unwrap_or(false);
+            if !extended {
+                heads.insert(*h);
             }
         }
+        heads
+    }
 
-        let mut seen: BTreeSet<Hash> = BTreeSet::from([*target]);
+    // ===== Finality ============================================================
+    //
+    // An event E is "seen" by E' if E is reachable from E' over self_parent/refs
+    // back-edges. E is finalized iff every member has authored an event that
+    // sees E. Membership is static, so "every member" is just the configured set.
+
+    /// All events that transitively see `target` (target included). Reverse-BFS
+    /// over the incrementally-maintained `observed_by` index.
+    pub fn events_that_see(&self, target: &Hash) -> BTreeSet<Hash> {
+        let mut seen = BTreeSet::from([*target]);
         let mut frontier = alloc::vec![*target];
         while let Some(cur) = frontier.pop() {
-            if let Some(observers) = observed_by.get(&cur) {
-                for &obs in observers {
-                    if seen.insert(obs) {
-                        frontier.push(obs);
+            if let Some(observers) = self.observed_by.get(&cur) {
+                for &o in observers {
+                    if seen.insert(o) {
+                        frontier.push(o);
                     }
                 }
             }
@@ -282,13 +175,12 @@ impl Dag {
         seen
     }
 
-    /// Node-pubkeys among Witnesses in `events_that_see(target)`.
-    pub fn witnessing_nodes(&self, target: &Hash) -> BTreeSet<PubKey> {
-        let seen = self.events_that_see(target);
+    /// Members who have authored an event that sees `target`.
+    pub fn witnessing_members(&self, target: &Hash) -> BTreeSet<PubKey> {
         let mut out = BTreeSet::new();
-        for h in &seen {
-            if let Some(ev) = self.events.get(h) {
-                if matches!(ev.op, Op::Witness { .. }) {
+        for h in self.events_that_see(target) {
+            if let Some(ev) = self.events.get(&h) {
+                if self.members.contains(&ev.author) {
                     out.insert(ev.author);
                 }
             }
@@ -296,176 +188,58 @@ impl Dag {
         out
     }
 
-    /// The Node-pubkeys present in the state at event `h` — i.e. the Nodes
-    /// whose Witnesses are required to finalize `h`'s children. Returns None if
-    /// the state can't be derived (e.g. a missing ancestor).
-    fn nodes_at(&self, h: &Hash) -> Option<BTreeSet<PubKey>> {
-        let state = self.state_at(h).ok()?;
-        Some(
-            state
-                .members
-                .iter()
-                .filter(|(_, info)| info.kind == MemberKind::Node)
-                .map(|(pk, _)| *pk)
-                .collect(),
-        )
-    }
-
-    /// Whether `target` is witnessed by every Node in `required`.
-    fn has_required_witnesses(&self, target: &Hash, required: &BTreeSet<PubKey>) -> bool {
-        required.is_subset(&self.witnessing_nodes(target))
-    }
-
-    /// True iff every current Node (at target's parent state) has signed
-    /// a Witness that transitively references target. Public consensus-API
-    /// surface (see README); `consensus_state_head` inlines the equivalent
-    /// check with the Node set hoisted per level.
-    #[allow(dead_code)]
+    /// True iff every member has witnessed `target`.
     pub fn is_finalized(&self, target: &Hash) -> bool {
-        let parent = match self.events.get(target) {
-            Some(e) => e.parent,
-            None => return false,
-        };
-        match self.nodes_at(&parent) {
-            Some(required) => self.has_required_witnesses(target, &required),
-            None => false,
-        }
+        self.events.contains_key(target) && self.members.is_subset(&self.witnessing_members(target))
     }
 
-    /// True if op is a state-changing op (NodeIntroduce, MailboxCreate, Revoke).
-    pub fn is_state_mutating(op: &Op) -> bool {
-        matches!(
-            op,
-            Op::NodeIntroduce { .. } | Op::MailboxCreate { .. } | Op::Revoke { .. }
-        )
+    /// The finalized events in canonical order: topologically sorted (every
+    /// event after its `self_parent ∪ refs`), ties broken by event hash. This is
+    /// the stream a reducer consumes. The finalized set is ancestry-closed, so
+    /// every dependency of an included event is also included.
+    pub fn ordered_finalized(&self) -> Vec<Hash> {
+        let finalized: BTreeSet<Hash> = self
+            .events
+            .keys()
+            .copied()
+            .filter(|h| self.is_finalized(h))
+            .collect();
+        self.topo_sort(&finalized)
     }
 
-    /// Walk forward from genesis through the linear chain of finalized
-    /// state-changing events. Ties broken by lowest event-hash. Returns the
-    /// current state-DAG head (or GENESIS_PARENT if no state changes yet).
-    pub fn consensus_state_head(&self) -> Hash {
-        let mut head = GENESIS_PARENT;
-        loop {
-            let children = match self.children.get(&head) {
-                Some(c) => c,
-                None => break,
-            };
-            // The Nodes required to finalize any child are those present at
-            // `head` (the children's shared parent) — compute once per level.
-            let Some(required) = self.nodes_at(&head) else {
-                break;
-            };
-            // `children` is a BTreeSet, so iteration is hash-ascending; the
-            // first finalized state-changing child is the lowest-hash winner.
-            let next = children.iter().find(|h| {
-                self.events.get(*h).is_some_and(|ev| {
-                    Self::is_state_mutating(&ev.op)
-                        && self.has_required_witnesses(h, &required)
-                })
-            });
-            match next {
-                Some(h) => head = *h,
-                None => break,
+    fn topo_sort(&self, set: &BTreeSet<Hash>) -> Vec<Hash> {
+        let mut indeg: BTreeMap<Hash, usize> = BTreeMap::new();
+        for h in set {
+            let ev = &self.events[h];
+            let d = dep_set(ev).iter().filter(|x| set.contains(*x)).count();
+            indeg.insert(*h, d);
+        }
+        // `ready` is a BTreeSet so iteration is hash-ascending → deterministic
+        // lowest-hash tie-break among concurrent events.
+        let mut ready: BTreeSet<Hash> =
+            indeg.iter().filter(|(_, d)| **d == 0).map(|(h, _)| *h).collect();
+        let mut out = Vec::with_capacity(set.len());
+        while let Some(&cur) = ready.iter().next() {
+            ready.remove(&cur);
+            out.push(cur);
+            if let Some(observers) = self.observed_by.get(&cur) {
+                for o in observers {
+                    if let Some(d) = indeg.get_mut(o) {
+                        *d -= 1;
+                        if *d == 0 {
+                            ready.insert(*o);
+                        }
+                    }
+                }
             }
         }
-        head
-    }
-
-    /// The current consensus state — state walked through the state-DAG
-    /// from genesis to consensus head.
-    pub fn consensus_state(&self) -> State {
-        self.state_at(&self.consensus_state_head())
-            .unwrap_or_else(|_| self.genesis_state())
-    }
-}
-
-fn apply_op(state: &mut State, ev: &Event, root_pubkey: &PubKey) {
-    match &ev.op {
-        Op::NodeIntroduce { subject, name } => {
-            state.members.entry(*subject).or_insert_with(|| MemberInfo {
-                kind: MemberKind::Node,
-                name: name.clone(),
-            });
-        }
-        Op::MailboxCreate { subject, name } => {
-            state.members.entry(*subject).or_insert_with(|| MemberInfo {
-                kind: MemberKind::Mailbox,
-                name: name.clone(),
-            });
-        }
-        Op::Revoke { subject } => {
-            // Root is identified by pubkey, not by the "root" name label.
-            if subject != root_pubkey {
-                state.members.remove(subject);
-            }
-        }
-        Op::Send { .. } | Op::Witness { .. } => {
-            // No state change.
-        }
-    }
-}
-
-fn validate_event(
-    event: &Event,
-    state_at_parent: &State,
-    root_pubkey: &PubKey,
-) -> Result<(), String> {
-    // Genesis-only special case: the first event after the genesis sentinel
-    // must come from the root Node.
-    if event.parent == GENESIS_PARENT && event.author != *root_pubkey {
-        return Err("only root may author the first event off genesis".to_string());
-    }
-    if !state_at_parent.is_member(&event.author) {
-        return Err(format!("author {} not a member at parent", hex(&event.author)));
-    }
-    match &event.op {
-        Op::NodeIntroduce { subject, .. } => {
-            require_node(state_at_parent, &event.author, "NodeIntroduce")?;
-            if state_at_parent.is_member(subject) {
-                return Err(format!("NodeIntroduce: {} already a member", hex(subject)));
-            }
-        }
-        Op::MailboxCreate { subject, .. } => {
-            require_node(state_at_parent, &event.author, "MailboxCreate")?;
-            if state_at_parent.is_member(subject) {
-                return Err(format!("MailboxCreate: {} already a member", hex(subject)));
-            }
-        }
-        Op::Revoke { subject } => {
-            require_node(state_at_parent, &event.author, "Revoke")?;
-            if !state_at_parent.is_member(subject) {
-                return Err(format!("Revoke: {} not a member", hex(subject)));
-            }
-            if subject == root_pubkey {
-                return Err("Revoke: cannot revoke root".to_string());
-            }
-        }
-        Op::Send { recipient, .. } => {
-            // Send may be authored by any member (Node OR Mailbox).
-            if !state_at_parent.is_member(recipient) {
-                return Err(format!("Send: recipient {} not a member", hex(recipient)));
-            }
-        }
-        Op::Witness { .. } => {
-            // Witness must be authored by a Node — Mailboxes may not witness.
-            require_node(state_at_parent, &event.author, "Witness")?;
-        }
-    }
-    Ok(())
-}
-
-fn require_node(state: &State, pk: &PubKey, op_name: &str) -> Result<(), String> {
-    if state.is_node(pk) {
-        Ok(())
-    } else {
-        Err(format!("{}: author {} is not a Node", op_name, hex(pk)))
+        out
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::event::{Event, Op};
     use ed25519_dalek::{Signer, SigningKey};
 
     fn key(seed: u8) -> SigningKey {
@@ -476,179 +250,166 @@ mod tests {
         sk.verifying_key().to_bytes()
     }
 
-    fn signed(sk: &SigningKey, parent: Hash, op: Op) -> Event {
+    fn members(sks: &[&SigningKey]) -> BTreeSet<PubKey> {
+        sks.iter().map(|sk| pk(sk)).collect()
+    }
+
+    fn signed(sk: &SigningKey, self_parent: Option<Hash>, refs: Vec<Hash>, payload: Vec<u8>) -> Event {
         let author = pk(sk);
-        let signing_hash = Event::signing_hash(&parent, &author, &op);
-        Event { parent, author, op, signature: sk.sign(&signing_hash).to_bytes() }
-    }
-
-    /// Ingest `op` from `author` at the current consensus head, then have the
-    /// root witness it so single-node consensus finalizes. Returns the event hash.
-    fn commit(dag: &mut Dag, root: &SigningKey, author: &SigningKey, op: Op) -> Hash {
-        let head = dag.consensus_state_head();
-        let ev = signed(author, head, op);
-        let h = ev.event_hash();
-        dag.ingest(ev).expect("ingest event");
-        let witness = signed(root, h, Op::Witness { also_cite: alloc::vec![h] });
-        dag.ingest(witness).expect("ingest witness");
-        h
+        let signing_hash = Event::signing_hash(&author, &self_parent, &refs, &payload);
+        Event { author, self_parent, refs, payload, signature: sk.sign(&signing_hash).to_bytes() }
     }
 
     #[test]
-    fn genesis_has_root_as_node() {
-        let root = key(1);
-        let dag = Dag::new(pk(&root), Vec::new());
-        let state = dag.consensus_state();
-        assert!(state.is_member(&pk(&root)));
-        assert!(state.is_node(&pk(&root)));
+    fn single_member_finalizes_its_own_genesis() {
+        let a = key(1);
+        let mut dag = Dag::new(members(&[&a]));
+        let g = signed(&a, None, Vec::new(), Vec::new());
+        let gh = g.event_hash();
+        assert!(dag.ingest(g).unwrap());
+        assert!(dag.is_finalized(&gh));
+        assert_eq!(dag.ordered_finalized(), alloc::vec![gh]);
     }
 
     #[test]
-    fn genesis_with_peers_admits_peer_nodes() {
-        let root = key(1);
-        let peer = key(2);
-        let dag = Dag::new(pk(&root), alloc::vec![(pk(&peer), "node-b".to_string())]);
-        let state = dag.consensus_state();
-        assert!(state.is_node(&pk(&peer)));
+    fn two_members_finalize_via_mutual_grafting() {
+        let a = key(1);
+        let b = key(2);
+        let mut dag = Dag::new(members(&[&a, &b]));
+
+        let ga = signed(&a, None, Vec::new(), Vec::new());
+        let gb = signed(&b, None, Vec::new(), Vec::new());
+        let (gah, gbh) = (ga.event_hash(), gb.event_hash());
+        dag.ingest(ga).unwrap();
+        dag.ingest(gb).unwrap();
+
+        // Neither genesis is finalized yet — only its own author has witnessed.
+        assert!(!dag.is_finalized(&gah));
+        assert!(!dag.is_finalized(&gbh));
+
+        // Each grafts the other's genesis.
+        let a1 = signed(&a, Some(gah), alloc::vec![gbh], Vec::new());
+        let b1 = signed(&b, Some(gbh), alloc::vec![gah], Vec::new());
+        let (a1h, b1h) = (a1.event_hash(), b1.event_hash());
+        dag.ingest(a1).unwrap();
+        dag.ingest(b1).unwrap();
+
+        // Both genesis events are now seen by A and B → finalized.
+        assert!(dag.is_finalized(&gah));
+        assert!(dag.is_finalized(&gbh));
+        // The grafts themselves aren't finalized: each is seen by only one member.
+        assert!(!dag.is_finalized(&a1h));
+        assert!(!dag.is_finalized(&b1h));
+
+        // Canonical order is a valid topo-sort over the finalized set.
+        let order = dag.ordered_finalized();
+        assert_eq!(order.len(), 2);
+        assert!(order.contains(&gah) && order.contains(&gbh));
+        assert_topo_valid(&dag, &order);
     }
 
     #[test]
-    fn create_mailbox_needs_a_witness_to_finalize() {
-        let root = key(1);
-        let alice = key(7);
-        let mut dag = Dag::new(pk(&root), Vec::new());
-
-        let create = signed(&root, GENESIS_PARENT, Op::MailboxCreate {
-            subject: pk(&alice),
-            name: "alice".to_string(),
-        });
-        let h = create.event_hash();
-        dag.ingest(create).expect("ingest create");
-
-        // Not finalized before any witness; alice not yet in consensus state.
-        assert!(!dag.is_finalized(&h));
-        assert!(!dag.consensus_state().is_member(&pk(&alice)));
-
-        // Root witnesses -> finalized and applied.
-        let witness = signed(&root, h, Op::Witness { also_cite: alloc::vec![h] });
-        dag.ingest(witness).expect("ingest witness");
-        assert!(dag.is_finalized(&h));
-        assert_eq!(dag.consensus_state_head(), h);
-        let state = dag.consensus_state();
-        assert!(state.is_member(&pk(&alice)));
-        assert!(!state.is_node(&pk(&alice))); // it's a Mailbox
-    }
-
-    #[test]
-    fn first_event_off_genesis_must_be_root() {
-        let root = key(1);
+    fn rejects_non_member_author() {
+        let a = key(1);
         let stranger = key(9);
-        let mut dag = Dag::new(pk(&root), Vec::new());
-        let ev = signed(&stranger, GENESIS_PARENT, Op::Send {
-            recipient: pk(&root),
-            payload: Vec::new(),
-        });
+        let mut dag = Dag::new(members(&[&a]));
+        let ev = signed(&stranger, None, Vec::new(), Vec::new());
         assert!(dag.ingest(ev).is_err());
     }
 
     #[test]
-    fn mailbox_cannot_introduce_or_witness() {
-        let root = key(1);
-        let alice = key(7);
-        let mut dag = Dag::new(pk(&root), Vec::new());
-        commit(&mut dag, &root, &root, Op::MailboxCreate {
-            subject: pk(&alice),
-            name: "alice".to_string(),
-        });
-        let head = dag.consensus_state_head();
-
-        // A Mailbox may not author NodeIntroduce...
-        let intro = signed(&alice, head, Op::NodeIntroduce {
-            subject: pk(&key(8)),
-            name: "x".to_string(),
-        });
-        assert!(dag.ingest(intro).is_err());
-
-        // ...nor a Witness.
-        let witness = signed(&alice, head, Op::Witness { also_cite: Vec::new() });
-        assert!(dag.ingest(witness).is_err());
-
-        // ...but it MAY author a Send to a member.
-        let send = signed(&alice, head, Op::Send { recipient: pk(&root), payload: b"hi".to_vec() });
-        assert!(dag.ingest(send).is_ok());
+    fn rejects_self_parent_from_another_author() {
+        let a = key(1);
+        let b = key(2);
+        let mut dag = Dag::new(members(&[&a, &b]));
+        let ga = signed(&a, None, Vec::new(), Vec::new());
+        let gah = ga.event_hash();
+        dag.ingest(ga).unwrap();
+        // B claims A's event as its self_parent — illegal.
+        let bad = signed(&b, Some(gah), Vec::new(), Vec::new());
+        assert!(dag.ingest(bad).is_err());
     }
 
     #[test]
-    fn send_to_non_member_is_rejected() {
-        let root = key(1);
-        let mut dag = Dag::new(pk(&root), Vec::new());
-        let send = signed(&root, GENESIS_PARENT, Op::Send {
-            recipient: pk(&key(42)),
-            payload: Vec::new(),
-        });
-        assert!(dag.ingest(send).is_err());
+    fn buffers_then_admits_when_dependency_arrives() {
+        let a = key(1);
+        let b = key(2);
+        let mut dag = Dag::new(members(&[&a, &b]));
+
+        let ga = signed(&a, None, Vec::new(), Vec::new());
+        let gah = ga.event_hash();
+        dag.ingest(ga).unwrap();
+
+        let gb = signed(&b, None, Vec::new(), Vec::new());
+        let gbh = gb.event_hash();
+
+        // a1 refs gb, which we don't have yet → buffered, not admitted.
+        let a1 = signed(&a, Some(gah), alloc::vec![gbh], Vec::new());
+        let a1h = a1.event_hash();
+        assert_eq!(dag.ingest(a1).unwrap(), false);
+        assert!(!dag.has(&a1h));
+
+        // gb arrives → a1's dependency is satisfied and it gets admitted.
+        dag.ingest(gb).unwrap();
+        assert!(dag.has(&a1h));
     }
 
     #[test]
-    fn root_cannot_be_revoked() {
-        let root = key(1);
-        let mut dag = Dag::new(pk(&root), Vec::new());
-        let revoke = signed(&root, GENESIS_PARENT, Op::Revoke { subject: pk(&root) });
-        assert!(dag.ingest(revoke).is_err());
-    }
+    fn forks_are_admitted_not_rejected() {
+        let a = key(1);
+        let mut dag = Dag::new(members(&[&a]));
+        let ga = signed(&a, None, Vec::new(), Vec::new());
+        let gah = ga.event_hash();
+        dag.ingest(ga).unwrap();
 
-    /// Regression: root protection is by pubkey, not by the "root" name label.
-    /// A Mailbox literally named "root" must still be revocable.
-    #[test]
-    fn mailbox_named_root_is_still_revocable() {
-        let root = key(1);
-        let impostor = key(5);
-        let mut dag = Dag::new(pk(&root), Vec::new());
-
-        commit(&mut dag, &root, &root, Op::MailboxCreate {
-            subject: pk(&impostor),
-            name: "root".to_string(),
-        });
-        assert!(dag.consensus_state().is_member(&pk(&impostor)));
-
-        commit(&mut dag, &root, &root, Op::Revoke { subject: pk(&impostor) });
-        assert!(!dag.consensus_state().is_member(&pk(&impostor)));
+        // Two distinct events off the same self_parent (different payloads).
+        let f1 = signed(&a, Some(gah), Vec::new(), b"one".to_vec());
+        let f2 = signed(&a, Some(gah), Vec::new(), b"two".to_vec());
+        assert!(dag.ingest(f1.clone()).unwrap());
+        assert!(dag.ingest(f2.clone()).unwrap());
+        assert!(dag.has(&f1.event_hash()));
+        assert!(dag.has(&f2.event_hash()));
+        // The author now has two heads.
+        assert_eq!(dag.heads_of(&pk(&a)).len(), 2);
     }
 
     #[test]
-    fn sequential_state_changes_apply_in_order() {
-        let root = key(1);
-        let a = key(7);
-        let b = key(8);
-        let mut dag = Dag::new(pk(&root), Vec::new());
-        commit(&mut dag, &root, &root, Op::MailboxCreate { subject: pk(&a), name: "a".to_string() });
-        commit(&mut dag, &root, &root, Op::NodeIntroduce { subject: pk(&b), name: "b".to_string() });
-        let state = dag.consensus_state();
-        assert!(state.is_member(&pk(&a)));
-        assert!(state.is_node(&pk(&b)));
+    fn ingest_is_idempotent() {
+        let a = key(1);
+        let mut dag = Dag::new(members(&[&a]));
+        let g = signed(&a, None, Vec::new(), Vec::new());
+        dag.ingest(g.clone()).unwrap();
+        dag.ingest(g).unwrap();
+        assert_eq!(dag.events.len(), 1);
     }
 
     #[test]
-    fn witness_of_witness_is_seen_transitively() {
-        let root = key(1);
-        let mut dag = Dag::new(pk(&root), Vec::new());
-        let create = signed(&root, GENESIS_PARENT, Op::MailboxCreate {
-            subject: pk(&key(7)),
-            name: "a".to_string(),
-        });
-        let ch = create.event_hash();
-        dag.ingest(create).unwrap();
+    fn heads_track_the_chain_tip() {
+        let a = key(1);
+        let mut dag = Dag::new(members(&[&a]));
+        let g = signed(&a, None, Vec::new(), Vec::new());
+        let gh = g.event_hash();
+        dag.ingest(g).unwrap();
+        assert_eq!(dag.heads_of(&pk(&a)), BTreeSet::from([gh]));
 
-        // w1 cites create; w2 cites w1 (not create directly).
-        let w1 = signed(&root, ch, Op::Witness { also_cite: alloc::vec![ch] });
-        let w1h = w1.event_hash();
-        dag.ingest(w1).unwrap();
-        let w2 = signed(&root, w1h, Op::Witness { also_cite: alloc::vec![w1h] });
-        let w2h = w2.event_hash();
-        dag.ingest(w2).unwrap();
+        let e1 = signed(&a, Some(gh), Vec::new(), b"x".to_vec());
+        let e1h = e1.event_hash();
+        dag.ingest(e1).unwrap();
+        assert_eq!(dag.heads_of(&pk(&a)), BTreeSet::from([e1h]));
+    }
 
-        // create is transitively seen, and root counts as a witnessing node.
-        assert!(dag.events_that_see(&ch).contains(&w2h));
-        assert!(dag.witnessing_nodes(&ch).contains(&pk(&root)));
+    /// Assert every event in `order` appears after all of its in-set dependencies.
+    fn assert_topo_valid(dag: &Dag, order: &[Hash]) {
+        let mut pos = BTreeMap::new();
+        for (i, h) in order.iter().enumerate() {
+            pos.insert(*h, i);
+        }
+        for (i, h) in order.iter().enumerate() {
+            for dep in dep_set(&dag.events[h]) {
+                if let Some(&dpos) = pos.get(&dep) {
+                    assert!(dpos < i, "dependency must precede dependent");
+                }
+            }
+        }
     }
 }
