@@ -1,5 +1,7 @@
 # mesh
 
+[![CI](https://github.com/colinrozzi/mesh/actions/workflows/ci.yml/badge.svg)](https://github.com/colinrozzi/mesh/actions/workflows/ci.yml)
+
 A theater-native **substrate for replicated state machines**. Each node is an
 ed25519 keypair maintaining a self-rooted log of signed events; the network
 agrees on a finalized, canonically-ordered event stream; and a deterministic
