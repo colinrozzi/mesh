@@ -3,7 +3,7 @@
 //! Each node keeps a self-rooted log: every event names its author's previous
 //! event via `self_parent` (`None` for that node's genesis), plus zero or more
 //! `refs` — foreign heads it has grafted, which double as witnesses. The
-//! substrate treats `payload` as opaque bytes. See DESIGN-v3.md.
+//! substrate treats `payload` as opaque bytes. See DESIGN.md.
 //!
 //! Canonical wire format (hand-rolled, deterministic, byte-stable across
 //! machines and language ports):
@@ -30,7 +30,7 @@ pub struct Event {
     pub author: PubKey,
     /// This author's previous event. `None` only for the author's genesis.
     /// Not required to be unique — an author that forks is admitted as
-    /// concurrent siblings (see DESIGN-v3.md / dag.rs).
+    /// concurrent siblings (see DESIGN.md / dag.rs).
     pub self_parent: Option<Hash>,
     /// Foreign heads grafted by this event. These are the witnessing +
     /// dissemination edges; together with `self_parent` they form the DAG's

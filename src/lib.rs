@@ -1,6 +1,6 @@
 //! mesh v3 — DAG-based replicated state-machine substrate.
 //!
-//! See DESIGN-v3.md. Each node is a self-rooted log; events carry
+//! See DESIGN.md. Each node is a self-rooted log; events carry
 //! `self_parent ∪ refs` back-edges; membership is static config; finality is
 //! "every member has witnessed." Message-passing rides on top as a reducer.
 //!
@@ -406,7 +406,7 @@ fn on_close(state: ActorState, conn_id: String, reason: String) -> Result<(Actor
 
 #[export(name = "theater:simple/timer.handle-tick")]
 fn handle_tick(state: ActorState, _timer_name: String) -> Result<(ActorState, ()), String> {
-    // Timed heartbeat / batched emission is deferred (DESIGN-v3.md). For now,
+    // Timed heartbeat / batched emission is deferred (DESIGN.md). For now,
     // emission is purely on-event; the tick is a no-op.
     Ok((state, ()))
 }

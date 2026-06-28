@@ -4,7 +4,7 @@
 //! (`Dag::ordered_finalized`). A *reducer* folds that stream's payloads into
 //! committed application state. The substrate is agnostic to what payloads mean
 //! — one network runs one state machine, and this is its only coupling point.
-//! See DESIGN-v3.md.
+//! See DESIGN.md.
 
 use crate::dag::Dag;
 use crate::event::{Hash, PubKey};
@@ -24,7 +24,7 @@ pub trait Reducer {
 ///
 /// Re-folds from the start on each call; incremental application (apply only
 /// newly-finalized events, snapshot state) is a near-term optimization noted in
-/// DESIGN-v3.md.
+/// DESIGN.md.
 pub fn fold<R: Reducer>(dag: &Dag) -> R::State {
     let mut state = R::State::default();
     for h in dag.ordered_finalized() {

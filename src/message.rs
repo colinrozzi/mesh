@@ -166,4 +166,32 @@ mod tests {
         let inboxes = fold::<Mailboxes>(&dag);
         assert!(inboxes.inbox(&pk(&b)).is_empty());
     }
+
+    #[test]
+    fn delivers_multiple_messages_in_canonical_order() {
+        let a = key(1);
+        let b = key(2);
+        let mut dag = Dag::new(BTreeSet::from([pk(&a), pk(&b)]));
+        let ga = signed(&a, None, Vec::new(), Vec::new());
+        let gb = signed(&b, None, Vec::new(), Vec::new());
+        let (gah, gbh) = (ga.event_hash(), gb.event_hash());
+        dag.ingest(ga).unwrap();
+        dag.ingest(gb).unwrap();
+
+        let bob = pk(&b);
+        let m1 = signed(&a, Some(gah), alloc::vec![gbh], encode_message(&bob, b"one"));
+        let m1h = m1.event_hash();
+        dag.ingest(m1).unwrap();
+        let m2 = signed(&a, Some(m1h), alloc::vec![gbh], encode_message(&bob, b"two"));
+        let m2h = m2.event_hash();
+        dag.ingest(m2).unwrap();
+
+        // B witnesses m2, which transitively sees m1 (m1 is m2's self_parent).
+        let b1 = signed(&b, Some(gbh), alloc::vec![m2h], Vec::new());
+        dag.ingest(b1).unwrap();
+
+        let inboxes = fold::<Mailboxes>(&dag);
+        let bodies: Vec<&[u8]> = inboxes.inbox(&bob).iter().map(|m| m.body.as_slice()).collect();
+        assert_eq!(bodies, alloc::vec![b"one".as_slice(), b"two".as_slice()]);
+    }
 }

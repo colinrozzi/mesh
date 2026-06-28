@@ -1,0 +1,8 @@
+[package]
+name = "mesh-testkit"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ed25519-dalek = "2"
+sha2 = "0.10"

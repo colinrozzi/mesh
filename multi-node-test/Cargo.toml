@@ -8,5 +8,4 @@ name = "mesh-multi-node-test"
 path = "src/main.rs"
 
 [dependencies]
-ed25519-dalek = { version = "2", features = ["rand_core"] }
-sha2 = "0.10"
+mesh-testkit = { path = "../testkit" }

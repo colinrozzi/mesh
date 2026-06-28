@@ -6,7 +6,7 @@
 //! set; it does not derive it from the log. The substrate's only jobs here are
 //! to admit valid events, track reverse-reachability (who has witnessed what),
 //! decide finality (every member has witnessed an event), and produce the
-//! canonical finalized order for a reducer to consume. See DESIGN-v3.md.
+//! canonical finalized order for a reducer to consume. See DESIGN.md.
 
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::format;
@@ -306,6 +306,34 @@ mod tests {
         assert_eq!(order.len(), 2);
         assert!(order.contains(&gah) && order.contains(&gbh));
         assert_topo_valid(&dag, &order);
+    }
+
+    #[test]
+    fn finality_requires_all_members() {
+        let a = key(1);
+        let b = key(2);
+        let c = key(3);
+        let mut dag = Dag::new(members(&[&a, &b, &c]));
+        let ga = signed(&a, None, Vec::new(), Vec::new());
+        let gb = signed(&b, None, Vec::new(), Vec::new());
+        let gc = signed(&c, None, Vec::new(), Vec::new());
+        let (gah, gbh, gch) = (ga.event_hash(), gb.event_hash(), gc.event_hash());
+        dag.ingest(ga).unwrap();
+        dag.ingest(gb).unwrap();
+        dag.ingest(gc).unwrap();
+
+        let m = signed(&a, Some(gah), alloc::vec![gbh, gch], b"x".to_vec());
+        let mh = m.event_hash();
+        dag.ingest(m).unwrap();
+        assert!(!dag.is_finalized(&mh), "only A has witnessed");
+
+        let b1 = signed(&b, Some(gbh), alloc::vec![mh], Vec::new());
+        dag.ingest(b1).unwrap();
+        assert!(!dag.is_finalized(&mh), "A and B — still missing C");
+
+        let c1 = signed(&c, Some(gch), alloc::vec![mh], Vec::new());
+        dag.ingest(c1).unwrap();
+        assert!(dag.is_finalized(&mh), "all three have witnessed");
     }
 
     #[test]

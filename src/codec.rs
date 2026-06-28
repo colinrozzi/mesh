@@ -39,7 +39,7 @@ pub fn from_hex32(s: &str) -> Result<[u8; 32], String> {
 }
 
 pub fn from_hex(s: &str) -> Result<Vec<u8>, String> {
-    if s.len() % 2 != 0 {
+    if !s.len().is_multiple_of(2) {
         return Err("odd-length hex".to_string());
     }
     let mut out = Vec::with_capacity(s.len() / 2);
@@ -187,5 +187,44 @@ mod tests {
         assert_eq!(restored.events.len(), dag.events.len());
         // A single-member network finalizes its own event.
         assert!(restored.is_finalized(&h));
+    }
+
+    #[test]
+    fn persisted_orphan_resolves_after_reload() {
+        let a = SigningKey::from_bytes(&[1u8; 32]);
+        let b = SigningKey::from_bytes(&[2u8; 32]);
+        let members = BTreeSet::from([a.verifying_key().to_bytes(), b.verifying_key().to_bytes()]);
+
+        let sign = |sk: &SigningKey, sp: Option<Hash>, refs: Vec<Hash>| {
+            let author = sk.verifying_key().to_bytes();
+            let sh = Event::signing_hash(&author, &sp, &refs, &[]);
+            Event { author, self_parent: sp, refs, payload: Vec::new(), signature: sk.sign(&sh).to_bytes() }
+        };
+
+        let mut dag = Dag::new(members.clone());
+        let ga = sign(&a, None, Vec::new());
+        let gah = ga.event_hash();
+        dag.ingest(ga).unwrap();
+
+        let gb = sign(&b, None, Vec::new());
+        let gbh = gb.event_hash();
+        // child refs gb, which we don't have yet → buffered, not admitted.
+        let child = sign(&a, Some(gah), alloc::vec![gbh]);
+        let child_h = child.event_hash();
+        assert_eq!(dag.ingest(child).unwrap(), false);
+
+        // Persist (admitted DAG + pending orphan buffer) and reload.
+        let dag_json = dag_to_json(&dag);
+        let pending_json = events_to_json(&dag.pending_events());
+        let members_json = members_to_json(&members);
+        let mut reloaded = dag_from_json(&dag_json, &members_json).unwrap();
+        for ev in events_from_json(&pending_json) {
+            let _ = reloaded.ingest(ev);
+        }
+        assert!(!reloaded.has(&child_h), "still orphaned across reload");
+
+        // The dependency arrives → the buffered child resolves.
+        reloaded.ingest(gb).unwrap();
+        assert!(reloaded.has(&child_h));
     }
 }

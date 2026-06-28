@@ -153,13 +153,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "68ab91017fe16c622486840e4c83c9a37afeff978bd239b5293d61ece587de66"
 
 [[package]]
-name = "mesh-multi-node-test"
-version = "0.1.0"
-dependencies = [
- "mesh-testkit",
-]
-
-[[package]]
 name = "mesh-testkit"
 version = "0.1.0"
 dependencies = [

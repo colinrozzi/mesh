@@ -8,6 +8,4 @@ name = "mesh-smoke"
 path = "src/main.rs"
 
 [dependencies]
-ed25519-dalek = { version = "2", features = ["rand_core"] }
-sha2 = "0.10"
-rand = "0.8"
+mesh-testkit = { path = "../testkit" }

@@ -1,343 +1,363 @@
-# mesh — v2 design
+# mesh — design
 
-**Status (as of 2026-06-24):** mesh v2 is *built and running*. This
-document is now a historical record of the design conversation that led
-to v2, plus the protocol-level reasoning behind the implementation. The
-**current spec lives in `README.md`** — read that first if you want to
-know how mesh actually works today.
+This is the design rationale for mesh — the *why* behind the shape of the code.
+`README.md` covers what it is and how to run it; this covers why it's built this
+way.
 
-A few things evolved during the build that this document doesn't yet
-reflect:
+mesh is a **generalized substrate for replicated state machines**. Each node is
+its own self-rooted log; events have multiple back-references; the network runs
+one deterministic state machine over a finalized, ordered event stream —
+message-passing is the first one.
 
-- **Member kinds.** v2 introduced Node and Mailbox as distinct roles. The
-  Op enum is `NodeIntroduce / MailboxCreate / Revoke / Send / Witness` —
-  not the generic `Admit / Revoke` described below. Only Nodes count for
-  consensus; Mailboxes are addressable endpoints that can Send.
-- **No emails.** Member records carry just a name; no email field.
-- **Inline witness emission.** When mesh receives a state-mutating event,
-  it emits a Witness *inline* (synchronously) before `on_data` returns —
-  not just on the periodic timer. This means single-node consensus is
-  reached immediately and clients can act on freshly-created members
-  without waiting for a tick.
-- **`from_state` / `to_state` on state-mutating events.** Designed in but
-  not implemented; events carry only `parent: EventHash` as their
-  position commitment.
-- **Catch-up sync (HEAD exchange + walk-back).** Designed in §"Joining
-  the network" but not implemented. Multi-node v2 requires identical
-  genesis configs on every node; runtime catch-up is future work.
+> History: this design (internally "v3") replaced an earlier version that used a
+> single shared event chain with one global root and explicit `Witness` ops.
+> Sections below contrast with that "v2" to explain the reasoning; `git log` has
+> the old docs.
 
-The rest of this document is the original design — useful for reasoning
-about why the protocol looks the way it does.
+## Why this shape
 
----
+The earlier design conflated three things into one `parent` pointer: a node's
+own history, the network's shared ordering, and propagation evidence. That made
+catch-up sync an afterthought (there was none — nodes had to boot from identical
+genesis and see every event live) and tied the whole system to a single global
+root.
+
+This design separates them. The insight: **if every node keeps a self-rooted log and
+events can reference several predecessors, then identity, dissemination,
+ordering, finality, and catch-up all fall out of the same structure.** This is a
+Merkle-DAG / Merkle-clock — the shape of git history (merge commits), Matrix's
+room DAG (`prev_events`), and Merkle-CRDTs.
 
 ## Mental model
 
-Imagine the network as git. Every member has a working copy. The
-working copy is a DAG of signed events extending out from genesis.
-Members create new events by branching off whatever point in the DAG
-they currently see as the "head". Events propagate; members witness
-them; eventually most members have witnessed the same events and a
-shared "consensus head" emerges.
+Two tiers, and the substrate is almost entirely ignorant of what runs on top.
 
-A node's local DAG isn't a write-once log. It's the operational data
-structure the node uses to:
+- **Substrate** — identities, the per-node logs, dissemination + sync, the
+  canonical order, and finality. It treats event payloads as **opaque bytes**.
+- **State machine** — a deterministic reducer fed the finalized, canonically
+  ordered event stream. The network *is* a state machine; which one is implied
+  by the network you've joined. Message-passing is one such reducer; the next
+  thing we build is another.
 
-- Know who is a member (state derived from event sequence)
-- Know what events the network has and hasn't seen yet
-- Decide who to forward new events to
-- Verify incoming events without re-querying authority
-- Recover from being offline by hashing-into-someone-else's-state
+A node's local DAG is the operational data structure it uses to: know the order
+of events, know what the network has and hasn't seen, decide what to send peers,
+verify incoming events without re-querying authority, and recover after being
+offline.
+
+## Threat model & guarantees
+
+mesh is a **coordination channel among a fixed, fully-present set of nodes** —
+think a multi-party TCP connection more than a fault-tolerant store. Everything
+below follows from that framing:
+
+- **Honest-but-may-be-offline.** Members run correct code; they may crash or
+  disconnect, but they don't forge, lie, or equivocate. Byzantine faults are out
+  of scope for v3 — the signed self-chains make misbehavior *detectable* (see
+  *Equivocation*), but defending against it is a later BFT layer.
+- **Consistency over availability (CP).** Finality requires *every* member, so
+  if any member is offline the network **intentionally stops committing** until
+  it returns. That is the contract, not a weakness: committing *means* everyone
+  is present and agrees. This is not a Dynamo-style always-available store and
+  isn't trying to be.
+- **Determinism.** Given the same set of events, every node computes the same
+  DAG, the same order, and the same committed state — *independent of arrival
+  order*. This is why forks are admitted rather than arrival-order-rejected
+  (see *Validity*); rejecting-on-arrival is the one thing that would break it.
 
 ## Core data shape
 
 ```
 Event {
-    parent:    EventHash,        // sha256 of one prior event (genesis = special)
-    author:    PubKey,           // ed25519 verifying key
-    op:        Op,               // the action this event records
-    signature: Sig,              // ed25519 over sha256(parent, author, op)
-}
-
-Op = enum {
-    Admit  { subject: PubKey, name, email },
-    Revoke { subject: PubKey },
-    Send   { recipient: PubKey, payload: Vec<u8> },
-    Witness { also_cite: Vec<EventHash> },
+    author:      PubKey,          // ed25519 verifying key (a member node)
+    self_parent: Option<Hash>,    // this author's previous event; None for a genesis
+    refs:        Vec<Hash>,       // foreign heads this event grafts / witnesses
+    payload:     Vec<u8>,         // opaque to the substrate; may be empty
+    signature:   Sig,             // ed25519 over the canonical encoding above
 }
 ```
 
-Every event references exactly one parent (except genesis). The DAG
-forms by following parent pointers backward. Witness events
-additionally cite events the author observed but did NOT chain off of —
-those references are propagation/attestation, not causal extension.
+`event_hash` is sha256 over the canonical encoding. Encoding stays hand-rolled
+and deterministic (byte-stable across machines and language ports), as in v2 —
+only the field set changes. `self_parent: None` encodes with an explicit
+discriminant byte (`0` = none, `1` = followed by 32 bytes) so the layout stays
+canonical.
 
-### Why these four ops
+### self_parent vs refs — the load-bearing distinction
 
-- **Admit / Revoke**: control membership.
-- **Send**: deliver a message. State doesn't change but the event
-  exists in the DAG so it propagates + is provably attributable.
-- **Witness**: attestation. An author signs that they've observed
-  specific events. This is the load-bearing primitive for gossip + for
-  deriving consensus.
+A node's events form a **chain** via `self_parent`: each event names that
+author's previous event, tracing back to the author's genesis. This is the
+node's history, independently verifiable (walk it to genesis, check every
+signature against the author's key). Under honest operation the chain is linear
+with a single head; v3 tolerates an author forking it (the forks are admitted as
+concurrent siblings — see *Validity*), so an author's "head" may transiently be
+a *set*.
 
-### Why state hashes are NOT in events
+`refs` are the **grafting / witnessing** edges: foreign heads the author had
+seen when it signed. An event with `refs` simultaneously (a) extends its
+author's own log and (b) records "I have observed these other histories up to
+here." There is no separate `Witness` op in v3 — **every event that grafts a
+foreign head is a witness.**
 
-State is a pure function of the DAG: walk from genesis, apply
-state-mutating events in some canonical order, look at the resulting
-member set. State hashes are useful **internally** for fast equality
-checks; they are not part of the wire protocol or event schema. Two
-nodes that disagree on a state hash also necessarily disagree on the
-DAG, and the DAG is the source of truth.
+So the back-edges of the DAG are `self_parent ∪ refs`. Ancestry ("E is in X's
+causal past") is reachability over those edges.
 
-(Optionally, state-mutating events MAY include `from_state: Hash`,
-`to_state: Hash` fields as a self-check. These are recomputable and
-don't change semantics; they're purely for failing fast on garbled
-input. v2 includes them.)
+### Genesis
+
+A node's genesis event has `self_parent: None` and (typically) empty `refs`. It
+is the root of that node's chain, signed by the node's key. Membership (below)
+is configured out-of-band, so genesis doesn't need to *announce* identity to a
+registry — it just anchors the chain. Its payload may declare the node's key(s)
+for future key-rotation, but that's not required in v3. There is **no global
+genesis** and no privileged root; each chain is self-rooted.
+
+### Equivocation is detectable, but tolerated for now
+
+Because each event names a `self_parent`, an author that signs two different
+events off the same parent has forked its own chain — cryptographic, self-
+incriminating evidence any node can verify. v3 **admits both forks** rather than
+rejecting either: rejecting the second-seen would make finality depend on
+arrival order and break determinism (the whole point of *Threat model*). Under
+honest-but-offline this shouldn't happen; if it does, the two events are just
+concurrent siblings the canonical order resolves by hash. Acting on the evidence
+— rejecting or slashing an equivocator — is a future BFT concern; *disallowing*
+forks outright is deferred until then.
+
+## Membership (static)
+
+Membership is **objective** — every node computes the same member set — and in
+v3 it is **static configuration**: each node is started with the set of member
+pubkeys (and their addresses) pre-defined and identical across the network. This
+is the v2 `peer_node_pubkeys` / `peer_meshes` bootstrap promoted to the whole
+membership story.
+
+This is the simplification that lets us drop a per-event "machine" tag: since
+the member set comes from config and never changes at runtime, **the substrate
+never has to interpret an event to learn membership.** It interprets nothing.
+There is no membership op, no system namespace — one network is one member set is
+one state machine.
+
+> **v3 boundary, named deliberately.** The moment membership must change at
+> runtime, the substrate again needs to learn the member set *from somewhere* —
+> a substrate-reserved payload convention it may peek at, or an out-of-band
+> reconfiguration protocol. v3 does not solve this. Static membership is a
+> conscious boundary, not an oversight.
+
+A consequence: v2's **Node vs Mailbox** roles dissolve from the substrate. The
+substrate knows only *member nodes* (the consensus participants). Application
+identities — agents, mailboxes, addressable endpoints — are an *application*
+concern, expressed in payloads and interpreted by the reducer.
+
+## Validity — two layers
+
+**Substrate validity** (objective; every node agrees; decides whether an event
+enters the DAG):
+
+1. **Signature** verifies against `author`.
+2. **Author is a member** (in the configured set).
+3. **self_parent points into the author's own chain** (one of the author's
+   prior events), or is `None` for a genesis. It need **not** be unique: if an
+   author signs two events off the same `self_parent`, both are admitted. We
+   never arrival-order-reject — that would diverge nodes (see *Equivocation*).
+4. **self_parent and refs exist** in our DAG. If any is missing, the event is
+   **buffered pending** and we request the gap (see *Dissemination*).
+
+**Reducer validity** (application-defined): whether a payload is a legal
+transition for the state machine. An event can be substrate-valid and admitted
+to the DAG yet be a **no-op or rejected** by the reducer. Keeping rejection in
+the reducer — not the substrate — is what keeps the substrate app-agnostic and
+every node deterministic: all nodes admit the same events, order them the same,
+and the reducer makes the same accept/reject decision everywhere.
+
+## Dissemination & sync — one mechanic
+
+Grafting *is* sync. There is no separate catch-up protocol.
+
+```
+On receiving an event E:
+    1. DEDUP — if E is already in my DAG, drop it. (Mandatory: without this,
+       any cycle in the peer graph re-forwards events forever.)
+    2. If E's self_parent or any ref is missing from my DAG:
+         buffer E, send WANT(missing hashes)        // backfill ancestry on demand
+    3. Else validate E, add it to my DAG, then immediately:
+         - forward E to peers that don't yet have it, and
+         - author my own event grafting E
+               self_parent = my head
+               refs        = foreign heads newly seen
+               payload     = empty                   // this graft IS my witness of E
+       (When *I* have a payload to send, I author an event the same way, with
+        payload set.)
+```
+
+Because validating E means being able to walk its ancestry to genesis, "receive
+a head" naturally pulls "fetch the ancestry I'm missing." **That is the catch-up
+sync** — a node that joins late or reconnects after a gap requests what it lacks
+and converges. The orphan buffer (events held pending their parents) is a
+first-class, persisted part of state, and it *drives* `WANT` requests rather
+than waiting passively.
+
+**Bulk sync on connect** is an optimization of the same idea: exchange a compact
+**frontier** (the heads each side has per author — a head-set, since an author
+may have forked) so a reconnecting node learns what it's behind on without
+re-streaming the whole DAG.
+
+### Emission is on-event, no timer (for now)
+
+Receiving new information immediately produces a witness event — lowest latency,
+simplest code. An **empty-payload event is a pure graft / heartbeat / witness**;
+the same primitive as an app event, distinguished only by an empty payload. The
+reducer skips empties. Continuous mutual grafting (ping-pong) doubles as a
+liveness heartbeat, and we lean into it.
+
+The cost, stated plainly: in a fully-connected N-node network each received
+event begets a graft, so steady-state volume is ~O(N²) events per round-trip and
+the DAG grows continuously even with no payloads. That's fine for the small,
+TCP-like deployments v3 targets, and **dedup (step 1) bounds it to new events
+only**, preventing true loops. **Batched emission** — graft on a tick that
+collapses many refs into one witness, à la v2's witness-tick — is the known fix
+for larger N or idle cost. Near-term, not a launch blocker (see below).
+
+## Canonical order
+
+State is a pure function of the DAG. To order events deterministically:
+
+1. Take the finalized sub-DAG (events at or before the finalized frontier).
+2. Topologically sort: every event after all of its `self_parent ∪ refs`
+   predecessors. Break ties (concurrent events, including forks) by `event_hash`
+   ascending.
+
+Every node with the same DAG computes the same order. The reducer consumes
+payloads in this order. This is v2's `state_at` topo-sort, generalized to
+multi-parent ancestry.
+
+## Finality — recast, not rebuilt
+
+An event `E` is **finalized** iff every current member has authored an event
+that transitively *sees* `E` (has `E` in its `self_parent ∪ refs` ancestry).
+Witnesses are no longer a special op — they're just events that graft `E`'s
+lineage. Because "every member" is required, commitment **halts the moment any
+member is offline** — by design (see *Threat model*).
+
+This maps directly onto machinery v2 already has:
+
+- `events_that_see(E)` — reverse-reachability over the back-edges. v2 walked
+  `parent ∪ also_cite`; v3 walks `self_parent ∪ refs`. Same reverse-BFS.
+- `witnessing_members(E)` = authors of events that see `E`.
+- `finalized(E)` = `witnessing_members(E) ⊇ members`.
+
+The finalized frontier advances as grafts accumulate; the reducer's committed
+state is derived strictly from the finalized, ordered prefix.
+
+## Optimistic delivery vs finalized commitment
+
+Two visibility tiers, as in v2's "Sends deliver before finality":
+
+- **Optimistic**: a payload event can be surfaced to the application as soon as
+  it's received and substrate-valid — low latency, not yet committed.
+- **Committed**: the reducer only *advances state* over the finalized, ordered
+  prefix. Anything past the finalized frontier is working-copy.
+
+Caveat worth respecting: the hash-tiebreak order means a later-arriving
+concurrent event can sort *before* one already shown optimistically. So
+optimistic delivery is only safe for **reorderable / idempotent** payloads (e.g.
+fire-and-forget message delivery). Anything order-sensitive or with side effects
+should read committed state — there's no un-delivering.
 
 ## Wire protocol
 
-Same handshake as v1: HELLO → CHALLENGE → AUTH → ACCEPTED. After
-accept, the connection's identity is bound to the pubkey from HELLO.
+TCP, length-prefixed binary frames: `LEN(u32 BE) || KIND(u8) || PAYLOAD`.
+Config provides each member's pubkey **and address** (peer discovery beyond the
+configured set is out of scope for v3).
 
-Frame kinds carry over from v1; SUBMIT now carries v2-shaped events.
-New frames for catch-up:
+Handshake (unchanged from v2 in spirit; membership checked against config):
 
-| Direction | Kind | Name | Purpose |
+```
+client → HELLO(pubkey)                                   0x01
+mesh   → CHALLENGE(nonce[32])     | REJECTED             0x80 | 0x82
+client → AUTH(sig over nonce)                            0x02
+mesh   → ACCEPTED(frontier)       | REJECTED             0x81 | 0x82
+```
+
+`ACCEPTED` carries the accepting node's frontier (per-author head-sets) so the
+dialer can immediately compute what it's missing. After accept, the connection's
+identity is bound to the HELLO pubkey for its lifetime.
+
+Post-handshake:
+
+| Direction | Kind | Name | Payload |
 |---|---|---|---|
-| client ↔ mesh | `0x20` | HAVE | `Vec<EventHash>` — "I have these events." Used to negotiate what to send. |
-| client ↔ mesh | `0x21` | WANT | `Vec<EventHash>` — "Please send me these events." |
-| mesh → client | `0x90` | DELIVERED | full event bytes (any kind, any author) |
+| both | `0x10` | DELIVER | one encoded `Event` (broadcast / backfill response) |
+| both | `0x20` | FRONTIER | per-author head-sets — "here's what I have" |
+| both | `0x21` | WANT | `Vec<Hash>` — "send me these events" |
 
-When peers connect, both sides exchange HAVE lists (e.g. recent N
-events from their DAG). Each side computes what the other is missing,
-sends WANTs, and the responses fill the gap. After catch-up, new events
-propagate live via DELIVERED.
+`DELIVER` unifies v2's `DELIVERED`/`SUBMIT`: every event is just an event. A
+node's own new events and a peer's gossiped events flow through the same path;
+there is no privileged "submit." `WANT` backfills missing ancestry; `FRONTIER`
+negotiates bulk catch-up.
 
-## Event validation
+## Liveness — halting is the contract, not a bug
 
-Every received event is validated independently. Validity is local:
+Finality requires **all** members, so a member that goes down **halts
+commitment** until it returns. In v3 this is the *intended* semantics: mesh is a
+coordination channel for a fixed, present set (see *Threat model*) — "we're all
+here and agree" is exactly what committing means. Optimistic delivery keeps
+flowing among connected peers; only commitment waits.
 
-1. **Signature** — `ed25519_verify(author, sign_hash(parent, author, op))`
-2. **Parent exists** — either genesis or already in our DAG. If not, we
-   buffer until we get it.
-3. **Author is a member at parent** — derive state up to `parent`,
-   check `author` is in `members`. Genesis has implicit root membership.
-4. **Op-specific rules**:
-   - Admit: subject not currently a member at parent.
-   - Revoke: subject IS a member at parent; subject ≠ root.
-   - Send: recipient is a member at parent.
-   - Witness: each cited event hash exists in our DAG (buffer
-     otherwise).
+A *permanently* gone member is handled by **reconfiguring membership** (changing
+the configured set) — the dynamic-membership work deferred below — not by in-band
+eviction. The ping-pong heartbeat is the signal that tells an operator (or a
+future reconfiguration protocol) that a member is gone.
 
-If validation fails, drop. If it passes but `parent` is missing, hold
-in pending; when the parent arrives, retry. This implements the
-"backfill on demand" behaviour.
+## Module map
 
-## State derivation
+- `event.rs` — the `Event` type (`author / self_parent / refs / payload /
+  signature`), canonical hand-rolled encoding + `Cursor` decode, signing.
+- `dag.rs` — DAG storage over `self_parent ∪ refs` back-edges; forks admitted;
+  static member set; `events_that_see` → `witnessing_members` → finality;
+  `ordered_finalized` (the reducer's input); persisted orphan buffer.
+- `reducer.rs` — the reducer seam: `fold` the finalized, ordered stream into
+  committed state.
+- `message.rs` — message-passing, the first reducer: payloads `recipient[32] ||
+  body` folded into per-recipient inboxes.
+- `wire.rs` — frame protocol (handshake + DELIVER/WANT/FRONTIER + SUBMIT/ACK/
+  NOTIFY).
+- `conn.rs` — per-connection handshake state.
+- `codec.rs` — persistence of `ActorState` (DAG, orphan buffer, members,
+  connections) and hex helpers.
+- `lib.rs` — the actor: init, handshake, gossip + dedup + backfill, emit-a-graft
+  on payload events, committed delivery via the reducer.
 
-To compute state at any event `E`:
+## Near-term (not yet built — not launch blockers)
 
-1. Walk back from `E` via parent pointers, building a list of ancestors.
-2. Topologically sort: every event appears after its parent. Ties
-   (events with the same parent) sort by `event_hash` ascending.
-3. Apply state-mutating events in order: Admit adds, Revoke removes,
-   Send is a no-op, Witness is a no-op.
+The first things to build next. Unbounded growth is an accepted failure mode
+until they land.
 
-State at `E` is deterministic given the same DAG view. Two nodes that
-agree on the DAG up to `E` agree on the state at `E`.
+- **Pruning / compaction.** Finalized, applied history can be dropped (keep
+  hashes for verification). Most urgent, because the on-event heartbeat grows
+  the DAG continuously, even at idle.
+- **Incremental finality + reducer.** Advance the finalized frontier and apply
+  the reducer over *newly* finalized events instead of re-folding from genesis;
+  snapshot committed state. Avoids O(history²) recompute.
+- **Batched emission.** Replace on-event grafting with a tick that collapses
+  many refs into one witness — the scaling fix for N>2 and idle cost.
 
-## Propagation
+## Deferred
 
-Each node's job:
+- **Dynamic membership** (runtime add/remove, and reconfiguration to drop a
+  permanently-gone member) — the boundary named under *Membership* above.
+- **Byzantine fault tolerance** — equivocation/forgery is detected, not
+  defended; admitting forks keeps us consistent under honest-but-offline only.
+- **The introduction problem** — admitting a genuinely new node without
+  pre-shared config (web-of-trust, sponsor events, …).
+- **Key rotation** — the self-rooted log supports it (genesis declares keys, a
+  later event rotates); not implemented.
+- **Application identities** (agents / mailboxes) — addressing for non-member
+  participants is a reducer-layer design, per app.
 
-```
-For each new event E I receive (from any source):
-    Validate E (sig, parent in DAG, author was member at parent, op rules).
-    If valid: add E to DAG.
-    For each peer P I'm connected to ≠ source of E:
-        If I don't yet know that P has E:
-            Send DELIVERED(E) to P.
-```
+## Prior art
 
-"I don't yet know that P has E" comes from:
-- Witnesses from P that cite E (or transitively cite events that
-  reference E as ancestor).
-- HAVE messages from P listing E.
-- Optimistic: events forwarded to P are marked sent.
-
-This is observation-based, not handshake-based. We don't need P to
-explicitly ack receipt of E — if P ever sends us an event that
-cryptographically references E (via parent chain or a Witness), we
-know P has it.
-
-## Witnesses — the gossip-about-gossip layer
-
-A Witness from author A is signed proof that "I, A, have observed these
-event hashes at this point in time." Witnesses have:
-
-- A `parent` — A's previous event (or some recent point A is branching
-  from). This puts the Witness in A's causal chain.
-- `also_cite: Vec<EventHash>` — events A has seen that AREN'T
-  causally before `parent`. The cross-references.
-
-A Witness is itself an event in the DAG, so it gets propagated and
-later witnessed by others. The recursive structure means:
-
-> A node can prove, from its local DAG, that any other member had seen
-> a specific event by a specific time. It just needs a chain of
-> Witnesses leading back to that event.
-
-This is what enables consensus derivation without a separate voting
-protocol — see below.
-
-### Witness emission cadence
-
-Policy, not protocol. Suggested heuristics for the v2 impl:
-
-- Emit a Witness every K seconds with the events received since the
-  last Witness.
-- Or emit on-demand when a peer asks "have you seen X?"
-- Or both.
-
-### Witnesses of Witnesses are fine
-
-A Witness W cites previous Witnesses W1, W2, etc. This is how
-propagation evidence aggregates. Don't restrict.
-
-## Consensus head derivation
-
-The "consensus head" is the most recent event (or set of concurrent
-events) that's been transitively witnessed by **every current member**.
-
-To compute it locally:
-
-```
-For each event E in DAG:
-    witnesses_of_E = {A : there exists a Witness from A whose
-                          transitive closure includes E}
-    if witnesses_of_E ⊇ current members at E:
-        E is in consensus
-
-consensus_head = the maximum (latest in causal order) events in consensus
-```
-
-This is purely a local computation given a local DAG view. No voting
-round, no quorum protocol. The Witnesses ARE the votes; we just count.
-
-Optimization: maintain a running per-event witness set as events
-arrive, instead of recomputing each time.
-
-## State machine — applied vs. finalized
-
-- **Applied state**: result of walking the DAG from genesis through
-  consensus head, applying ops.
-- **Finalized events**: events at or before consensus head. Safe to
-  prune the bodies (keep hashes only) — future Witnesses citing them
-  still verify, just transitively.
-- **Working copy**: events past the consensus head. Not yet finalized.
-
-A node operates on applied state for everything (membership checks,
-Send routing, etc.). Working-copy events are visible to everyone but
-not "committed" — though for Send delivery, working-copy is enough; we
-don't wait for finality before delivering messages.
-
-## Joining the network
-
-A new node N receives the root pubkey somehow (config, friend tells
-them, whatever — bootstrap is external trust).
-
-1. N generates keypair, opens connection to any known peer P.
-2. N completes handshake (P checks N is a member — but N isn't yet!).
-3. Some existing member (genesis, or any current member) issues an
-   `Admit(N)` event and propagates.
-4. N can now connect (handshake succeeds).
-5. N exchanges HAVE/WANT with peers to backfill the DAG. They get every
-   event from genesis to current head.
-6. N is operational.
-
-For pure bootstrap (N is the very first node after genesis): genesis
-holder has a key. They just start; their event chain is itself the
-network.
-
-## Storage layout (theater:simple/store)
-
-```
-event/<event_hash>        — encoded Event bytes
-event_index/by_author/<pubkey>/<seq> — author's per-author chain index
-peer_have/<peer_pubkey>   — last-known HAVE set from peer (latest hashes)
-consensus_head            — current consensus head (event hash list)
-```
-
-Genesis event is special: bootstrapped from `init_state.root_pubkey`,
-represents the world before any signed event. Implicit, not actually
-stored. All Admit events without a real parent reference "genesis"
-sentinel.
-
-## Pruning
-
-Once an event E is finalized AND its effect is reflected in the
-current applied state AND all events causally after it are also
-finalized, the event body can be dropped. The hash stays — needed to
-verify future Witnesses citing E.
-
-Witnesses themselves prune via subsumption: if a later Witness W' from
-author A causally precedes W (via the parent chain) and cites a
-superset of what W cited, W can be dropped.
-
-This keeps storage bounded by O(applied_state + recent unfinalized
-events + active witness chain), not O(history).
-
-## Concurrent events
-
-Two events with the same parent are siblings — concurrent in causal
-order. Both are valid (assuming each individually passes validation).
-Both go into the DAG. State derivation breaks ties via event_hash
-sort, so result is deterministic across nodes.
-
-Authors can avoid creating concurrent events by tracking what they've
-seen as the current head before signing. But if they DO accidentally
-create concurrent events, no problem — the DAG accommodates.
-
-## What's NOT in v2
-
-- **Capability layer.** Any member can do anything still.
-- **Multi-mesh broker topology.** v2 is still single-process per
-  "node," but v2 IS a real distributed network — multiple nodes
-  syncing via the DAG protocol. Topology stays simple: peer-to-peer
-  among nodes that know about each other.
-- **Threshold cryptography / Byzantine fault tolerance.** v2 assumes
-  members are honest-but-may-be-offline. Adversarial peers (members
-  forging events with their own valid sigs but lying about
-  propagation) need a separate protocol layer.
-
-## Anticipated implementation phases
-
-1. **Schema rewrite.** New Event type with `parent: EventHash`, new
-   Op enum. v1's state.rs + event.rs replaced. (~half day)
-2. **DAG storage + traversal.** New `dag.rs` module. Stores events,
-   builds parent index, walks for state derivation. (~half day)
-3. **Witness emission + consensus computation.** New behaviour in
-   actor: emit witnesses on schedule, compute consensus head from DAG.
-   (~half day)
-4. **HAVE/WANT protocol.** Catch-up frames + the negotiation logic.
-   (~half day)
-5. **Multi-node smoke test.** Two mesh instances, connected, with
-   members on each side, exchanging messages. Replace the v1 smoke
-   test. (~half day)
-
-Total: ~2-3 days of focused work for a real distributed v2.
-
-## Open questions
-
-1. Cadence: how often do Witnesses get emitted? On every received
-   event? Every K seconds? On a heuristic? — recommend tunable.
-2. Initial peer discovery: how does a fresh node find the first peer
-   to gossip with? — out-of-band for now (config file with seed peer
-   addresses).
-3. Recovery from genuine state corruption: if a node's DAG gets
-   tampered locally, can it heal from peers? Yes — fetch fresh, but
-   need verification that the peer's view is canonical (via Witness
-   count from other members).
-4. NAT traversal / connectivity: for now assume direct TCP between
-   peers. Multi-host story stays simple until we need it.
+This is a Merkle-clock / Merkle-DAG replicated log: per-node append-only logs
+(à la Secure Scuttlebutt) with multi-parent merge events (à la git, Matrix's
+event DAG, IPFS Merkle-CRDTs). The novel-for-us part is folding witnessing,
+dissemination, and catch-up into the single grafting mechanic, over a statically
+configured, objectively-agreed member set with all-members finality — a CP
+coordination channel, not an AP store.
