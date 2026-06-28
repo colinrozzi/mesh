@@ -53,7 +53,11 @@
           '';
         });
         devShells.default = craneLib.devShell {
-          packages = [ rustToolchain theater.packages.${system}.default ];
+          packages = [
+            rustToolchain
+            theater.packages.${system}.default
+            pkgs.gh
+          ];
         };
       });
 }
