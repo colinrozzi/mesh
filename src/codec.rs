@@ -101,8 +101,12 @@ pub fn events_from_json(s: &str) -> Vec<Event> {
 
 // ---- DAG ----
 
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(serde::Serialize, serde::Deserialize, Default)]
 struct DagBlob {
+    /// Membership derivation base (hex pubkeys) — the member set as of the pruned
+    /// watermark. Advances as `compact` folds pruned Introduce/Depart ops in.
+    #[serde(default)]
+    base_members: Vec<String>,
     /// event_hash_hex -> event_bytes_hex (the canonical Event::encode()).
     events_hex: BTreeMap<String, String>,
 }
@@ -112,16 +116,17 @@ pub fn dag_to_json(dag: &Dag) -> String {
     for (h, ev) in &dag.events {
         events_hex.insert(hex(h), hex(&ev.encode()));
     }
-    serde_json::to_string(&DagBlob { events_hex }).unwrap_or_else(|_| "{}".to_string())
+    let base_members = dag.base_members.iter().map(|pk| hex(pk)).collect();
+    serde_json::to_string(&DagBlob { base_members, events_hex }).unwrap_or_else(|_| "{}".to_string())
 }
 
-/// Rebuild a Dag from persisted state. These events were already validated when
-/// first ingested, so we `rehydrate` (rebuild indices) instead of re-running
-/// signature + rule checks on every callback.
-pub fn dag_from_json(s: &str, members_json: &str) -> Result<Dag, String> {
-    let blob: DagBlob =
-        serde_json::from_str(s).unwrap_or(DagBlob { events_hex: BTreeMap::new() });
-    let members = members_from_json(members_json);
+/// Rebuild a Dag from persisted state, including its pruned membership base.
+/// These events were already validated when first ingested, so we `rehydrate`
+/// (rebuild indices) instead of re-running signature + rule checks.
+pub fn dag_from_json(s: &str) -> Result<Dag, String> {
+    let blob: DagBlob = serde_json::from_str(s).unwrap_or_default();
+    let base_members: BTreeSet<PubKey> =
+        blob.base_members.iter().filter_map(|h| from_hex32(h).ok()).collect();
     let mut events = Vec::with_capacity(blob.events_hex.len());
     for ev_hex in blob.events_hex.values() {
         let bytes = from_hex(ev_hex)?;
@@ -129,7 +134,7 @@ pub fn dag_from_json(s: &str, members_json: &str) -> Result<Dag, String> {
             events.push(ev);
         }
     }
-    Ok(Dag::rehydrate(members, events))
+    Ok(Dag::rehydrate(base_members, events))
 }
 
 #[cfg(test)]
@@ -174,7 +179,7 @@ mod tests {
         dag.ingest(g).unwrap();
 
         let json = dag_to_json(&dag);
-        let restored = dag_from_json(&json, &members_to_json(&members)).unwrap();
+        let restored = dag_from_json(&json).unwrap();
         assert!(restored.has(&h));
         assert_eq!(restored.events.len(), dag.events.len());
         // A single-member network finalizes its own event.
@@ -205,8 +210,7 @@ mod tests {
         // Persist (admitted DAG + pending orphan buffer) and reload.
         let dag_json = dag_to_json(&dag);
         let pending_json = events_to_json(&dag.pending_events());
-        let members_json = members_to_json(&members);
-        let mut reloaded = dag_from_json(&dag_json, &members_json).unwrap();
+        let mut reloaded = dag_from_json(&dag_json).unwrap();
         for ev in events_from_json(&pending_json) {
             let _ = reloaded.ingest(ev);
         }

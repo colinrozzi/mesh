@@ -311,7 +311,7 @@ fn handle_connection(state: ActorState, conn_id: String) -> Result<(ActorState, 
 #[export(name = "theater:simple/tcp-client.on-data")]
 fn on_data(state: ActorState, conn_id: String, data: Vec<u8>) -> Result<(ActorState, ()), String> {
     let signing_key = SigningKey::from_bytes(&from_hex32(&state.signing_key_hex)?);
-    let mut dag = dag_from_json(&state.dag_json, &state.members_json)?;
+    let mut dag = dag_from_json(&state.dag_json)?;
     for ev in events_from_json(&state.pending_json) {
         let _ = dag.ingest(ev); // re-buffer or resolve persisted orphans
     }
@@ -416,8 +416,12 @@ fn on_close(state: ActorState, conn_id: String, reason: String) -> Result<(Actor
 
 #[export(name = "theater:simple/timer.handle-tick")]
 fn handle_tick(state: ActorState, _timer_name: String) -> Result<(ActorState, ()), String> {
-    // Timed heartbeat / batched emission is deferred (DESIGN.md). For now,
-    // emission is purely on-event; the tick is a no-op.
+    // NOTE: `Dag::compact` is implemented and unit-tested, but NOT wired here
+    // yet. Running it live drops the pruned ancestry that a *joining or lagging*
+    // node needs to reconstruct the DAG — that requires a checkpoint/snapshot
+    // transfer over the sync path (base_members + sealed anchors), which is the
+    // next design step. Compaction is correct for nodes that already hold the
+    // history; it is not yet safe for catch-up. So the tick stays a no-op.
     Ok((state, ()))
 }
 

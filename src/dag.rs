@@ -36,9 +36,11 @@ fn dep_set(ev: &Event) -> BTreeSet<Hash> {
 
 #[derive(Clone, Debug)]
 pub struct Dag {
-    /// The configured bootstrap member set — the network's members at genesis,
-    /// before any Introduce/Depart. The live set is derived from here.
-    pub genesis_members: BTreeSet<PubKey>,
+    /// The derivation base for membership: the configured genesis set, advanced
+    /// by `compact` to the member set as of the pruned watermark. `members_at`
+    /// folds onto this. Every node's `members_at(E)` agrees regardless of how far
+    /// it has pruned (pruned ops here + retained ops in the fold = all ops).
+    pub base_members: BTreeSet<PubKey>,
     pub events: BTreeMap<Hash, Event>,
     /// Reverse adjacency: for each event hash, the events that directly
     /// reference it (via `self_parent` or `refs`) — "who observes me."
@@ -49,9 +51,9 @@ pub struct Dag {
 }
 
 impl Dag {
-    pub fn new(genesis_members: BTreeSet<PubKey>) -> Self {
+    pub fn new(base_members: BTreeSet<PubKey>) -> Self {
         Dag {
-            genesis_members,
+            base_members,
             events: BTreeMap::new(),
             observed_by: BTreeMap::new(),
             pending: BTreeMap::new(),
@@ -59,8 +61,8 @@ impl Dag {
     }
 
     /// Rebuild from persisted, already-validated events.
-    pub fn rehydrate(genesis_members: BTreeSet<PubKey>, events: Vec<Event>) -> Self {
-        let mut dag = Self::new(genesis_members);
+    pub fn rehydrate(base_members: BTreeSet<PubKey>, events: Vec<Event>) -> Self {
+        let mut dag = Self::new(base_members);
         for ev in events {
             let h = ev.event_hash();
             dag.insert(h, ev);
@@ -189,7 +191,7 @@ impl Dag {
     fn members_at_frontier(&self, frontier: &[Hash]) -> BTreeSet<PubKey> {
         let ancestors = self.ancestors_of(frontier);
         let ordered = self.topo_sort(&ancestors);
-        let mut members = self.genesis_members.clone();
+        let mut members = self.base_members.clone();
         for h in ordered {
             match self.events.get(&h).and_then(|e| e.system.as_ref()) {
                 Some(SystemOp::Introduce { node }) => {
@@ -207,7 +209,7 @@ impl Dag {
     /// The agreed current member set — genesis members with every *finalized*
     /// membership op folded in canonical order. Used for the handshake.
     pub fn consensus_members(&self) -> BTreeSet<PubKey> {
-        let mut members = self.genesis_members.clone();
+        let mut members = self.base_members.clone();
         for h in self.ordered_finalized() {
             match self.events.get(&h).and_then(|e| e.system.as_ref()) {
                 Some(SystemOp::Introduce { node }) => {
@@ -275,6 +277,97 @@ impl Dag {
             .filter(|h| self.is_finalized(h))
             .collect();
         self.topo_sort(&finalized)
+    }
+
+    // ===== Pruning =============================================================
+    //
+    // Anything below the finalized frontier is safe to drop: all-members finality
+    // means every member has witnessed the frontier, so every member already
+    // holds everyone's events up to it and no future event will reference below
+    // it. `compact` drops the strict common ancestors of all current heads
+    // (finalized, and — for payloads — already delivered), folding their
+    // membership ops into `base_members`. The member set derived at any event is
+    // invariant to how far a node has pruned, so nodes stay in agreement.
+
+    /// Compact the DAG, dropping sealed events below the frontier. `delivered` is
+    /// the set of payload events already delivered (we only prune a payload once
+    /// it's been delivered). Returns the pruned event hashes.
+    ///
+    /// Correct for nodes that already hold the full history, but not yet wired
+    /// into the live actor: a node catching up needs the pruned ancestry (or a
+    /// snapshot of it) to reconstruct the DAG — snapshot transfer is the next
+    /// step (see lib::handle_tick).
+    #[allow(dead_code)]
+    pub fn compact(&mut self, delivered: &BTreeSet<Hash>) -> Vec<Hash> {
+        // Heads of every current member — new events extend from these, so their
+        // strict common ancestors will never be referenced again.
+        let mut heads: Vec<Hash> = Vec::new();
+        for m in self.consensus_members() {
+            heads.extend(self.heads_of(&m));
+        }
+        if heads.is_empty() {
+            return Vec::new();
+        }
+
+        let prunable: BTreeSet<Hash> = self
+            .common_ancestors(&heads)
+            .into_iter()
+            .filter(|h| self.is_finalized(h))
+            .filter(|h| {
+                self.events
+                    .get(h)
+                    .is_some_and(|e| e.payload.is_empty() || delivered.contains(h))
+            })
+            .collect();
+        if prunable.is_empty() {
+            return Vec::new();
+        }
+
+        // Fold pruned membership ops into the derivation base (canonical order),
+        // so members_at above the watermark stays correct without them.
+        for h in self.topo_sort(&prunable) {
+            match self.events.get(&h).and_then(|e| e.system.as_ref()) {
+                Some(SystemOp::Introduce { node }) => {
+                    self.base_members.insert(*node);
+                }
+                Some(SystemOp::Depart { node }) => {
+                    self.base_members.remove(node);
+                }
+                None => {}
+            }
+        }
+
+        // Drop the events; clean their entries out of the reverse index.
+        for h in &prunable {
+            if let Some(deps) = self.events.get(h).map(dep_set) {
+                for d in deps {
+                    if let Some(obs) = self.observed_by.get_mut(&d) {
+                        obs.remove(h);
+                    }
+                }
+            }
+            self.events.remove(h);
+            self.observed_by.remove(h);
+        }
+        prunable.into_iter().collect()
+    }
+
+    /// Events that are ancestors of *every* head (strict — heads excluded).
+    #[allow(dead_code)]
+    fn common_ancestors(&self, heads: &[Hash]) -> BTreeSet<Hash> {
+        let mut iter = heads.iter();
+        let Some(&first) = iter.next() else {
+            return BTreeSet::new();
+        };
+        let mut common = self.ancestors_of(&[first]);
+        for &h in iter {
+            let anc = self.ancestors_of(&[h]);
+            common.retain(|x| anc.contains(x));
+        }
+        for h in heads {
+            common.remove(h);
+        }
+        common
     }
 
     fn topo_sort(&self, set: &BTreeSet<Hash>) -> Vec<Hash> {
@@ -518,5 +611,80 @@ mod tests {
         // A tries to depart B — illegal (no third-party eviction).
         let bad = sys(&a, Some(gah), alloc::vec![gbh], SystemOp::Depart { node: pk(&b) });
         assert!(dag.ingest(bad).is_err());
+    }
+
+    // ----- pruning -----
+
+    #[test]
+    fn compact_prunes_sealed_history_and_preserves_finality() {
+        let a = key(1);
+        let b = key(2);
+        let mut dag = Dag::new(members(&[&a, &b]));
+        let ga = ev(&a, None, Vec::new(), Vec::new());
+        let gb = ev(&b, None, Vec::new(), Vec::new());
+        let (gah, gbh) = (ga.event_hash(), gb.event_hash());
+        dag.ingest(ga).unwrap();
+        dag.ingest(gb).unwrap();
+
+        let m1 = ev(&a, Some(gah), alloc::vec![gbh], b"one".to_vec());
+        let m1h = m1.event_hash();
+        dag.ingest(m1).unwrap();
+        let b1 = ev(&b, Some(gbh), alloc::vec![m1h], Vec::new());
+        let b1h = b1.event_hash();
+        dag.ingest(b1).unwrap();
+
+        let m2 = ev(&a, Some(m1h), alloc::vec![b1h], b"two".to_vec());
+        let m2h = m2.event_hash();
+        dag.ingest(m2).unwrap();
+        let b2 = ev(&b, Some(b1h), alloc::vec![m2h], Vec::new());
+        dag.ingest(b2).unwrap();
+
+        assert_eq!(dag.events.len(), 6);
+        assert!(dag.is_finalized(&m2h));
+
+        // m1 has been delivered; ga/gb/b1 are empty grafts → all droppable.
+        let pruned = dag.compact(&BTreeSet::from([m1h]));
+        assert!(pruned.contains(&gah) && pruned.contains(&m1h) && pruned.contains(&b1h));
+        assert!(!dag.has(&m1h));
+        assert!(dag.events.len() < 6);
+
+        // Derivation survives: membership unchanged, m2 still finalized.
+        assert_eq!(dag.consensus_members(), members(&[&a, &b]));
+        assert!(dag.is_finalized(&m2h));
+    }
+
+    #[test]
+    fn compact_folds_pruned_membership_into_base() {
+        let a = key(1);
+        let b = key(2);
+        let n = key(7);
+        let mut dag = Dag::new(members(&[&a, &b]));
+        let ga = ev(&a, None, Vec::new(), Vec::new());
+        let gb = ev(&b, None, Vec::new(), Vec::new());
+        let (gah, gbh) = (ga.event_hash(), gb.event_hash());
+        dag.ingest(ga).unwrap();
+        dag.ingest(gb).unwrap();
+
+        let intro = sys(&a, Some(gah), alloc::vec![gbh], SystemOp::Introduce { node: pk(&n) });
+        let ih = intro.event_hash();
+        dag.ingest(intro).unwrap();
+        let b1 = ev(&b, Some(gbh), alloc::vec![ih], Vec::new());
+        let b1h = b1.event_hash();
+        dag.ingest(b1).unwrap();
+        assert!(dag.consensus_members().contains(&pk(&n)));
+
+        // Advance both members past the introduce so it becomes a common ancestor.
+        let a2 = ev(&a, Some(ih), alloc::vec![b1h], Vec::new());
+        let a2h = a2.event_hash();
+        dag.ingest(a2).unwrap();
+        let b2 = ev(&b, Some(b1h), alloc::vec![a2h], Vec::new());
+        dag.ingest(b2).unwrap();
+
+        let pruned = dag.compact(&BTreeSet::new());
+        assert!(pruned.contains(&ih), "the introduce should be pruned");
+        assert!(!dag.has(&ih));
+        // N is still a member — the pruned Introduce was folded into base_members.
+        assert!(dag.base_members.contains(&pk(&n)));
+        assert!(dag.consensus_members().contains(&pk(&n)));
     }
 }

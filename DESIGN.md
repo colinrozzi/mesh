@@ -325,9 +325,19 @@ future reconfiguration protocol) that a member is gone.
 The first things to build next. Unbounded growth is an accepted failure mode
 until they land.
 
-- **Pruning / compaction.** Finalized, applied history can be dropped (keep
-  hashes for verification). Most urgent, because the on-event heartbeat grows
-  the DAG continuously, even at idle.
+- **Pruning / compaction.** The *mechanism* exists (`Dag::compact` +
+  unit tests): all-members finality means everything below the finalized
+  frontier is safe to drop, so `compact` prunes the strict common ancestors of
+  all current heads (finalized + delivered), folding their membership ops into
+  `base_members`. It's correct for a node that already holds the history — but
+  **not yet wired live**, because a *joining or lagging* node syncs the retained
+  events and can't reconstruct the DAG once their pruned ancestry is gone. That
+  needs **snapshot transfer** (below).
+- **Snapshot transfer.** For live pruning: a node catching up past the pruned
+  watermark must receive a checkpoint — `base_members` + a set of "sealed"
+  boundary anchors it can treat as valid-but-bodyless — so it can ingest
+  retained events whose deps were pruned, and derive membership. This is the
+  prerequisite that makes compaction safe to run in the actor.
 - **Incremental finality + delivery.** Advance the finalized frontier and
   process *newly* finalized events instead of re-scanning the whole log each
   callback; snapshot committed state. Avoids O(history²) recompute.
