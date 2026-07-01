@@ -122,25 +122,18 @@ concurrent siblings the canonical order resolves by hash. Acting on the evidence
 — rejecting or slashing an equivocator — is a future BFT concern; *disallowing*
 forks outright is deferred until then.
 
-## Membership (static)
+## Membership
 
-Membership is **objective** — every node computes the same member set — and in
-v3 it is **static configuration**: each node is started with the set of member
-pubkeys (and their addresses) pre-defined and identical across the network. This
-is the v2 `peer_node_pubkeys` / `peer_meshes` bootstrap promoted to the whole
-membership story.
+Membership is **objective** — every node computes the same member set. It starts
+from a **configured genesis set** (pubkeys pre-defined and identical across the
+network — the v2 `peer_node_pubkeys` bootstrap) and **evolves at runtime** via
+`Introduce`/`Depart` system events. See *Dynamic membership* below for the full
+model; the short version: the genesis set is config, and the live set is derived
+by folding membership events over the finalized log.
 
-This is the simplification that lets us drop a per-event "machine" tag: since
-the member set comes from config and never changes at runtime, **the substrate
-never has to interpret an event to learn membership.** It interprets nothing.
-There is no membership op, no system namespace — one network is one member set is
-one state machine.
-
-> **v3 boundary, named deliberately.** The moment membership must change at
-> runtime, the substrate again needs to learn the member set *from somewhere* —
-> a substrate-reserved payload convention it may peek at, or an out-of-band
-> reconfiguration protocol. v3 does not solve this. Static membership is a
-> conscious boundary, not an oversight.
+Membership is the *one* thing the substrate interprets in events (it must —
+finality depends on the member set). Everything else in an event's `payload` is
+opaque; one network is one member set is one state machine.
 
 A consequence: v2's **Node vs Mailbox** roles dissolve from the substrate. The
 substrate knows only *member nodes* (the consensus participants). Application
@@ -340,14 +333,98 @@ until they land.
 - **Batched emission.** Replace on-event grafting with a tick that collapses
   many refs into one witness — the scaling fix for N>2 and idle cost.
 
+## Dynamic membership — introduction & departure
+
+> Status: **implemented** (`SystemOp` in event.rs, derivation + validation in
+> dag.rs, INTRODUCE/DEPART frames in lib.rs, `membership-test`). Stays inside the
+> honest-but-offline / CP model — *no* fault tolerance. Nodes join and leave via
+> explicit signed events; a crash without a departure halts the network
+> (accepted). Motivating use: each agent in a fleet runs its own mesh node (in
+> its supervision tree) and uses it to communicate.
+
+### Membership becomes derived state (a substrate-reserved op)
+
+Once membership is mutable, the substrate must *interpret* the events that change
+it — finality can't be computed without knowing the member set. So membership
+events are substrate-reserved, carried in a typed field rather than the opaque
+payload:
+
+```
+SystemOp = Introduce { node: PubKey }   // admit a node
+         | Depart    { node: PubKey }   // remove a node (self-announced)
+
+Event { author, self_parent, refs, payload, system: Option<SystemOp>, signature }
+```
+
+An ordinary event has `system: None` + an opaque payload; a membership event has
+a `SystemOp` + empty payload. The canonical encoding gains a tag byte after
+`payload`: `0` = none, `1` = Introduce + node[32], `2` = Depart + node[32]. The
+genesis member set is still the configured bootstrap set; it evolves from there.
+
+### Deriving the live member set
+
+The member set is a pure function of the finalized DAG, computed by the substrate
+itself (not the app reducer — finality needs it):
+
+    members_at(E) = start from the configured genesis members, then fold every
+                    finalized Introduce/Depart in E's causal ancestry, in
+                    canonical order.
+
+Inductive from genesis — no circularity — the same shape as v2's
+`state_at(parent)`. The *live* member set is `members_at` the finalized frontier.
+
+### Finality with a moving member set
+
+`is_finalized(E) = members_at(E) ⊆ witnessing_members(E)` — the members *live at
+E's position* must all have witnessed it. Two cases fall out cleanly:
+
+- **Introduce{N}:** N isn't a member yet at this position, so it's *not* required
+  to witness its own admission — the current members finalize it, then N joins.
+- **Depart{N}:** N *is* still a member here, so it must witness — but it authored
+  the event, and authorship is a witness, so that's automatic. The departure
+  finalizes once the *other* members graft it. N can emit-and-die.
+
+### Join flow (supervision-tree-mediated)
+
+1. A parent agent spawns a child agent + its mesh node, and knows the child's key.
+2. The parent (a member) authors `Introduce{child}`; it gossips and finalizes
+   once the current members witness.
+3. The parent signals the child it's admitted; the child connects as a now-valid
+   member, catches up via WANT/FRONTIER, and starts witnessing.
+
+The supervision hierarchy *is* the admission channel — a parent vouches in its
+child — which sidesteps a separate bootstrap protocol and matches the fleet's
+spawn pattern. (A node only passes the membership-gated handshake once its
+`Introduce` has finalized; until then the parent relays.)
+
+### Departure flow
+
+1. On graceful shutdown, the child's node authors `Depart{self}`.
+2. It gossips the departure and waits for **one live peer to acknowledge receipt**.
+3. The node exits. Survivors graft the departure; it finalizes without the
+   departed node; the member set shrinks.
+
+The only hard requirement is that ≥1 peer receive the departure before the node
+dies — from there gossip finalizes it. A crash with no departure (or before any
+peer sees it) halts: accepted, per the threat model.
+
+### Authorization & sequencing
+
+- Any current member may `Introduce` (web-of-trust — a parent vouches for its
+  child). `Depart` is self-authored. A member authoring `Depart` for *another*
+  node — manual eviction of a crashed peer — is the one escape hatch that makes a
+  crash recoverable; left out for now (it's "progress after a failure").
+- Membership changes apply **one at a time** in canonical order. Concurrent
+  changes (rare in a cooperative fleet) are ordered deterministically by hash;
+  members chain a change off the latest membership state they've seen.
+  Concurrent *conflicting* changes are the sharp edge to harden later.
+
 ## Deferred
 
-- **Dynamic membership** (runtime add/remove, and reconfiguration to drop a
-  permanently-gone member) — the boundary named under *Membership* above.
-- **Byzantine fault tolerance** — equivocation/forgery is detected, not
-  defended; admitting forks keeps us consistent under honest-but-offline only.
-- **The introduction problem** — admitting a genuinely new node without
-  pre-shared config (web-of-trust, sponsor events, …).
+- **Fault tolerance** — quorum finality, automatic eviction on failure, and
+  partition recovery. The dynamic-membership design above deliberately stops
+  short: a crashed member halts progress. Byzantine tolerance (defending against
+  forged/equivocated events, not just detecting them) is further out still.
 - **Key rotation** — the self-rooted log supports it (genesis declares keys, a
   later event rotates); not implemented.
 - **Application identities** (agents / mailboxes) — addressing for non-member

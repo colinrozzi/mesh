@@ -47,11 +47,12 @@ and the same mechanic drives dissemination and catch-up sync.
 
 ```
 Event {
-    author:      PubKey,        // 32 bytes — ed25519 verifying key (a member)
-    self_parent: Option<Hash>,  // author's previous event; None for a genesis
-    refs:        Vec<Hash>,     // foreign heads grafted (witness + propagation)
-    payload:     Vec<u8>,       // opaque to the substrate; empty = pure graft
-    signature:   Sig,           // 64 bytes — ed25519 over the encoding above
+    author:      PubKey,          // 32 bytes — ed25519 verifying key (a member)
+    self_parent: Option<Hash>,    // author's previous event; None for a genesis
+    refs:        Vec<Hash>,       // foreign heads grafted (witness + propagation)
+    payload:     Vec<u8>,         // opaque to the substrate; empty = pure graft
+    system:      Option<SystemOp>,// membership op (Introduce/Depart), or None
+    signature:   Sig,             // 64 bytes — ed25519 over the encoding above
 }
 ```
 
@@ -61,9 +62,13 @@ primitive as an application event, distinguished only by carrying no payload.
 
 ## Membership
 
-Membership is **objective and static** — every node is configured with the same
-member-pubkey set. The substrate never derives membership from the log, so it
-interprets *nothing* in events; payloads are entirely the reducer's business.
+Membership is **objective and dynamic** — every node computes the same member
+set. It starts from a configured genesis set and evolves at runtime: a member
+authors an `Introduce{node}` (admit) or `Depart{self}` (leave), carried in the
+event's `system` field. The substrate folds these over the finalized log to
+derive the live set (the one thing it interprets in an event); everything else
+in `payload` is the reducer's business. A crash *without* a departure halts
+progress — mesh is CP, with no fault tolerance (see `DESIGN.md`).
 
 There are no roles. The substrate knows only **member nodes** (consensus
 participants). Application identities — message recipients, agents, mailboxes —
@@ -111,7 +116,9 @@ catch up immediately.
 | both | `0x10` | DELIVER | one encoded `Event` (gossip / backfill response) |
 | both | `0x20` | FRONTIER | hash-list — "here are my heads" |
 | both | `0x21` | WANT | hash-list — "send me these events" |
-| client → mesh | `0x11` | SUBMIT | payload bytes — "author this for me" |
+| client → mesh | `0x11` | SUBMIT | payload bytes — "author this message for me" |
+| client → mesh | `0x12` | INTRODUCE | pubkey[32] — "admit this node as a member" |
+| client → mesh | `0x13` | DEPART | (empty) — "author my departure" |
 | mesh → client | `0x91` | ACK | event_hash[32] + ok_byte + utf8 err |
 | mesh → client | `0x92` | NOTIFY | from[32] + body — committed message delivery |
 
@@ -126,6 +133,7 @@ author:       32 bytes
 self_parent:  1 tag byte (0=none, 1=present) + 32 bytes iff present
 refs:         u16 count (BE) + count * 32 bytes
 payload:      u32 len (BE) + len bytes
+system:       1 tag byte (0=none, 1=Introduce, 2=Depart) + node[32] iff 1|2
 signature:    64 bytes (ed25519 over sha256 of all the above)
 ```
 
@@ -140,10 +148,13 @@ Deterministic and byte-stable across machines and language ports.
   // REQUIRED — seed material for this node's signing key
   "node_seed": "...",
 
-  // OPTIONAL — other member pubkeys (hex). These ∪ this node = the member set.
+  // OPTIONAL — the genesis member set (hex pubkeys), identical on every node.
+  // Defaults to just this node if omitted. A node whose key is NOT in this set
+  // is a *joining* node, admitted later via an Introduce event. Membership
+  // evolves from here at runtime.
   "members": ["<64 hex chars>", ...],
 
-  // OPTIONAL — peers to outbound-connect to on init (a subset of members)
+  // OPTIONAL — peers to outbound-connect to on init
   "dial": [{"pubkey": "<hex>", "address": "127.0.0.1:9448"}],
 
   // OPTIONAL — listen address (default "127.0.0.1:9447")
@@ -187,6 +198,15 @@ cd multi-node-test && cargo build --release && ./target/release/mesh-multi-node-
 Spawns two member nodes (9447, 9448); B dials A. A message submitted to A
 propagates to B, finalizes across both, and is delivered to a client on B.
 
+### Dynamic-membership test
+
+```sh
+cd membership-test && cargo build --release && ./target/release/mesh-membership-test
+```
+
+Bootstrap nodes A + B admit a third node N at runtime, finalize a message
+delivered to N, then N departs cleanly and A + B carry on without it.
+
 ## File layout
 
 ```
@@ -204,20 +224,22 @@ mesh/
 │   ├── conn.rs         # per-connection handshake state
 │   ├── codec.rs        # ActorState persistence + hex helpers
 │   └── wire.rs         # frame protocol
+├── testkit/            # shared integration-test client + spawn harness
 ├── smoke/              # single-node end-to-end test
-└── multi-node-test/    # two-node integration test
+├── multi-node-test/    # two-node integration test
+└── membership-test/    # dynamic introduce/depart test
 ```
 
 ## Status
 
-**Working:** self-rooted logs; multi-parent DAG with forks admitted; static
-membership; grafting as unified dissemination / witnessing / catch-up; all-
-members finality; the reducer seam + message-passing with committed delivery;
-single- and multi-node operation.
+**Working:** self-rooted logs; multi-parent DAG with forks admitted; **dynamic
+membership** (runtime introduce/depart); grafting as unified dissemination /
+witnessing / catch-up; all-members finality; the reducer seam + message-passing
+with committed delivery; single- and multi-node operation.
 
 **Near-term** (see `DESIGN.md`): pruning/compaction (the DAG grows unbounded),
 incremental finality + reducer (currently re-folds from genesis each callback),
 batched emission (currently emit-on-event).
 
-**Deferred:** dynamic membership, eviction / liveness-on-disconnect, the
-introduction problem, key rotation, Byzantine fault tolerance.
+**Deferred:** fault tolerance (quorum finality, eviction of a crashed member,
+partition recovery), key rotation, Byzantine fault tolerance.

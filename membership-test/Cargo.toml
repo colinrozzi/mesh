@@ -1,0 +1,11 @@
+[package]
+name = "mesh-membership-test"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "mesh-membership-test"
+path = "src/main.rs"
+
+[dependencies]
+mesh-testkit = { path = "../testkit" }

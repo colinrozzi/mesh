@@ -43,14 +43,14 @@ use codec::{
 };
 use conn::{ConnState, Phase};
 use dag::Dag;
-use event::{Event, Hash, PubKey};
+use event::{Event, Hash, PubKey, SystemOp};
 use message::Mailboxes;
 use reducer::fold;
 use wire::{
     decode_hashes, encode_ack, encode_auth, encode_challenge, encode_deliver, encode_hashes,
     encode_hello, encode_notify, encode_rejected, try_parse_frame, ParsedFrame, FRAME_ACCEPTED,
-    FRAME_AUTH, FRAME_CHALLENGE, FRAME_DELIVER, FRAME_FRONTIER, FRAME_HELLO, FRAME_SUBMIT,
-    FRAME_WANT,
+    FRAME_AUTH, FRAME_CHALLENGE, FRAME_DELIVER, FRAME_DEPART, FRAME_FRONTIER, FRAME_HELLO,
+    FRAME_INTRODUCE, FRAME_SUBMIT, FRAME_WANT,
 };
 
 #[derive(Clone, GraphValue)]
@@ -169,17 +169,27 @@ fn init(state: Value) -> Result<(ActorState, ()), String> {
     let signing_key = SigningKey::from_bytes(&key_bytes);
     let self_pubkey = signing_key.verifying_key().to_bytes();
 
-    // Member set = configured members ∪ self.
+    // Genesis member set = the configured bootstrap set (identical on every
+    // node), or {self} if none is given (single-node). We do NOT auto-add self:
+    // a node whose key isn't in the genesis set is a *joining* node, admitted
+    // later via an Introduce event.
     let mut members = members_from_json("[]");
     for m in &cfg.members {
         members.insert(from_hex32(m)?);
     }
-    members.insert(self_pubkey);
+    if members.is_empty() {
+        members.insert(self_pubkey);
+    }
+    let is_bootstrap = members.contains(&self_pubkey);
 
-    // Author this node's genesis so it has a chain head.
     let mut dag = Dag::new(members.clone());
-    let genesis = author_genesis(&mut dag, &signing_key);
-    let self_head = genesis.event_hash();
+    // Bootstrap members author a genesis at init; a joining node has no chain
+    // yet — it authors its first event (grafting its admission) after it syncs.
+    let self_head: Option<Hash> = if is_bootstrap {
+        Some(author_genesis(&mut dag, &signing_key).event_hash())
+    } else {
+        None
+    };
 
     let listener_id =
         tcp_listen(listen_addr.clone()).map_err(|e| format!("listen failed: {}", e))?;
@@ -212,7 +222,7 @@ fn init(state: Value) -> Result<(ActorState, ()), String> {
             listen_addr,
             signing_key_hex: hex(&key_bytes),
             members_json: members_to_json(&members),
-            self_head_hex: hex(&self_head),
+            self_head_hex: self_head.map(|h| hex(&h)).unwrap_or_default(),
             dag_json: dag_to_json(&dag),
             pending_json: "[]".to_string(),
             delivered_json: "[]".to_string(),
@@ -310,7 +320,11 @@ fn on_data(state: ActorState, conn_id: String, data: Vec<u8>) -> Result<(ActorSt
         let _ = dag.ingest(ev); // re-buffer or resolve persisted orphans
     }
     let mut conns = connections_from_json(&state.connections_json);
-    let mut self_head = from_hex32(&state.self_head_hex)?;
+    let mut self_head: Option<Hash> = if state.self_head_hex.is_empty() {
+        None
+    } else {
+        Some(from_hex32(&state.self_head_hex)?)
+    };
     let mut delivered: BTreeSet<Hash> = hashes_from_json(&state.delivered_json).into_iter().collect();
 
     let mut conn_state = match conns.remove(&conn_id) {
@@ -389,7 +403,7 @@ fn on_data(state: ActorState, conn_id: String, data: Vec<u8>) -> Result<(ActorSt
             pending_json: events_to_json(&dag.pending_events()),
             delivered_json: hashes_to_json(&delivered_vec),
             connections_json: connections_to_json(&conns),
-            self_head_hex: hex(&self_head),
+            self_head_hex: self_head.map(|h| hex(&h)).unwrap_or_default(),
             ..state
         },
         (),
@@ -426,7 +440,7 @@ fn step_hello(conn_id: &str, frame: &ParsedFrame, dag: &Dag) -> Step {
     }
     let mut pk = [0u8; 32];
     pk.copy_from_slice(&frame.payload);
-    if !dag.members.contains(&pk) {
+    if !dag.consensus_members().contains(&pk) {
         let _ = tcp_send(conn_id.to_string(), encode_rejected("not a member"));
         let _ = tcp_close(conn_id.to_string());
         return Step::Close;
@@ -472,9 +486,9 @@ fn handle_authed_frame(
     conns: &BTreeMap<String, ConnState>,
     conn_id: &str,
     signing_key: &SigningKey,
-    self_head: Hash,
+    self_head: Option<Hash>,
     frame: &ParsedFrame,
-) -> Hash {
+) -> Option<Hash> {
     match frame.kind {
         FRAME_DELIVER => match Event::decode(&frame.payload) {
             Ok(ev) => ingest_and_propagate(dag, conns, conn_id, signing_key, self_head, ev),
@@ -483,20 +497,25 @@ fn handle_authed_frame(
                 self_head
             }
         },
+        // App client asks us to author an event on our own chain: a message
+        // payload (SUBMIT), or a membership change (INTRODUCE / DEPART).
         FRAME_SUBMIT => {
-            // App client asks us to author a payload event on our own chain.
-            match author_event(dag, signing_key, self_head, frame.payload.clone()) {
-                Ok(ev) => {
-                    let h = ev.event_hash();
-                    let _ = tcp_send(conn_id.to_string(), encode_ack(&h, true, ""));
-                    broadcast(conns, conn_id, &encode_deliver(&ev.encode()));
-                    h
-                }
-                Err(e) => {
-                    let _ = tcp_send(conn_id.to_string(), encode_ack(&[0u8; 32], false, &e));
-                    self_head
-                }
+            author_and_broadcast(dag, conns, conn_id, signing_key, self_head, frame.payload.clone(), None)
+        }
+        FRAME_INTRODUCE => {
+            if frame.payload.len() != 32 {
+                let _ = tcp_send(conn_id.to_string(), encode_ack(&[0u8; 32], false, "INTRODUCE needs pubkey[32]"));
+                return self_head;
             }
+            let mut node = [0u8; 32];
+            node.copy_from_slice(&frame.payload);
+            let op = Some(SystemOp::Introduce { node });
+            author_and_broadcast(dag, conns, conn_id, signing_key, self_head, Vec::new(), op)
+        }
+        FRAME_DEPART => {
+            let me = signing_key.verifying_key().to_bytes();
+            let op = Some(SystemOp::Depart { node: me });
+            author_and_broadcast(dag, conns, conn_id, signing_key, self_head, Vec::new(), op)
         }
         FRAME_WANT => {
             for h in decode_hashes(&frame.payload) {
@@ -526,13 +545,16 @@ fn ingest_and_propagate(
     conns: &BTreeMap<String, ConnState>,
     from_conn: &str,
     signing_key: &SigningKey,
-    self_head: Hash,
+    self_head: Option<Hash>,
     event: Event,
-) -> Hash {
+) -> Option<Hash> {
     if dag.has(&event.event_hash()) {
         return self_head; // dedup — already have it
     }
-    let payload_nonempty = !event.payload.is_empty();
+    // Anything that must reach finality — a payload event or a membership change
+    // — we witness by grafting. Pure heartbeats (empty payload, no system op)
+    // are only forwarded, so grafts don't beget grafts forever.
+    let needs_witness = !event.payload.is_empty() || event.system.is_some();
     let encoded = event.encode();
     let missing = missing_deps(dag, &event); // compute before `ingest` consumes it
 
@@ -541,13 +563,20 @@ fn ingest_and_propagate(
             // Forward to every other peer (the source is excluded — it's not in
             // `conns` right now, having been removed for the duration of on-data).
             broadcast(conns, from_conn, &encode_deliver(&encoded));
-            if payload_nonempty {
+            if needs_witness {
                 // Witness it: author a graft whose refs cover the new head.
                 // (Delivery happens on finality, via deliver_committed.)
-                match author_event(dag, signing_key, self_head, Vec::new()) {
+                match author_event(dag, signing_key, self_head, Vec::new(), None) {
                     Ok(graft) => {
-                        broadcast(conns, "", &encode_deliver(&graft.encode()));
-                        return graft.event_hash();
+                        // Send our witness to every peer INCLUDING the source. The
+                        // source was pulled out of `conns` for the duration of
+                        // on-data, but it's precisely the peer that needs to see
+                        // we witnessed — so *it* can finalize. Without this, a
+                        // witness never flows back to an event's origin.
+                        let frame = encode_deliver(&graft.encode());
+                        broadcast(conns, "", &frame);
+                        let _ = tcp_send(from_conn.to_string(), frame);
+                        return Some(graft.event_hash());
                     }
                     Err(e) => log(format!("[mesh] graft failed: {}", e)),
                 }
@@ -571,46 +600,64 @@ fn ingest_and_propagate(
 // ---- authoring + helpers ----
 
 fn author_genesis(dag: &mut Dag, signing_key: &SigningKey) -> Event {
-    let author = signing_key.verifying_key().to_bytes();
-    let sh = Event::signing_hash(&author, &None, &[], &[]);
-    let ev = Event {
-        author,
-        self_parent: None,
-        refs: Vec::new(),
-        payload: Vec::new(),
-        signature: signing_key.sign(&sh).to_bytes(),
-    };
+    let ev = Event::sign(signing_key, None, Vec::new(), Vec::new(), None);
     let _ = dag.ingest(ev.clone());
     ev
 }
 
-/// Author an event on this node's chain: self_parent = current head, refs =
-/// foreign heads we've seen, with the given payload. Ingests and returns it.
+/// Author an event on this node's chain: self_parent = current head (`None` for
+/// the node's first event), refs = foreign heads we've seen. Ingests and returns
+/// it. A joining node's first event has `self_head == None` but still grafts the
+/// network via `refs` (which reach its Introduce), so it validates as a member.
 fn author_event(
     dag: &mut Dag,
     signing_key: &SigningKey,
-    self_head: Hash,
+    self_head: Option<Hash>,
     payload: Vec<u8>,
+    system: Option<SystemOp>,
 ) -> Result<Event, String> {
     let author = signing_key.verifying_key().to_bytes();
     let refs = foreign_heads(dag, &author);
-    let self_parent = Some(self_head);
-    let sh = Event::signing_hash(&author, &self_parent, &refs, &payload);
-    let ev = Event { author, self_parent, refs, payload, signature: signing_key.sign(&sh).to_bytes() };
+    let ev = Event::sign(signing_key, self_head, refs, payload, system);
     match dag.ingest(ev.clone())? {
         true => Ok(ev),
         false => Err("authored event buffered (missing dep)".to_string()),
     }
 }
 
+/// Author an event (payload or system op), ACK the requester, and broadcast it.
+/// Returns the new self_head on success, unchanged on failure.
+fn author_and_broadcast(
+    dag: &mut Dag,
+    conns: &BTreeMap<String, ConnState>,
+    conn_id: &str,
+    signing_key: &SigningKey,
+    self_head: Option<Hash>,
+    payload: Vec<u8>,
+    system: Option<SystemOp>,
+) -> Option<Hash> {
+    match author_event(dag, signing_key, self_head, payload, system) {
+        Ok(ev) => {
+            let h = ev.event_hash();
+            let _ = tcp_send(conn_id.to_string(), encode_ack(&h, true, ""));
+            broadcast(conns, conn_id, &encode_deliver(&ev.encode()));
+            Some(h)
+        }
+        Err(e) => {
+            let _ = tcp_send(conn_id.to_string(), encode_ack(&[0u8; 32], false, &e));
+            self_head
+        }
+    }
+}
+
 /// Heads of every member other than `me` that we currently hold.
 fn foreign_heads(dag: &Dag, me: &PubKey) -> Vec<Hash> {
     let mut out = Vec::new();
-    for m in &dag.members {
-        if m == me {
+    for m in dag.consensus_members() {
+        if m == *me {
             continue;
         }
-        out.extend(dag.heads_of(m));
+        out.extend(dag.heads_of(&m));
     }
     out
 }
@@ -618,8 +665,8 @@ fn foreign_heads(dag: &Dag, me: &PubKey) -> Vec<Hash> {
 /// All current heads across all members — our advertised frontier.
 fn all_heads(dag: &Dag) -> Vec<Hash> {
     let mut out = Vec::new();
-    for m in &dag.members {
-        out.extend(dag.heads_of(m));
+    for m in dag.consensus_members() {
+        out.extend(dag.heads_of(&m));
     }
     out
 }

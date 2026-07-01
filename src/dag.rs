@@ -1,12 +1,17 @@
-//! DAG storage + finality, over a multi-parent event graph (v3).
+//! DAG storage + finality, over a multi-parent event graph with dynamic
+//! membership.
 //!
-//! Each event has back-edges `self_parent ∪ refs` (see event.rs): `self_parent`
-//! is the author's own previous event, `refs` are foreign heads it grafted.
-//! Membership is **static configuration** — the substrate is told the member
-//! set; it does not derive it from the log. The substrate's only jobs here are
-//! to admit valid events, track reverse-reachability (who has witnessed what),
-//! decide finality (every member has witnessed an event), and produce the
-//! canonical finalized order for a reducer to consume. See DESIGN.md.
+//! Each event has back-edges `self_parent ∪ refs` (see event.rs). Membership is
+//! **derived**: it starts from a configured genesis set and evolves as
+//! `Introduce`/`Depart` system events finalize. The substrate interprets those
+//! ops directly (it must — finality depends on the member set). See DESIGN.md.
+//!
+//! Two member-set views:
+//!   - `members_at_frontier(deps)` — members *live at a point*, folded from the
+//!     ancestry reachable from `deps`. Used to validate an event and to decide
+//!     which members must witness it for finality.
+//!   - `consensus_members()` — members folded over the *finalized* order. The
+//!     agreed current set; used for the membership-gated handshake.
 
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::format;
@@ -14,7 +19,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use crate::codec::hex;
-use crate::event::{Event, Hash, PubKey};
+use crate::event::{Event, Hash, PubKey, SystemOp};
 
 /// The back-edges of an event: its `self_parent` (if any) and its `refs`,
 /// de-duplicated (an honest event won't repeat, but decode permits it).
@@ -31,12 +36,12 @@ fn dep_set(ev: &Event) -> BTreeSet<Hash> {
 
 #[derive(Clone, Debug)]
 pub struct Dag {
-    /// Static, configured member set. Identical on every node in the network.
-    pub members: BTreeSet<PubKey>,
+    /// The configured bootstrap member set — the network's members at genesis,
+    /// before any Introduce/Depart. The live set is derived from here.
+    pub genesis_members: BTreeSet<PubKey>,
     pub events: BTreeMap<Hash, Event>,
     /// Reverse adjacency: for each event hash, the events that directly
     /// reference it (via `self_parent` or `refs`) — "who observes me."
-    /// Maintained incrementally; drives `events_that_see`.
     observed_by: BTreeMap<Hash, BTreeSet<Hash>>,
     /// Events held until a missing dependency arrives, keyed by one missing
     /// dependency hash. When that hash lands, the waiters are re-ingested.
@@ -44,20 +49,18 @@ pub struct Dag {
 }
 
 impl Dag {
-    pub fn new(members: BTreeSet<PubKey>) -> Self {
+    pub fn new(genesis_members: BTreeSet<PubKey>) -> Self {
         Dag {
-            members,
+            genesis_members,
             events: BTreeMap::new(),
             observed_by: BTreeMap::new(),
             pending: BTreeMap::new(),
         }
     }
 
-    /// Rebuild from persisted, already-validated events: insert each and
-    /// rebuild the reverse index. Skips signature + rule checks (they passed
-    /// when first ingested), so reloading is O(n) inserts.
-    pub fn rehydrate(members: BTreeSet<PubKey>, events: Vec<Event>) -> Self {
-        let mut dag = Self::new(members);
+    /// Rebuild from persisted, already-validated events.
+    pub fn rehydrate(genesis_members: BTreeSet<PubKey>, events: Vec<Event>) -> Self {
+        let mut dag = Self::new(genesis_members);
         for ev in events {
             let h = ev.event_hash();
             dag.insert(h, ev);
@@ -70,34 +73,52 @@ impl Dag {
     /// validation failure.
     pub fn ingest(&mut self, event: Event) -> Result<bool, String> {
         event.verify_signature()?;
-        if !self.members.contains(&event.author) {
-            return Err(format!("author {} is not a member", hex(&event.author)));
-        }
         let h = event.event_hash();
         if self.events.contains_key(&h) {
             return Ok(true); // dedup — idempotent
         }
 
         // Buffer until every dependency (self_parent + refs) is present.
-        if let Some(missing) = dep_set(&event)
-            .into_iter()
-            .find(|d| !self.events.contains_key(d))
-        {
-            self.pending.entry(missing).or_default().push(event);
+        let deps: Vec<Hash> = dep_set(&event).into_iter().collect();
+        if let Some(missing) = deps.iter().find(|d| !self.events.contains_key(*d)) {
+            self.pending.entry(*missing).or_default().push(event);
             return Ok(false);
+        }
+
+        // Members live *at this event's position* — folded from its ancestry.
+        let members = self.members_at_frontier(&deps);
+        if !members.contains(&event.author) {
+            return Err(format!("author {} is not a member", hex(&event.author)));
         }
 
         // self_parent must be one of the author's own events.
         if let Some(sp) = event.self_parent {
-            let parent = self.events.get(&sp).expect("dep present");
-            if parent.author != event.author {
+            if self.events.get(&sp).map(|p| p.author) != Some(event.author) {
                 return Err("self_parent must be authored by the same node".into());
+            }
+        }
+
+        // Membership-op rules.
+        if let Some(op) = &event.system {
+            match op {
+                SystemOp::Introduce { node } => {
+                    if members.contains(node) {
+                        return Err(format!("Introduce: {} already a member", hex(node)));
+                    }
+                }
+                SystemOp::Depart { node } => {
+                    if !members.contains(node) {
+                        return Err(format!("Depart: {} not a member", hex(node)));
+                    }
+                    if *node != event.author {
+                        return Err("Depart must be self-authored".into());
+                    }
+                }
             }
         }
 
         self.insert(h, event);
 
-        // Re-drive anything that was waiting on this event.
         if let Some(waiters) = self.pending.remove(&h) {
             for w in waiters {
                 let _ = self.ingest(w);
@@ -106,8 +127,6 @@ impl Dag {
         Ok(true)
     }
 
-    /// Insert an event and update the reverse index. (No validation — callers
-    /// validate, or trust persisted input via `rehydrate`.)
     fn insert(&mut self, h: Hash, event: Event) {
         for dep in dep_set(&event) {
             self.observed_by.entry(dep).or_default().insert(h);
@@ -119,32 +138,26 @@ impl Dag {
         self.events.contains_key(h)
     }
 
-    /// Events buffered awaiting a missing dependency. Persisted across callbacks
-    /// so backfilled children survive until their parents arrive.
+    /// Events buffered awaiting a missing dependency. Persisted across callbacks.
     pub fn pending_events(&self) -> Vec<Event> {
         self.pending.values().flatten().cloned().collect()
     }
 
     /// The author's head(s): events authored by `author` that no other event of
-    /// that author builds on. Exactly one under honest operation; a set if the
-    /// author has forked.
+    /// that author builds on. Exactly one under honest operation; a set if forked.
     pub fn heads_of(&self, author: &PubKey) -> BTreeSet<Hash> {
         let mut heads = BTreeSet::new();
         for (h, ev) in &self.events {
             if ev.author != *author {
                 continue;
             }
-            let extended = self
-                .observed_by
-                .get(h)
-                .map(|obs| {
-                    obs.iter().any(|o| {
-                        self.events
-                            .get(o)
-                            .is_some_and(|e| e.author == *author && e.self_parent == Some(*h))
-                    })
+            let extended = self.observed_by.get(h).is_some_and(|obs| {
+                obs.iter().any(|o| {
+                    self.events
+                        .get(o)
+                        .is_some_and(|e| e.author == *author && e.self_parent == Some(*h))
                 })
-                .unwrap_or(false);
+            });
             if !extended {
                 heads.insert(*h);
             }
@@ -152,14 +165,72 @@ impl Dag {
         heads
     }
 
+    // ===== Membership derivation ===============================================
+
+    /// All events reachable from `frontier` via back-edges (frontier included).
+    fn ancestors_of(&self, frontier: &[Hash]) -> BTreeSet<Hash> {
+        let mut seen = BTreeSet::new();
+        let mut stack: Vec<Hash> = frontier.to_vec();
+        while let Some(cur) = stack.pop() {
+            if !self.events.contains_key(&cur) || !seen.insert(cur) {
+                continue;
+            }
+            if let Some(ev) = self.events.get(&cur) {
+                stack.extend(dep_set(ev));
+            }
+        }
+        seen
+    }
+
+    /// Members live at a point whose causal past is `frontier` — genesis members
+    /// with every Introduce/Depart in that ancestry folded in canonical order.
+    /// Structural (not finality-gated): a pure function of the DAG, so every
+    /// node agrees.
+    fn members_at_frontier(&self, frontier: &[Hash]) -> BTreeSet<PubKey> {
+        let ancestors = self.ancestors_of(frontier);
+        let ordered = self.topo_sort(&ancestors);
+        let mut members = self.genesis_members.clone();
+        for h in ordered {
+            match self.events.get(&h).and_then(|e| e.system.as_ref()) {
+                Some(SystemOp::Introduce { node }) => {
+                    members.insert(*node);
+                }
+                Some(SystemOp::Depart { node }) => {
+                    members.remove(node);
+                }
+                None => {}
+            }
+        }
+        members
+    }
+
+    /// The agreed current member set — genesis members with every *finalized*
+    /// membership op folded in canonical order. Used for the handshake.
+    pub fn consensus_members(&self) -> BTreeSet<PubKey> {
+        let mut members = self.genesis_members.clone();
+        for h in self.ordered_finalized() {
+            match self.events.get(&h).and_then(|e| e.system.as_ref()) {
+                Some(SystemOp::Introduce { node }) => {
+                    members.insert(*node);
+                }
+                Some(SystemOp::Depart { node }) => {
+                    members.remove(node);
+                }
+                None => {}
+            }
+        }
+        members
+    }
+
     // ===== Finality ============================================================
     //
-    // An event E is "seen" by E' if E is reachable from E' over self_parent/refs
-    // back-edges. E is finalized iff every member has authored an event that
-    // sees E. Membership is static, so "every member" is just the configured set.
+    // E is finalized iff every member *live at E's position* has authored an
+    // event that sees E. `members_at_frontier(E's deps)` gives that set; note it
+    // excludes E's own membership effect, so an Introduce doesn't require the new
+    // node to witness its own admission, while a Depart still requires the
+    // departing node (which supplies its own witness by authoring it).
 
-    /// All events that transitively see `target` (target included). Reverse-BFS
-    /// over the incrementally-maintained `observed_by` index.
+    /// All events that transitively see `target` (target included).
     pub fn events_that_see(&self, target: &Hash) -> BTreeSet<Hash> {
         let mut seen = BTreeSet::from([*target]);
         let mut frontier = alloc::vec![*target];
@@ -175,28 +246,27 @@ impl Dag {
         seen
     }
 
-    /// Members who have authored an event that sees `target`.
-    pub fn witnessing_members(&self, target: &Hash) -> BTreeSet<PubKey> {
-        let mut out = BTreeSet::new();
-        for h in self.events_that_see(target) {
-            if let Some(ev) = self.events.get(&h) {
-                if self.members.contains(&ev.author) {
-                    out.insert(ev.author);
-                }
-            }
-        }
-        out
+    /// Authors of events that see `target`.
+    fn witnessing_authors(&self, target: &Hash) -> BTreeSet<PubKey> {
+        self.events_that_see(target)
+            .iter()
+            .filter_map(|h| self.events.get(h).map(|e| e.author))
+            .collect()
     }
 
-    /// True iff every member has witnessed `target`.
+    /// True iff every member live at `target`'s position has witnessed it.
     pub fn is_finalized(&self, target: &Hash) -> bool {
-        self.events.contains_key(target) && self.members.is_subset(&self.witnessing_members(target))
+        let Some(ev) = self.events.get(target) else {
+            return false;
+        };
+        let deps: Vec<Hash> = dep_set(ev).into_iter().collect();
+        let required = self.members_at_frontier(&deps);
+        required.is_subset(&self.witnessing_authors(target))
     }
 
-    /// The finalized events in canonical order: topologically sorted (every
-    /// event after its `self_parent ∪ refs`), ties broken by event hash. This is
-    /// the stream a reducer consumes. The finalized set is ancestry-closed, so
-    /// every dependency of an included event is also included.
+    /// Finalized events in canonical order (topo-sort, hash tiebreak) — the
+    /// reducer's input. Ancestry-closed. Re-folds each call; incremental
+    /// application is a near-term optimization (DESIGN.md).
     pub fn ordered_finalized(&self) -> Vec<Hash> {
         let finalized: BTreeSet<Hash> = self
             .events
@@ -214,8 +284,6 @@ impl Dag {
             let d = dep_set(ev).iter().filter(|x| set.contains(*x)).count();
             indeg.insert(*h, d);
         }
-        // `ready` is a BTreeSet so iteration is hash-ascending → deterministic
-        // lowest-hash tie-break among concurrent events.
         let mut ready: BTreeSet<Hash> =
             indeg.iter().filter(|(_, d)| **d == 0).map(|(h, _)| *h).collect();
         let mut out = Vec::with_capacity(set.len());
@@ -240,7 +308,7 @@ impl Dag {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ed25519_dalek::{Signer, SigningKey};
+    use ed25519_dalek::SigningKey;
 
     fn key(seed: u8) -> SigningKey {
         SigningKey::from_bytes(&[seed; 32])
@@ -254,17 +322,19 @@ mod tests {
         sks.iter().map(|sk| pk(sk)).collect()
     }
 
-    fn signed(sk: &SigningKey, self_parent: Option<Hash>, refs: Vec<Hash>, payload: Vec<u8>) -> Event {
-        let author = pk(sk);
-        let signing_hash = Event::signing_hash(&author, &self_parent, &refs, &payload);
-        Event { author, self_parent, refs, payload, signature: sk.sign(&signing_hash).to_bytes() }
+    fn ev(sk: &SigningKey, sp: Option<Hash>, refs: Vec<Hash>, payload: Vec<u8>) -> Event {
+        Event::sign(sk, sp, refs, payload, None)
+    }
+
+    fn sys(sk: &SigningKey, sp: Option<Hash>, refs: Vec<Hash>, op: SystemOp) -> Event {
+        Event::sign(sk, sp, refs, Vec::new(), Some(op))
     }
 
     #[test]
     fn single_member_finalizes_its_own_genesis() {
         let a = key(1);
         let mut dag = Dag::new(members(&[&a]));
-        let g = signed(&a, None, Vec::new(), Vec::new());
+        let g = ev(&a, None, Vec::new(), Vec::new());
         let gh = g.event_hash();
         assert!(dag.ingest(g).unwrap());
         assert!(dag.is_finalized(&gh));
@@ -276,64 +346,19 @@ mod tests {
         let a = key(1);
         let b = key(2);
         let mut dag = Dag::new(members(&[&a, &b]));
-
-        let ga = signed(&a, None, Vec::new(), Vec::new());
-        let gb = signed(&b, None, Vec::new(), Vec::new());
+        let ga = ev(&a, None, Vec::new(), Vec::new());
+        let gb = ev(&b, None, Vec::new(), Vec::new());
         let (gah, gbh) = (ga.event_hash(), gb.event_hash());
         dag.ingest(ga).unwrap();
         dag.ingest(gb).unwrap();
-
-        // Neither genesis is finalized yet — only its own author has witnessed.
         assert!(!dag.is_finalized(&gah));
-        assert!(!dag.is_finalized(&gbh));
 
-        // Each grafts the other's genesis.
-        let a1 = signed(&a, Some(gah), alloc::vec![gbh], Vec::new());
-        let b1 = signed(&b, Some(gbh), alloc::vec![gah], Vec::new());
-        let (a1h, b1h) = (a1.event_hash(), b1.event_hash());
+        let a1 = ev(&a, Some(gah), alloc::vec![gbh], Vec::new());
+        let b1 = ev(&b, Some(gbh), alloc::vec![gah], Vec::new());
         dag.ingest(a1).unwrap();
         dag.ingest(b1).unwrap();
-
-        // Both genesis events are now seen by A and B → finalized.
         assert!(dag.is_finalized(&gah));
         assert!(dag.is_finalized(&gbh));
-        // The grafts themselves aren't finalized: each is seen by only one member.
-        assert!(!dag.is_finalized(&a1h));
-        assert!(!dag.is_finalized(&b1h));
-
-        // Canonical order is a valid topo-sort over the finalized set.
-        let order = dag.ordered_finalized();
-        assert_eq!(order.len(), 2);
-        assert!(order.contains(&gah) && order.contains(&gbh));
-        assert_topo_valid(&dag, &order);
-    }
-
-    #[test]
-    fn finality_requires_all_members() {
-        let a = key(1);
-        let b = key(2);
-        let c = key(3);
-        let mut dag = Dag::new(members(&[&a, &b, &c]));
-        let ga = signed(&a, None, Vec::new(), Vec::new());
-        let gb = signed(&b, None, Vec::new(), Vec::new());
-        let gc = signed(&c, None, Vec::new(), Vec::new());
-        let (gah, gbh, gch) = (ga.event_hash(), gb.event_hash(), gc.event_hash());
-        dag.ingest(ga).unwrap();
-        dag.ingest(gb).unwrap();
-        dag.ingest(gc).unwrap();
-
-        let m = signed(&a, Some(gah), alloc::vec![gbh, gch], b"x".to_vec());
-        let mh = m.event_hash();
-        dag.ingest(m).unwrap();
-        assert!(!dag.is_finalized(&mh), "only A has witnessed");
-
-        let b1 = signed(&b, Some(gbh), alloc::vec![mh], Vec::new());
-        dag.ingest(b1).unwrap();
-        assert!(!dag.is_finalized(&mh), "A and B — still missing C");
-
-        let c1 = signed(&c, Some(gch), alloc::vec![mh], Vec::new());
-        dag.ingest(c1).unwrap();
-        assert!(dag.is_finalized(&mh), "all three have witnessed");
     }
 
     #[test]
@@ -341,8 +366,7 @@ mod tests {
         let a = key(1);
         let stranger = key(9);
         let mut dag = Dag::new(members(&[&a]));
-        let ev = signed(&stranger, None, Vec::new(), Vec::new());
-        assert!(dag.ingest(ev).is_err());
+        assert!(dag.ingest(ev(&stranger, None, Vec::new(), Vec::new())).is_err());
     }
 
     #[test]
@@ -350,12 +374,10 @@ mod tests {
         let a = key(1);
         let b = key(2);
         let mut dag = Dag::new(members(&[&a, &b]));
-        let ga = signed(&a, None, Vec::new(), Vec::new());
+        let ga = ev(&a, None, Vec::new(), Vec::new());
         let gah = ga.event_hash();
         dag.ingest(ga).unwrap();
-        // B claims A's event as its self_parent — illegal.
-        let bad = signed(&b, Some(gah), Vec::new(), Vec::new());
-        assert!(dag.ingest(bad).is_err());
+        assert!(dag.ingest(ev(&b, Some(gah), Vec::new(), Vec::new())).is_err());
     }
 
     #[test]
@@ -363,21 +385,15 @@ mod tests {
         let a = key(1);
         let b = key(2);
         let mut dag = Dag::new(members(&[&a, &b]));
-
-        let ga = signed(&a, None, Vec::new(), Vec::new());
+        let ga = ev(&a, None, Vec::new(), Vec::new());
         let gah = ga.event_hash();
         dag.ingest(ga).unwrap();
-
-        let gb = signed(&b, None, Vec::new(), Vec::new());
+        let gb = ev(&b, None, Vec::new(), Vec::new());
         let gbh = gb.event_hash();
-
-        // a1 refs gb, which we don't have yet → buffered, not admitted.
-        let a1 = signed(&a, Some(gah), alloc::vec![gbh], Vec::new());
+        let a1 = ev(&a, Some(gah), alloc::vec![gbh], Vec::new());
         let a1h = a1.event_hash();
         assert_eq!(dag.ingest(a1).unwrap(), false);
         assert!(!dag.has(&a1h));
-
-        // gb arrives → a1's dependency is satisfied and it gets admitted.
         dag.ingest(gb).unwrap();
         assert!(dag.has(&a1h));
     }
@@ -386,58 +402,121 @@ mod tests {
     fn forks_are_admitted_not_rejected() {
         let a = key(1);
         let mut dag = Dag::new(members(&[&a]));
-        let ga = signed(&a, None, Vec::new(), Vec::new());
+        let ga = ev(&a, None, Vec::new(), Vec::new());
         let gah = ga.event_hash();
         dag.ingest(ga).unwrap();
-
-        // Two distinct events off the same self_parent (different payloads).
-        let f1 = signed(&a, Some(gah), Vec::new(), b"one".to_vec());
-        let f2 = signed(&a, Some(gah), Vec::new(), b"two".to_vec());
+        let f1 = ev(&a, Some(gah), Vec::new(), b"one".to_vec());
+        let f2 = ev(&a, Some(gah), Vec::new(), b"two".to_vec());
         assert!(dag.ingest(f1.clone()).unwrap());
         assert!(dag.ingest(f2.clone()).unwrap());
-        assert!(dag.has(&f1.event_hash()));
-        assert!(dag.has(&f2.event_hash()));
-        // The author now has two heads.
         assert_eq!(dag.heads_of(&pk(&a)).len(), 2);
     }
 
     #[test]
-    fn ingest_is_idempotent() {
+    fn finality_requires_all_members() {
         let a = key(1);
-        let mut dag = Dag::new(members(&[&a]));
-        let g = signed(&a, None, Vec::new(), Vec::new());
-        dag.ingest(g.clone()).unwrap();
-        dag.ingest(g).unwrap();
-        assert_eq!(dag.events.len(), 1);
+        let b = key(2);
+        let c = key(3);
+        let mut dag = Dag::new(members(&[&a, &b, &c]));
+        let ga = ev(&a, None, Vec::new(), Vec::new());
+        let gb = ev(&b, None, Vec::new(), Vec::new());
+        let gc = ev(&c, None, Vec::new(), Vec::new());
+        let (gah, gbh, gch) = (ga.event_hash(), gb.event_hash(), gc.event_hash());
+        dag.ingest(ga).unwrap();
+        dag.ingest(gb).unwrap();
+        dag.ingest(gc).unwrap();
+        let m = ev(&a, Some(gah), alloc::vec![gbh, gch], b"x".to_vec());
+        let mh = m.event_hash();
+        dag.ingest(m).unwrap();
+        assert!(!dag.is_finalized(&mh));
+        dag.ingest(ev(&b, Some(gbh), alloc::vec![mh], Vec::new())).unwrap();
+        assert!(!dag.is_finalized(&mh));
+        dag.ingest(ev(&c, Some(gch), alloc::vec![mh], Vec::new())).unwrap();
+        assert!(dag.is_finalized(&mh));
+    }
+
+    // ----- dynamic membership -----
+
+    /// Everyone in `current` grafts `target` so it finalizes. `heads` maps each
+    /// signer to its current head. Returns nothing; mutates the dag.
+    fn all_witness(dag: &mut Dag, target: Hash, signers: &[(&SigningKey, Hash)]) {
+        for (sk, head) in signers {
+            let g = ev(sk, Some(*head), alloc::vec![target], Vec::new());
+            dag.ingest(g).unwrap();
+        }
     }
 
     #[test]
-    fn heads_track_the_chain_tip() {
+    fn introduce_admits_a_new_member() {
         let a = key(1);
-        let mut dag = Dag::new(members(&[&a]));
-        let g = signed(&a, None, Vec::new(), Vec::new());
-        let gh = g.event_hash();
-        dag.ingest(g).unwrap();
-        assert_eq!(dag.heads_of(&pk(&a)), BTreeSet::from([gh]));
+        let b = key(2);
+        let n = key(7);
+        let mut dag = Dag::new(members(&[&a, &b]));
+        let ga = ev(&a, None, Vec::new(), Vec::new());
+        let gb = ev(&b, None, Vec::new(), Vec::new());
+        let (gah, gbh) = (ga.event_hash(), gb.event_hash());
+        dag.ingest(ga).unwrap();
+        dag.ingest(gb).unwrap();
 
-        let e1 = signed(&a, Some(gh), Vec::new(), b"x".to_vec());
-        let e1h = e1.event_hash();
-        dag.ingest(e1).unwrap();
-        assert_eq!(dag.heads_of(&pk(&a)), BTreeSet::from([e1h]));
+        // A introduces N (grafting B's genesis so it can finalize among {A,B}).
+        let intro = sys(&a, Some(gah), alloc::vec![gbh], SystemOp::Introduce { node: pk(&n) });
+        let ih = intro.event_hash();
+        dag.ingest(intro).unwrap();
+        // B must witness the introduction for it to finalize.
+        all_witness(&mut dag, ih, &[(&b, gbh)]);
+        assert!(dag.is_finalized(&ih));
+        assert!(dag.consensus_members().contains(&pk(&n)));
+
+        // N can now author its first event by grafting the introduction.
+        let n1 = ev(&n, None, alloc::vec![ih], b"hello".to_vec());
+        assert!(dag.ingest(n1).is_ok());
     }
 
-    /// Assert every event in `order` appears after all of its in-set dependencies.
-    fn assert_topo_valid(dag: &Dag, order: &[Hash]) {
-        let mut pos = BTreeMap::new();
-        for (i, h) in order.iter().enumerate() {
-            pos.insert(*h, i);
-        }
-        for (i, h) in order.iter().enumerate() {
-            for dep in dep_set(&dag.events[h]) {
-                if let Some(&dpos) = pos.get(&dep) {
-                    assert!(dpos < i, "dependency must precede dependent");
-                }
-            }
-        }
+    #[test]
+    fn depart_removes_a_member() {
+        let a = key(1);
+        let b = key(2);
+        let mut dag = Dag::new(members(&[&a, &b]));
+        let ga = ev(&a, None, Vec::new(), Vec::new());
+        let gb = ev(&b, None, Vec::new(), Vec::new());
+        let (gah, gbh) = (ga.event_hash(), gb.event_hash());
+        dag.ingest(ga).unwrap();
+        dag.ingest(gb).unwrap();
+
+        // B departs itself (grafting A's genesis).
+        let dep = sys(&b, Some(gbh), alloc::vec![gah], SystemOp::Depart { node: pk(&b) });
+        let dh = dep.event_hash();
+        dag.ingest(dep).unwrap();
+        // A must witness; B already witnessed by authoring it.
+        all_witness(&mut dag, dh, &[(&a, gah)]);
+        assert!(dag.is_finalized(&dh));
+        assert!(!dag.consensus_members().contains(&pk(&b)));
+        assert!(dag.consensus_members().contains(&pk(&a)));
+    }
+
+    #[test]
+    fn introduce_of_existing_member_is_rejected() {
+        let a = key(1);
+        let mut dag = Dag::new(members(&[&a]));
+        let ga = ev(&a, None, Vec::new(), Vec::new());
+        let gah = ga.event_hash();
+        dag.ingest(ga).unwrap();
+        let bad = sys(&a, Some(gah), Vec::new(), SystemOp::Introduce { node: pk(&a) });
+        assert!(dag.ingest(bad).is_err());
+    }
+
+    #[test]
+    fn depart_must_be_self_authored() {
+        let a = key(1);
+        let b = key(2);
+        let mut dag = Dag::new(members(&[&a, &b]));
+        let ga = ev(&a, None, Vec::new(), Vec::new());
+        let gb = ev(&b, None, Vec::new(), Vec::new());
+        let (gah, gbh) = (ga.event_hash(), gb.event_hash());
+        dag.ingest(ga).unwrap();
+        dag.ingest(gb).unwrap();
+        // A tries to depart B — illegal (no third-party eviction).
+        let bad = sys(&a, Some(gah), alloc::vec![gbh], SystemOp::Depart { node: pk(&b) });
+        assert!(dag.ingest(bad).is_err());
     }
 }

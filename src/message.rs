@@ -79,7 +79,7 @@ mod tests {
     use crate::event::Event;
     use crate::reducer::fold;
     use alloc::collections::BTreeSet;
-    use ed25519_dalek::{Signer, SigningKey};
+    use ed25519_dalek::SigningKey;
 
     fn key(seed: u8) -> SigningKey {
         SigningKey::from_bytes(&[seed; 32])
@@ -90,9 +90,7 @@ mod tests {
     }
 
     fn signed(sk: &SigningKey, sp: Option<Hash>, refs: Vec<Hash>, payload: Vec<u8>) -> Event {
-        let author = pk(sk);
-        let sh = Event::signing_hash(&author, &sp, &refs, &payload);
-        Event { author, self_parent: sp, refs, payload, signature: sk.sign(&sh).to_bytes() }
+        Event::sign(sk, sp, refs, payload, None)
     }
 
     /// A 2-member network where A authors one event with `payload` and B

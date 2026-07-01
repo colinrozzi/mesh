@@ -74,14 +74,16 @@ fn main() {
     println!("Node A pubkey: {}", hex(&pk_a));
     println!("Node B pubkey: {}", hex(&pk_b));
 
-    // A knows B is a member but doesn't dial; B knows A and dials it.
+    // Both list the full bootstrap set; B dials A.
     let init_a = format!(
-        r#"{{"node_seed":"mesh-multi-node-a-seed","listen_addr":"{ADDR_A}","members":["{}"]}}"#,
-        hex(&pk_b),
+        r#"{{"node_seed":"mesh-multi-node-a-seed","listen_addr":"{ADDR_A}","members":["{a}","{b}"]}}"#,
+        a = hex(&pk_a),
+        b = hex(&pk_b),
     );
     let init_b = format!(
-        r#"{{"node_seed":"mesh-multi-node-b-seed","listen_addr":"{ADDR_B}","members":["{a}"],"dial":[{{"pubkey":"{a}","address":"{ADDR_A}"}}]}}"#,
+        r#"{{"node_seed":"mesh-multi-node-b-seed","listen_addr":"{ADDR_B}","members":["{a}","{b}"],"dial":[{{"pubkey":"{a}","address":"{ADDR_A}"}}]}}"#,
         a = hex(&pk_a),
+        b = hex(&pk_b),
     );
 
     let _ = std::fs::remove_dir_all("/tmp/mesh-node-a-store");

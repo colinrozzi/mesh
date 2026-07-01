@@ -135,7 +135,7 @@ pub fn dag_from_json(s: &str, members_json: &str) -> Result<Dag, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ed25519_dalek::{Signer, SigningKey};
+    use ed25519_dalek::SigningKey;
 
     #[test]
     fn hex_round_trips() {
@@ -169,15 +169,7 @@ mod tests {
         let members = BTreeSet::from([apk]);
         let mut dag = Dag::new(members.clone());
 
-        let payload = b"hi".to_vec();
-        let sh = Event::signing_hash(&apk, &None, &[], &payload);
-        let g = Event {
-            author: apk,
-            self_parent: None,
-            refs: Vec::new(),
-            payload,
-            signature: a.sign(&sh).to_bytes(),
-        };
+        let g = Event::sign(&a, None, Vec::new(), b"hi".to_vec(), None);
         let h = g.event_hash();
         dag.ingest(g).unwrap();
 
@@ -195,11 +187,8 @@ mod tests {
         let b = SigningKey::from_bytes(&[2u8; 32]);
         let members = BTreeSet::from([a.verifying_key().to_bytes(), b.verifying_key().to_bytes()]);
 
-        let sign = |sk: &SigningKey, sp: Option<Hash>, refs: Vec<Hash>| {
-            let author = sk.verifying_key().to_bytes();
-            let sh = Event::signing_hash(&author, &sp, &refs, &[]);
-            Event { author, self_parent: sp, refs, payload: Vec::new(), signature: sk.sign(&sh).to_bytes() }
-        };
+        let sign =
+            |sk: &SigningKey, sp: Option<Hash>, refs: Vec<Hash>| Event::sign(sk, sp, refs, Vec::new(), None);
 
         let mut dag = Dag::new(members.clone());
         let ga = sign(&a, None, Vec::new());

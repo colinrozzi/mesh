@@ -44,3 +44,4 @@ jobs:
           cargo build --manifest-path testkit/Cargo.toml
           cargo build --manifest-path smoke/Cargo.toml
           cargo build --manifest-path multi-node-test/Cargo.toml
+          cargo build --manifest-path membership-test/Cargo.toml
