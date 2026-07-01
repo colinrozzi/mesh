@@ -32,8 +32,6 @@ mod codec;
 mod conn;
 mod dag;
 mod event;
-mod message;
-mod reducer;
 mod wire;
 
 use codec::{
@@ -44,8 +42,6 @@ use codec::{
 use conn::{ConnState, Phase};
 use dag::Dag;
 use event::{Event, Hash, PubKey, SystemOp};
-use message::Mailboxes;
-use reducer::fold;
 use wire::{
     decode_hashes, encode_ack, encode_auth, encode_challenge, encode_deliver, encode_hashes,
     encode_hello, encode_notify, encode_rejected, try_parse_frame, ParsedFrame, FRAME_ACCEPTED,
@@ -698,25 +694,23 @@ fn broadcast(conns: &BTreeMap<String, ConnState>, exclude: &str, frame: &[u8]) {
     }
 }
 
-/// Deliver newly-finalized messages to connected app clients via NOTIFY. Folds
-/// the finalized event stream through the message reducer and NOTIFYs any
-/// committed message not yet delivered (tracked in `delivered`). This is the
-/// committed-delivery path — finality-gated, exactly-once per message.
-fn deliver_committed(
-    dag: &Dag,
-    conns: &BTreeMap<String, ConnState>,
-    delivered: &mut BTreeSet<Hash>,
-) {
-    let inboxes = fold::<Mailboxes>(dag);
-    for msgs in inboxes.by_recipient.values() {
-        for msg in msgs {
-            if delivered.insert(msg.event) {
-                let frame = encode_notify(&msg.from, &msg.body);
-                for (cid, cs) in conns {
-                    if matches!(cs.phase, Phase::Authed { .. }) {
-                        let _ = tcp_send(cid.clone(), frame.clone());
-                    }
-                }
+/// Broadcast newly-finalized payloads to connected clients via NOTIFY. Walks the
+/// finalized, canonically-ordered stream and NOTIFYs `(author, payload)` for
+/// every payload-bearing event not yet delivered (tracked in `delivered`). The
+/// substrate is payload-agnostic: addressing / message-type / routing all live
+/// in the payload bytes and are the application's concern.
+fn deliver_committed(dag: &Dag, conns: &BTreeMap<String, ConnState>, delivered: &mut BTreeSet<Hash>) {
+    for h in dag.ordered_finalized() {
+        let Some(ev) = dag.events.get(&h) else {
+            continue;
+        };
+        if ev.payload.is_empty() || !delivered.insert(h) {
+            continue;
+        }
+        let frame = encode_notify(&ev.author, &ev.payload);
+        for (cid, cs) in conns {
+            if matches!(cs.phase, Phase::Authed { .. }) {
+                let _ = tcp_send(cid.clone(), frame.clone());
             }
         }
     }

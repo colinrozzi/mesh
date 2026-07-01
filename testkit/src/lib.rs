@@ -83,11 +83,10 @@ impl Client {
         Ok(Client { stream })
     }
 
-    /// SUBMIT a message (`recipient[32] || body`); returns the event hash.
-    pub fn submit(&mut self, recipient: &[u8; 32], body: &[u8]) -> io::Result<[u8; 32]> {
-        let mut payload = recipient.to_vec();
-        payload.extend_from_slice(body);
-        self.stream.write_all(&encode_frame(SUBMIT, &payload))?;
+    /// SUBMIT a payload (opaque app bytes); returns the event hash. Any
+    /// addressing lives in the payload — the substrate doesn't interpret it.
+    pub fn submit(&mut self, payload: &[u8]) -> io::Result<[u8; 32]> {
+        self.stream.write_all(&encode_frame(SUBMIT, payload))?;
         self.read_ack()
     }
 

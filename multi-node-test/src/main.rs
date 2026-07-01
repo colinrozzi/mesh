@@ -118,7 +118,7 @@ fn main() {
         println!("✓ test client authenticated to B as Node B");
 
         let body = b"hello from A across the mesh";
-        client_a.submit(&pk_b, body).map_err(|e| format!("submit: {}", e))?;
+        client_a.submit(body).map_err(|e| format!("submit: {}", e))?;
         println!("✓ message submitted to A and ACKed");
 
         let (_from, got) = client_b.recv_message().map_err(|e| format!("client_b: {}", e))?;

@@ -4,9 +4,10 @@
 
 A theater-native **substrate for replicated state machines**. Each node is an
 ed25519 keypair maintaining a self-rooted log of signed events; the network
-agrees on a finalized, canonically-ordered event stream; and a deterministic
-reducer folds that stream into committed state. **Message-passing is the first
-state machine built on it.**
+agrees on a finalized, canonically-ordered event stream. Membership is the one
+state machine the substrate computes itself; applications consume the finalized
+stream and build whatever they need on top. **Message-passing** — broadcasting
+opaque payloads to the fleet — is the first thing built on it.
 
 `DESIGN.md` is the design rationale (the *why*); this is the *what* and *how*.
 
@@ -33,8 +34,11 @@ Two tiers, and the substrate barely knows what runs on top.
 **Substrate** — identities, per-node logs, dissemination + catch-up, the
 canonical order, and finality. It treats event payloads as **opaque bytes**.
 
-**State machine** — a deterministic reducer fed the finalized, ordered event
-stream. The network *is* a state machine; message-passing is the first one.
+**Application** — consumes the finalized, ordered stream. It can just read and
+write it (message-passing broadcasts opaque payloads), or fold it into its own
+replicated state (a shared task board, capability grants) — that folding is the
+app's business. Membership is the one state machine the *substrate* folds
+itself, because finality can't be computed without the member set.
 
 Each node keeps a linear, **self-rooted log**: every event names that author's
 previous event (`self_parent`), tracing back to the author's genesis. Events
@@ -67,12 +71,12 @@ set. It starts from a configured genesis set and evolves at runtime: a member
 authors an `Introduce{node}` (admit) or `Depart{self}` (leave), carried in the
 event's `system` field. The substrate folds these over the finalized log to
 derive the live set (the one thing it interprets in an event); everything else
-in `payload` is the reducer's business. A crash *without* a departure halts
+in `payload` is the application's business. A crash *without* a departure halts
 progress — mesh is CP, with no fault tolerance (see `DESIGN.md`).
 
 There are no roles. The substrate knows only **member nodes** (consensus
-participants). Application identities — message recipients, agents, mailboxes —
-live in the *reducer* layer, expressed in payloads.
+participants). Application identities — agents, recipients, addresses — live in
+the *application* layer, expressed in payloads.
 
 ## Finality
 
@@ -86,12 +90,14 @@ present set (think a multi-party TCP connection, not an always-available store):
 if a member is down, the network **intentionally stops committing** until it
 returns. Consistency over availability, by design.
 
-## Message-passing (the first reducer)
+## Message-passing
 
-A message payload is `recipient[32] || body`. The reducer folds finalized
-messages into per-recipient inboxes. When a message finalizes, the node delivers
-it to connected clients via a `NOTIFY` frame (committed, exactly-once delivery).
-Empty and malformed payloads are deterministically ignored.
+The substrate is **payload-agnostic**: a message is opaque bytes. When a
+payload-bearing event finalizes, the node **broadcasts** it to every connected
+client via a `NOTIFY` frame (`from[32] || payload`), committed and exactly-once.
+Every client sees every committed payload — the whole log is replicated on every
+node, so this is redundancy, not waste. Addressing, message-types, and routing
+all live *in the payload*, interpreted by the application.
 
 ## Wire protocol
 
@@ -120,11 +126,11 @@ catch up immediately.
 | client → mesh | `0x12` | INTRODUCE | pubkey[32] — "admit this node as a member" |
 | client → mesh | `0x13` | DEPART | (empty) — "author my departure" |
 | mesh → client | `0x91` | ACK | event_hash[32] + ok_byte + utf8 err |
-| mesh → client | `0x92` | NOTIFY | from[32] + body — committed message delivery |
+| mesh → client | `0x92` | NOTIFY | from[32] + payload — committed payload broadcast |
 
 On a newly-seen event a node forwards it, backfills missing ancestry via `WANT`,
-and (for payload events) authors a graft to witness it. Delivery happens on
-finality, via the reducer.
+and (for payload or membership events) authors a graft to witness it. Delivery
+happens on finality — payloads are broadcast to connected clients.
 
 ### Event encoding (canonical, hand-rolled)
 
@@ -177,7 +183,7 @@ cargo test
 ```
 
 Host-side tests (the crate is `#![cfg_attr(not(test), no_std)]`). Cover the event
-encoding, DAG + finality, the reducer, and persistence.
+encoding, DAG + finality + membership, and persistence.
 
 ### Single-node smoke
 
@@ -219,8 +225,6 @@ mesh/
 │   ├── lib.rs          # actor: init, handshake, gossip, committed delivery
 │   ├── event.rs        # event type, canonical encoding, signing
 │   ├── dag.rs          # DAG storage, finality, canonical order
-│   ├── reducer.rs      # the reducer seam (fold finalized stream → state)
-│   ├── message.rs      # message-passing reducer (first app)
 │   ├── conn.rs         # per-connection handshake state
 │   ├── codec.rs        # ActorState persistence + hex helpers
 │   └── wire.rs         # frame protocol
@@ -234,12 +238,13 @@ mesh/
 
 **Working:** self-rooted logs; multi-parent DAG with forks admitted; **dynamic
 membership** (runtime introduce/depart); grafting as unified dissemination /
-witnessing / catch-up; all-members finality; the reducer seam + message-passing
-with committed delivery; single- and multi-node operation.
+witnessing / catch-up; all-members finality; broadcast delivery of committed
+payloads; single- and multi-node operation.
 
-**Near-term** (see `DESIGN.md`): pruning/compaction (the DAG grows unbounded),
-incremental finality + reducer (currently re-folds from genesis each callback),
-batched emission (currently emit-on-event).
+**Near-term** (see `DESIGN.md`): pruning/compaction (the DAG grows unbounded —
+the load-bearing piece that makes broadcast-replication sustainable), incremental
+finality (currently re-folds from genesis each callback), batched emission
+(currently emit-on-event).
 
 **Deferred:** fault tolerance (quorum finality, eviction of a crashed member,
 partition recovery), key rotation, Byzantine fault tolerance.

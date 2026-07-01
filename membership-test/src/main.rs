@@ -56,7 +56,7 @@ fn main() {
         // 3) A message finalizes across {A, B, N} and is delivered to N.
         let mut client_n = Client::connect(ADDR_N, &n).map_err(|e| format!("connect N: {e}"))?;
         let body1 = b"welcome, N";
-        client_a.submit(&pn, body1).map_err(|e| format!("submit 1: {e}"))?;
+        client_a.submit(body1).map_err(|e| format!("submit 1: {e}"))?;
         let (_from, got) = client_n.recv_message().map_err(|e| format!("N recv: {e}"))?;
         if got != body1 {
             return Err(format!("N got wrong body: {:?}", String::from_utf8_lossy(&got)));
@@ -71,7 +71,7 @@ fn main() {
         // 5) The survivors finalize a message without N.
         let mut client_b = Client::connect(ADDR_B, &b).map_err(|e| format!("connect B: {e}"))?;
         let body2 = b"carry on";
-        client_a.submit(&pb, body2).map_err(|e| format!("submit 2: {e}"))?;
+        client_a.submit(body2).map_err(|e| format!("submit 2: {e}"))?;
         let (_f, got2) = client_b.recv_message().map_err(|e| format!("B recv: {e}"))?;
         if got2 != body2 {
             return Err(format!("B got wrong body: {:?}", String::from_utf8_lossy(&got2)));

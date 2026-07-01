@@ -33,11 +33,14 @@ room DAG (`prev_events`), and Merkle-CRDTs.
 Two tiers, and the substrate is almost entirely ignorant of what runs on top.
 
 - **Substrate** — identities, the per-node logs, dissemination + sync, the
-  canonical order, and finality. It treats event payloads as **opaque bytes**.
-- **State machine** — a deterministic reducer fed the finalized, canonically
-  ordered event stream. The network *is* a state machine; which one is implied
-  by the network you've joined. Message-passing is one such reducer; the next
-  thing we build is another.
+  canonical order, finality, and **membership** (the one state machine it must
+  compute itself, since finality depends on the member set). It treats all other
+  event payloads as **opaque bytes**.
+- **Application** — consumes the finalized, canonically-ordered stream. It can
+  just read and write it (message-passing broadcasts opaque payloads), or fold
+  it into its own replicated state (a shared task board, capability grants).
+  That folding is the app's concern; the substrate doesn't provide a built-in
+  reducer for it (yet) — it just delivers the stream.
 
 A node's local DAG is the operational data structure it uses to: know the order
 of events, know what the network has and hasn't seen, decide what to send peers,
@@ -138,7 +141,7 @@ opaque; one network is one member set is one state machine.
 A consequence: v2's **Node vs Mailbox** roles dissolve from the substrate. The
 substrate knows only *member nodes* (the consensus participants). Application
 identities — agents, mailboxes, addressable endpoints — are an *application*
-concern, expressed in payloads and interpreted by the reducer.
+concern, expressed in payloads and interpreted by the application.
 
 ## Validity — two layers
 
@@ -154,12 +157,12 @@ enters the DAG):
 4. **self_parent and refs exist** in our DAG. If any is missing, the event is
    **buffered pending** and we request the gap (see *Dissemination*).
 
-**Reducer validity** (application-defined): whether a payload is a legal
-transition for the state machine. An event can be substrate-valid and admitted
-to the DAG yet be a **no-op or rejected** by the reducer. Keeping rejection in
-the reducer — not the substrate — is what keeps the substrate app-agnostic and
-every node deterministic: all nodes admit the same events, order them the same,
-and the reducer makes the same accept/reject decision everywhere.
+**Application validity** (application-defined): whether a payload means anything
+to the app. An event can be substrate-valid and admitted to the DAG yet be
+ignored by the application. Keeping that interpretation in the application — not
+the substrate — is what keeps the substrate app-agnostic and every node
+deterministic: all nodes admit the same events, order them the same, and each
+application makes the same decision everywhere.
 
 ## Dissemination & sync — one mechanic
 
@@ -197,8 +200,8 @@ re-streaming the whole DAG.
 
 Receiving new information immediately produces a witness event — lowest latency,
 simplest code. An **empty-payload event is a pure graft / heartbeat / witness**;
-the same primitive as an app event, distinguished only by an empty payload. The
-reducer skips empties. Continuous mutual grafting (ping-pong) doubles as a
+the same primitive as an app event, distinguished only by an empty payload.
+Delivery skips empties. Continuous mutual grafting (ping-pong) doubles as a
 liveness heartbeat, and we lean into it.
 
 The cost, stated plainly: in a fully-connected N-node network each received
@@ -218,7 +221,7 @@ State is a pure function of the DAG. To order events deterministically:
    predecessors. Break ties (concurrent events, including forks) by `event_hash`
    ascending.
 
-Every node with the same DAG computes the same order. The reducer consumes
+Every node with the same DAG computes the same order. Applications consume
 payloads in this order. This is v2's `state_at` topo-sort, generalized to
 multi-parent ancestry.
 
@@ -237,8 +240,8 @@ This maps directly onto machinery v2 already has:
 - `witnessing_members(E)` = authors of events that see `E`.
 - `finalized(E)` = `witnessing_members(E) ⊇ members`.
 
-The finalized frontier advances as grafts accumulate; the reducer's committed
-state is derived strictly from the finalized, ordered prefix.
+The finalized frontier advances as grafts accumulate; committed state (or
+delivery) is derived strictly from the finalized, ordered prefix.
 
 ## Optimistic delivery vs finalized commitment
 
@@ -246,8 +249,9 @@ Two visibility tiers, as in v2's "Sends deliver before finality":
 
 - **Optimistic**: a payload event can be surfaced to the application as soon as
   it's received and substrate-valid — low latency, not yet committed.
-- **Committed**: the reducer only *advances state* over the finalized, ordered
-  prefix. Anything past the finalized frontier is working-copy.
+- **Committed**: an application only acts on / advances state over the finalized,
+  ordered prefix. Anything past the finalized frontier is working-copy. (The
+  built-in message delivery is committed: payloads NOTIFY on finality.)
 
 Caveat worth respecting: the hash-tiebreak order means a later-arriving
 concurrent event can sort *before* one already shown optimistically. So
@@ -305,19 +309,16 @@ future reconfiguration protocol) that a member is gone.
 - `event.rs` — the `Event` type (`author / self_parent / refs / payload /
   signature`), canonical hand-rolled encoding + `Cursor` decode, signing.
 - `dag.rs` — DAG storage over `self_parent ∪ refs` back-edges; forks admitted;
-  static member set; `events_that_see` → `witnessing_members` → finality;
-  `ordered_finalized` (the reducer's input); persisted orphan buffer.
-- `reducer.rs` — the reducer seam: `fold` the finalized, ordered stream into
-  committed state.
-- `message.rs` — message-passing, the first reducer: payloads `recipient[32] ||
-  body` folded into per-recipient inboxes.
-- `wire.rs` — frame protocol (handshake + DELIVER/WANT/FRONTIER + SUBMIT/ACK/
-  NOTIFY).
+  derived membership (`members_at` / `consensus_members`); `events_that_see` →
+  finality; `ordered_finalized` (the finalized stream); persisted orphan buffer.
+- `wire.rs` — frame protocol (handshake + DELIVER/WANT/FRONTIER +
+  SUBMIT/INTRODUCE/DEPART/ACK/NOTIFY).
 - `conn.rs` — per-connection handshake state.
 - `codec.rs` — persistence of `ActorState` (DAG, orphan buffer, members,
   connections) and hex helpers.
 - `lib.rs` — the actor: init, handshake, gossip + dedup + backfill, emit-a-graft
-  on payload events, committed delivery via the reducer.
+  on payload/membership events, broadcast delivery of committed payloads, and
+  the SUBMIT/INTRODUCE/DEPART authoring paths.
 
 ## Near-term (not yet built — not launch blockers)
 
@@ -327,9 +328,9 @@ until they land.
 - **Pruning / compaction.** Finalized, applied history can be dropped (keep
   hashes for verification). Most urgent, because the on-event heartbeat grows
   the DAG continuously, even at idle.
-- **Incremental finality + reducer.** Advance the finalized frontier and apply
-  the reducer over *newly* finalized events instead of re-folding from genesis;
-  snapshot committed state. Avoids O(history²) recompute.
+- **Incremental finality + delivery.** Advance the finalized frontier and
+  process *newly* finalized events instead of re-scanning the whole log each
+  callback; snapshot committed state. Avoids O(history²) recompute.
 - **Batched emission.** Replace on-event grafting with a tick that collapses
   many refs into one witness — the scaling fix for N>2 and idle cost.
 
@@ -363,8 +364,8 @@ genesis member set is still the configured bootstrap set; it evolves from there.
 
 ### Deriving the live member set
 
-The member set is a pure function of the finalized DAG, computed by the substrate
-itself (not the app reducer — finality needs it):
+The member set is a pure function of the DAG, computed by the substrate itself
+(it can't be left to the application — finality needs it):
 
     members_at(E) = start from the configured genesis members, then fold every
                     finalized Introduce/Depart in E's causal ancestry, in
@@ -428,7 +429,7 @@ peer sees it) halts: accepted, per the threat model.
 - **Key rotation** — the self-rooted log supports it (genesis declares keys, a
   later event rotates); not implemented.
 - **Application identities** (agents / mailboxes) — addressing for non-member
-  participants is a reducer-layer design, per app.
+  participants is an application-layer design, in the payload, per app.
 
 ## Prior art
 
