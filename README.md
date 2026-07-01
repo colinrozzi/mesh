@@ -239,12 +239,12 @@ mesh/
 **Working:** self-rooted logs; multi-parent DAG with forks admitted; **dynamic
 membership** (runtime introduce/depart); grafting as unified dissemination /
 witnessing / catch-up; all-members finality; broadcast delivery of committed
-payloads; single- and multi-node operation.
+payloads; **pruning/compaction with snapshot transfer** (bounded storage, and a
+behind node bootstraps from a checkpoint); single- and multi-node operation.
 
-**Near-term** (see `DESIGN.md`): pruning/compaction (the DAG grows unbounded —
-the load-bearing piece that makes broadcast-replication sustainable), incremental
-finality (currently re-folds from genesis each callback), batched emission
-(currently emit-on-event).
+**Near-term** (see `DESIGN.md`): incremental finality/delivery (currently
+re-scans the retained DAG each callback), batched emission (currently
+emit-on-event).
 
 **Deferred:** fault tolerance (quorum finality, eviction of a crashed member,
 partition recovery), key rotation, Byzantine fault tolerance.

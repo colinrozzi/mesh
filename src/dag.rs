@@ -42,6 +42,10 @@ pub struct Dag {
     /// it has pruned (pruned ops here + retained ops in the fold = all ops).
     pub base_members: BTreeSet<PubKey>,
     pub events: BTreeMap<Hash, Event>,
+    /// Boundary anchors: hashes of *pruned* events still referenced by retained
+    /// events. Bare (no bodies) — they exist only so those refs resolve and so a
+    /// catching-up node can accept retained events past the pruned watermark.
+    pub sealed: BTreeSet<Hash>,
     /// Reverse adjacency: for each event hash, the events that directly
     /// reference it (via `self_parent` or `refs`) — "who observes me."
     observed_by: BTreeMap<Hash, BTreeSet<Hash>>,
@@ -55,19 +59,27 @@ impl Dag {
         Dag {
             base_members,
             events: BTreeMap::new(),
+            sealed: BTreeSet::new(),
             observed_by: BTreeMap::new(),
             pending: BTreeMap::new(),
         }
     }
 
-    /// Rebuild from persisted, already-validated events.
-    pub fn rehydrate(base_members: BTreeSet<PubKey>, events: Vec<Event>) -> Self {
+    /// Rebuild from persisted, already-validated events + boundary anchors.
+    pub fn rehydrate(base_members: BTreeSet<PubKey>, sealed: BTreeSet<Hash>, events: Vec<Event>) -> Self {
         let mut dag = Self::new(base_members);
+        dag.sealed = sealed;
         for ev in events {
             let h = ev.event_hash();
             dag.insert(h, ev);
         }
         dag
+    }
+
+    /// A dependency is available if we hold its body, or it's a sealed anchor
+    /// (pruned but known-valid).
+    fn dep_present(&self, h: &Hash) -> bool {
+        self.events.contains_key(h) || self.sealed.contains(h)
     }
 
     /// Ingest one event. `Ok(true)` on accept (or already-present),
@@ -80,9 +92,10 @@ impl Dag {
             return Ok(true); // dedup — idempotent
         }
 
-        // Buffer until every dependency (self_parent + refs) is present.
+        // Buffer until every dependency (self_parent + refs) is present (held or
+        // sealed).
         let deps: Vec<Hash> = dep_set(&event).into_iter().collect();
-        if let Some(missing) = deps.iter().find(|d| !self.events.contains_key(*d)) {
+        if let Some(missing) = deps.iter().find(|d| !self.dep_present(d)) {
             self.pending.entry(*missing).or_default().push(event);
             return Ok(false);
         }
@@ -93,10 +106,14 @@ impl Dag {
             return Err(format!("author {} is not a member", hex(&event.author)));
         }
 
-        // self_parent must be one of the author's own events.
+        // self_parent must be one of the author's own events. Skip when it's a
+        // sealed anchor — we can't check a bodyless dep, and it was validated
+        // before pruning.
         if let Some(sp) = event.self_parent {
-            if self.events.get(&sp).map(|p| p.author) != Some(event.author) {
-                return Err("self_parent must be authored by the same node".into());
+            if let Some(parent) = self.events.get(&sp) {
+                if parent.author != event.author {
+                    return Err("self_parent must be authored by the same node".into());
+                }
             }
         }
 
@@ -293,11 +310,9 @@ impl Dag {
     /// the set of payload events already delivered (we only prune a payload once
     /// it's been delivered). Returns the pruned event hashes.
     ///
-    /// Correct for nodes that already hold the full history, but not yet wired
-    /// into the live actor: a node catching up needs the pruned ancestry (or a
-    /// snapshot of it) to reconstruct the DAG — snapshot transfer is the next
-    /// step (see lib::handle_tick).
-    #[allow(dead_code)]
+    /// A catching-up node reconstructs the pruned region from an
+    /// `install_checkpoint` (base members + sealed anchors) rather than the
+    /// dropped bodies.
     pub fn compact(&mut self, delivered: &BTreeSet<Hash>) -> Vec<Hash> {
         // Heads of every current member — new events extend from these, so their
         // strict common ancestors will never be referenced again.
@@ -349,11 +364,54 @@ impl Dag {
             self.events.remove(h);
             self.observed_by.remove(h);
         }
+        self.recompute_sealed();
         prunable.into_iter().collect()
     }
 
+    /// Recompute the boundary: pruned events still referenced by a retained
+    /// event's `self_parent`/`refs`. Kept as bare anchors; the rest are gone.
+    fn recompute_sealed(&mut self) {
+        let mut sealed = BTreeSet::new();
+        for ev in self.events.values() {
+            for d in dep_set(ev) {
+                if !self.events.contains_key(&d) {
+                    sealed.insert(d);
+                }
+            }
+        }
+        self.sealed = sealed;
+    }
+
+    /// Install a peer's checkpoint iff we're behind its pruned watermark — it
+    /// sealed an event we neither hold nor already seal. Adopts its
+    /// `base_members` + boundary anchors, drops any now-sealed events we still
+    /// hold, and re-drives buffered events waiting on the newly-sealed hashes.
+    /// A no-op once we're caught up (the `members_at` invariant keeps peers
+    /// consistent without adopting, so pruning stays a local decision).
+    pub fn install_checkpoint(&mut self, base_members: BTreeSet<PubKey>, sealed: BTreeSet<Hash>) {
+        let behind = sealed
+            .iter()
+            .any(|h| !self.events.contains_key(h) && !self.sealed.contains(h));
+        if !behind {
+            return;
+        }
+        self.base_members = base_members;
+        let newly: Vec<Hash> = sealed.difference(&self.sealed).copied().collect();
+        self.sealed.extend(sealed);
+        for h in &newly {
+            self.events.remove(h);
+            self.observed_by.remove(h);
+        }
+        for h in &newly {
+            if let Some(waiters) = self.pending.remove(h) {
+                for w in waiters {
+                    let _ = self.ingest(w);
+                }
+            }
+        }
+    }
+
     /// Events that are ancestors of *every* head (strict — heads excluded).
-    #[allow(dead_code)]
     fn common_ancestors(&self, heads: &[Hash]) -> BTreeSet<Hash> {
         let mut iter = heads.iter();
         let Some(&first) = iter.next() else {
@@ -686,5 +744,55 @@ mod tests {
         // N is still a member — the pruned Introduce was folded into base_members.
         assert!(dag.base_members.contains(&pk(&n)));
         assert!(dag.consensus_members().contains(&pk(&n)));
+    }
+
+    #[test]
+    fn install_checkpoint_lets_a_behind_node_bootstrap_past_the_watermark() {
+        // A builds history admitting N, then prunes it into a checkpoint.
+        let a = key(1);
+        let b = key(2);
+        let n = key(7);
+        let mut src = Dag::new(members(&[&a, &b]));
+        let ga = ev(&a, None, Vec::new(), Vec::new());
+        let gb = ev(&b, None, Vec::new(), Vec::new());
+        let (gah, gbh) = (ga.event_hash(), gb.event_hash());
+        src.ingest(ga).unwrap();
+        src.ingest(gb).unwrap();
+        let intro = sys(&a, Some(gah), alloc::vec![gbh], SystemOp::Introduce { node: pk(&n) });
+        let ih = intro.event_hash();
+        src.ingest(intro).unwrap();
+        let b1 = ev(&b, Some(gbh), alloc::vec![ih], Vec::new());
+        let b1h = b1.event_hash();
+        src.ingest(b1).unwrap();
+        let a2 = ev(&a, Some(ih), alloc::vec![b1h], Vec::new());
+        let a2h = a2.event_hash();
+        src.ingest(a2.clone()).unwrap();
+        let b2 = ev(&b, Some(b1h), alloc::vec![a2h], Vec::new());
+        src.ingest(b2.clone()).unwrap();
+
+        src.compact(&BTreeSet::new());
+        assert!(!src.has(&ih) && !src.sealed.is_empty());
+
+        // A fresh node installs the checkpoint, then syncs the retained events
+        // (whose deps are now sealed anchors) exactly as it would from a peer.
+        let retained: Vec<Event> =
+            src.events.values().cloned().collect(); // what a peer would DELIVER
+        let mut joiner = Dag::new(members(&[&a, &b]));
+        joiner.install_checkpoint(src.base_members.clone(), src.sealed.clone());
+        assert!(joiner.base_members.contains(&pk(&n)), "adopted the admitted member");
+        // Feed them in any order; missing deps re-drive as their siblings land.
+        for ev in &retained {
+            let _ = joiner.ingest(ev.clone());
+        }
+        for ev in &retained {
+            let _ = joiner.ingest(ev.clone());
+        }
+        assert!(joiner.has(&a2h), "retained events reconstructed past the watermark");
+        assert!(joiner.consensus_members().contains(&pk(&n)));
+
+        // Idempotent: installing again when caught up is a no-op.
+        let before = joiner.base_members.clone();
+        joiner.install_checkpoint(src.base_members.clone(), src.sealed.clone());
+        assert_eq!(joiner.base_members, before);
     }
 }

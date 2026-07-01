@@ -43,10 +43,10 @@ use conn::{ConnState, Phase};
 use dag::Dag;
 use event::{Event, Hash, PubKey, SystemOp};
 use wire::{
-    decode_hashes, encode_ack, encode_auth, encode_challenge, encode_deliver, encode_hashes,
-    encode_hello, encode_notify, encode_rejected, try_parse_frame, ParsedFrame, FRAME_ACCEPTED,
-    FRAME_AUTH, FRAME_CHALLENGE, FRAME_DELIVER, FRAME_DEPART, FRAME_FRONTIER, FRAME_HELLO,
-    FRAME_INTRODUCE, FRAME_SUBMIT, FRAME_WANT,
+    decode_checkpoint, decode_hashes, encode_ack, encode_auth, encode_challenge, encode_checkpoint,
+    encode_deliver, encode_hashes, encode_hello, encode_notify, encode_rejected, try_parse_frame,
+    ParsedFrame, FRAME_ACCEPTED, FRAME_AUTH, FRAME_CHALLENGE, FRAME_CHECKPOINT, FRAME_DELIVER,
+    FRAME_DEPART, FRAME_FRONTIER, FRAME_HELLO, FRAME_INTRODUCE, FRAME_SUBMIT, FRAME_WANT,
 };
 
 #[derive(Clone, GraphValue)]
@@ -361,7 +361,9 @@ fn on_data(state: ActorState, conn_id: String, data: Vec<u8>) -> Result<(ActorSt
                 match step_auth(&conn_id, &frame, &pubkey_hex, &nonce_hex, &dag)? {
                     Step::Advance(p) => {
                         conn_state.phase = p;
-                        // Announce our frontier so the peer can catch up.
+                        // Send our checkpoint (so a behind peer can bootstrap past
+                        // our pruned watermark) then our frontier.
+                        let _ = tcp_send(conn_id.clone(), checkpoint_frame(&dag));
                         let _ = tcp_send(
                             conn_id.clone(),
                             encode_hashes(FRAME_FRONTIER, &all_heads(&dag)),
@@ -416,13 +418,39 @@ fn on_close(state: ActorState, conn_id: String, reason: String) -> Result<(Actor
 
 #[export(name = "theater:simple/timer.handle-tick")]
 fn handle_tick(state: ActorState, _timer_name: String) -> Result<(ActorState, ()), String> {
-    // NOTE: `Dag::compact` is implemented and unit-tested, but NOT wired here
-    // yet. Running it live drops the pruned ancestry that a *joining or lagging*
-    // node needs to reconstruct the DAG — that requires a checkpoint/snapshot
-    // transfer over the sync path (base_members + sealed anchors), which is the
-    // next design step. Compaction is correct for nodes that already hold the
-    // history; it is not yet safe for catch-up. So the tick stays a no-op.
-    Ok((state, ()))
+    // Periodic compaction: drop sealed history below the finalized frontier.
+    // Safe now that catch-up carries a checkpoint (base members + sealed anchors)
+    // over the sync path, so a behind node can bootstrap past the watermark.
+    let mut dag = dag_from_json(&state.dag_json)?;
+    for ev in events_from_json(&state.pending_json) {
+        let _ = dag.ingest(ev);
+    }
+    let mut delivered: BTreeSet<Hash> = hashes_from_json(&state.delivered_json).into_iter().collect();
+
+    let pruned = dag.compact(&delivered);
+    if pruned.is_empty() {
+        return Ok((state, ()));
+    }
+    for h in &pruned {
+        delivered.remove(h);
+    }
+    log(format!(
+        "[mesh] compacted {} events; {} retained, {} sealed",
+        pruned.len(),
+        dag.events.len(),
+        dag.sealed.len()
+    ));
+
+    let delivered_vec: Vec<Hash> = delivered.iter().copied().collect();
+    Ok((
+        ActorState {
+            dag_json: dag_to_json(&dag),
+            pending_json: events_to_json(&dag.pending_events()),
+            delivered_json: hashes_to_json(&delivered_vec),
+            ..state
+        },
+        (),
+    ))
 }
 
 // ---- handshake steps ----
@@ -531,6 +559,13 @@ fn handle_authed_frame(
             if !missing.is_empty() {
                 let _ = tcp_send(conn_id.to_string(), encode_hashes(FRAME_WANT, &missing));
             }
+            self_head
+        }
+        FRAME_CHECKPOINT => {
+            // Adopt if we're behind this peer's pruned watermark (a no-op
+            // otherwise), then any events buffered on now-sealed deps re-drive.
+            let (members, sealed) = decode_checkpoint(&frame.payload);
+            dag.install_checkpoint(members.into_iter().collect(), sealed.into_iter().collect());
             self_head
         }
         // ACK / NOTIFY are responses meant for app clients; a node ignores them.
@@ -660,6 +695,14 @@ fn foreign_heads(dag: &Dag, me: &PubKey) -> Vec<Hash> {
         out.extend(dag.heads_of(&m));
     }
     out
+}
+
+/// Encode this node's checkpoint (membership base + sealed anchors) so a peer
+/// catching up past our pruned watermark can bootstrap.
+fn checkpoint_frame(dag: &Dag) -> Vec<u8> {
+    let members: Vec<PubKey> = dag.base_members.iter().copied().collect();
+    let sealed: Vec<Hash> = dag.sealed.iter().copied().collect();
+    encode_checkpoint(&members, &sealed)
 }
 
 /// All current heads across all members — our advertised frontier.

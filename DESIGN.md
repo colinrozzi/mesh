@@ -322,25 +322,10 @@ future reconfiguration protocol) that a member is gone.
 
 ## Near-term (not yet built — not launch blockers)
 
-The first things to build next. Unbounded growth is an accepted failure mode
-until they land.
-
-- **Pruning / compaction.** The *mechanism* exists (`Dag::compact` +
-  unit tests): all-members finality means everything below the finalized
-  frontier is safe to drop, so `compact` prunes the strict common ancestors of
-  all current heads (finalized + delivered), folding their membership ops into
-  `base_members`. It's correct for a node that already holds the history — but
-  **not yet wired live**, because a *joining or lagging* node syncs the retained
-  events and can't reconstruct the DAG once their pruned ancestry is gone. That
-  needs **snapshot transfer** (below).
-- **Snapshot transfer.** For live pruning: a node catching up past the pruned
-  watermark must receive a checkpoint — `base_members` + a set of "sealed"
-  boundary anchors it can treat as valid-but-bodyless — so it can ingest
-  retained events whose deps were pruned, and derive membership. This is the
-  prerequisite that makes compaction safe to run in the actor.
-- **Incremental finality + delivery.** Advance the finalized frontier and
-  process *newly* finalized events instead of re-scanning the whole log each
-  callback; snapshot committed state. Avoids O(history²) recompute.
+- **Incremental finality + delivery.** `members_at` / `ordered_finalized` /
+  delivery re-scan the (now pruning-bounded) retained DAG each callback.
+  Snapshotting committed state + processing only newly-finalized events would
+  drop this from O(retained²) to incremental.
 - **Batched emission.** Replace on-event grafting with a tick that collapses
   many refs into one witness — the scaling fix for N>2 and idle cost.
 
@@ -429,6 +414,36 @@ peer sees it) halts: accepted, per the threat model.
   changes (rare in a cooperative fleet) are ordered deterministically by hash;
   members chain a change off the latest membership state they've seen.
   Concurrent *conflicting* changes are the sharp edge to harden later.
+
+## Pruning & snapshot transfer
+
+> Status: **implemented** (`Dag::compact`, `install_checkpoint`, the CHECKPOINT
+> frame; unit + integration tested). Bounds storage so broadcast-replication is
+> redundancy, not unbounded waste.
+
+**Why it's safe (the CP dividend).** All-members finality means every member has
+witnessed the finalized frontier — so every member already holds everyone's
+events up to it, and *no future event will ever reference below it* (a new
+event's `self_parent` is its author's own head; its `refs` are current foreign
+heads). So everything strictly below the frontier is droppable. The same
+property that makes mesh CP makes pruning correct.
+
+**Compaction (`compact`), a purely local decision.** Each node, on its tick,
+drops the strict common ancestors of all current heads that are finalized (and,
+for payloads, already delivered), folding any pruned Introduce/Depart into
+`base_members`. `members_at(E)` is *invariant* to how far a node has pruned
+(pruned ops in `base_members` + retained ops in the fold = all ops), so nodes
+never have to coordinate watermarks — they agree on membership regardless.
+
+**The catch — and snapshot transfer.** A *joining or lagging* node syncs the
+retained events, but their deps point at pruned events it will never receive. So
+compaction keeps **sealed anchors**: bare hashes of pruned events still
+referenced by retained ones (the boundary; GC'd as the frontier advances). On
+connect a node sends a **CHECKPOINT** = `base_members` + sealed anchors. A node
+that's genuinely behind (`install_checkpoint` — the peer sealed something it
+neither holds nor seals) adopts them: sealed deps now resolve, so it can ingest
+retained events, and it derives membership from the adopted base. A caught-up
+node ignores the checkpoint — pruning stays local.
 
 ## Deferred
 
