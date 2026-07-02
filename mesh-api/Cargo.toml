@@ -1,0 +1,7 @@
+[package]
+name = "mesh-api"
+version = "0.1.0"
+edition = "2021"
+description = "App ↔ node control envelope for the mesh substrate (co-located message-server link)."
+
+[dependencies]

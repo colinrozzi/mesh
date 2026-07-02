@@ -175,6 +175,9 @@ type = "tcp"
 type = "timer"
 
 [[handler]]
+type = "message-server"
+
+[[handler]]
 type = "store"
 base_path = "{store_path}"
 store_id = "{store_id}"

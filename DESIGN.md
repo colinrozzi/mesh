@@ -291,6 +291,33 @@ node's own new events and a peer's gossiped events flow through the same path;
 there is no privileged "submit." `WANT` backfills missing ancestry; `FRONTIER`
 negotiates bulk catch-up.
 
+## App interface — co-located, over message-server
+
+The wire protocol above is **node ↔ node** (TCP, across hosts, with the auth
+handshake). But an *application* — the agent that owns a node — talks to *its
+own* node over theater's native **message-server**, not TCP. The two links are
+split by trust: peers are remote and must authenticate; an app is the node's
+supervisor, so trust is structural — no handshake, and the app never signs.
+The node authors every event under its own key regardless of who asked.
+
+That collapses the app-facing surface to three commands and a delivery stream
+(the envelope lives in the `mesh-api` crate, shared by node and app):
+
+| Direction | Mechanism | Message |
+|---|---|---|
+| app → node | `request` | `Submit(payload)` / `Introduce(pubkey)` / `Depart` / `Register(app-id)` |
+| node → app | `request` reply | ack: `ok + event-hash`, or an error string |
+| node → app | `send` | delivery: `from[32] ‖ committed-payload` |
+
+Commands go over `request` so the app gets a synchronous ack (did it author?
+was I a member?). Delivery is a **callback**: the app calls `Register` once with
+its own actor-id, and the node `send`s every committed payload to it — the app's
+`handle-send` *is* the delivery hook. (An app learns its own id via theater's
+`get-self`; on `Register` the node also flushes retained finalized history so a
+late subscriber misses nothing.) This is the same committed-delivery stream the
+TCP `NOTIFY` path carries for test clients — the substrate stays
+payload-agnostic; addressing and message-type live in the payload bytes.
+
 ## Liveness — halting is the contract, not a bug
 
 Finality requires **all** members, so a member that goes down **halts
@@ -311,14 +338,18 @@ future reconfiguration protocol) that a member is gone.
 - `dag.rs` — DAG storage over `self_parent ∪ refs` back-edges; forks admitted;
   derived membership (`members_at` / `consensus_members`); `events_that_see` →
   finality; `ordered_finalized` (the finalized stream); persisted orphan buffer.
-- `wire.rs` — frame protocol (handshake + DELIVER/WANT/FRONTIER +
+- `wire.rs` — node↔node frame protocol (handshake + DELIVER/WANT/FRONTIER +
   SUBMIT/INTRODUCE/DEPART/ACK/NOTIFY).
+- `mesh-api/` — shared crate: the app↔node control envelope (command / ack /
+  delivery), used by both the node and app actors. Not signed, not the wire
+  format — the co-located message-server link (see *App interface*).
 - `conn.rs` — per-connection handshake state.
 - `codec.rs` — persistence of `ActorState` (DAG, orphan buffer, members,
   connections) and hex helpers.
 - `lib.rs` — the actor: init, handshake, gossip + dedup + backfill, emit-a-graft
-  on payload/membership events, broadcast delivery of committed payloads, and
-  the SUBMIT/INTRODUCE/DEPART authoring paths.
+  on payload/membership events, broadcast delivery of committed payloads, the
+  TCP SUBMIT/INTRODUCE/DEPART paths, and the `message-server` `handle-request`
+  path that lets a co-located app drive the node.
 
 ## Near-term (not yet built — not launch blockers)
 

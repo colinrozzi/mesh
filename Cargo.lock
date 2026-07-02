@@ -197,11 +197,16 @@ name = "mesh"
 version = "0.1.0"
 dependencies = [
  "ed25519-dalek",
+ "mesh-api",
  "packr-guest",
  "serde",
  "serde_json",
  "sha2",
 ]
+
+[[package]]
+name = "mesh-api"
+version = "0.1.0"
 
 [[package]]
 name = "once_cell"

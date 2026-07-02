@@ -34,6 +34,8 @@ mod dag;
 mod event;
 mod wire;
 
+use mesh_api as api;
+
 use codec::{
     connections_from_json, connections_to_json, dag_from_json, dag_to_json, events_from_json,
     events_to_json, from_hex32, hashes_from_json, hashes_to_json, hex, members_from_json,
@@ -67,6 +69,9 @@ pub struct ActorState {
     /// Event hashes of messages already delivered to clients (NOTIFY dedup).
     pub delivered_json: String,
     pub connections_json: String,
+    /// The co-located app actor's id (theater actor-id) to `send` committed
+    /// payloads to, set by a Register command. Empty = no app subscribed.
+    pub app_id: String,
 }
 
 pack_types! {
@@ -87,6 +92,10 @@ pack_types! {
             set-interval: func(name: string, interval-ms: u64) -> result<string, string>,
             now: func() -> u64,
         }
+        theater:simple/message-server-host {
+            register: func() -> result<_, string>,
+            send: func(actor-id: string, msg: list<u8>) -> result<_, string>,
+        }
     }
     exports {
         theater:simple/actor.init: func(state: value) -> result<actor-state, string>,
@@ -94,6 +103,7 @@ pack_types! {
         theater:simple/tcp-client.on-data: func(state: actor-state, connection-id: string, data: list<u8>) -> result<actor-state, string>,
         theater:simple/tcp-client.on-close: func(state: actor-state, connection-id: string, reason: string) -> result<actor-state, string>,
         theater:simple/timer.handle-tick: func(state: actor-state, timer-name: string) -> result<actor-state, string>,
+        theater:simple/message-server-client.handle-request: func(state: actor-state, params: tuple<string, list<u8>>) -> result<tuple<actor-state, tuple<option<list<u8>>>>, string>,
     }
 }
 
@@ -117,6 +127,10 @@ fn tcp_close(conn_id: String) -> Result<(), String>;
 fn timer_set_interval(name: String, interval_ms: u64) -> Result<String, String>;
 #[import(module = "theater:simple/timer", name = "now")]
 fn now_ms() -> u64;
+#[import(module = "theater:simple/message-server-host", name = "register")]
+fn message_server_register() -> Result<(), String>;
+#[import(module = "theater:simple/message-server-host", name = "send")]
+fn message_server_send(actor_id: String, msg: Vec<u8>) -> Result<(), String>;
 
 const LISTEN_ADDR: &str = "127.0.0.1:9447";
 const HEARTBEAT_TIMER: &str = "heartbeat";
@@ -199,6 +213,11 @@ fn init(state: Value) -> Result<(ActorState, ()), String> {
     if let Err(e) = timer_set_interval(HEARTBEAT_TIMER.to_string(), heartbeat_ms) {
         log(format!("[mesh] set-interval failed: {}", e));
     }
+    // Register with the message server so a co-located app actor can drive us
+    // (Submit/Introduce/Depart/Register) and receive committed payloads.
+    if let Err(e) = message_server_register() {
+        log(format!("[mesh] message-server register failed: {}", e));
+    }
 
     // Dial peers, handshake from the client side, register them as authed.
     let mut conns: BTreeMap<String, ConnState> = BTreeMap::new();
@@ -223,6 +242,7 @@ fn init(state: Value) -> Result<(ActorState, ()), String> {
             pending_json: "[]".to_string(),
             delivered_json: "[]".to_string(),
             connections_json: connections_to_json(&conns),
+            app_id: String::new(),
         },
         (),
     ))
@@ -391,8 +411,8 @@ fn on_data(state: ActorState, conn_id: String, data: Vec<u8>) -> Result<(ActorSt
     if !should_close {
         conns.insert(conn_id.clone(), conn_state);
     }
-    // Deliver any newly-finalized messages (committed delivery via the reducer).
-    deliver_committed(&dag, &conns, &mut delivered);
+    // Deliver any newly-finalized messages to TCP clients and the co-located app.
+    deliver_committed(&dag, &conns, &state.app_id, &mut delivered);
 
     let delivered_vec: Vec<Hash> = delivered.iter().copied().collect();
     Ok((
@@ -451,6 +471,101 @@ fn handle_tick(state: ActorState, _timer_name: String) -> Result<(ActorState, ()
         },
         (),
     ))
+}
+
+// ---- app control API (message-server, co-located link) ----
+
+/// A co-located app actor drives its node here: Submit / Introduce / Depart /
+/// Register. No handshake, no signing — the app is our supervisor, so we author
+/// under our own key. Returns an ack (event hash, or an error string) as the
+/// `request` response. Committed payloads flow back to the app via `send`.
+/// The `handle-request` response tuple: an optional reply payload (our ack).
+/// A 1-tuple because the message-server ABI wraps the response that way.
+type RequestReply = (Option<Vec<u8>>,);
+
+#[export(name = "theater:simple/message-server-client.handle-request")]
+fn handle_request(
+    state: ActorState,
+    params: (String, Vec<u8>),
+) -> Result<(ActorState, RequestReply), String> {
+    let signing_key = SigningKey::from_bytes(&from_hex32(&state.signing_key_hex)?);
+    let mut dag = dag_from_json(&state.dag_json)?;
+    for ev in events_from_json(&state.pending_json) {
+        let _ = dag.ingest(ev);
+    }
+    let conns = connections_from_json(&state.connections_json);
+    let mut self_head: Option<Hash> = if state.self_head_hex.is_empty() {
+        None
+    } else {
+        Some(from_hex32(&state.self_head_hex)?)
+    };
+    let mut delivered: BTreeSet<Hash> =
+        hashes_from_json(&state.delivered_json).into_iter().collect();
+    let mut app_id = state.app_id.clone();
+
+    let (_request_id, body) = params;
+    let ack = match api::decode_command(&body) {
+        Some(api::Command::Submit(payload)) => {
+            let (h, result) = run_command(&mut dag, &conns, &signing_key, self_head, payload, None);
+            self_head = h;
+            ack_bytes(result)
+        }
+        Some(api::Command::Introduce(node)) => {
+            let op = Some(SystemOp::Introduce { node });
+            let (h, result) = run_command(&mut dag, &conns, &signing_key, self_head, Vec::new(), op);
+            self_head = h;
+            ack_bytes(result)
+        }
+        Some(api::Command::Depart) => {
+            let me = signing_key.verifying_key().to_bytes();
+            let op = Some(SystemOp::Depart { node: me });
+            let (h, result) = run_command(&mut dag, &conns, &signing_key, self_head, Vec::new(), op);
+            self_head = h;
+            ack_bytes(result)
+        }
+        Some(api::Command::Register(id)) => {
+            // Subscribe this app for delivery, then flush the retained finalized
+            // payload history to it so it doesn't miss anything committed before
+            // it registered.
+            app_id = id.clone();
+            for h in dag.ordered_finalized() {
+                if let Some(ev) = dag.events.get(&h) {
+                    if ev.payload.is_empty() {
+                        continue;
+                    }
+                    let _ = message_server_send(id.clone(), api::encode_delivery(&ev.author, &ev.payload));
+                    delivered.insert(h);
+                }
+            }
+            log(format!("[mesh] app {} registered for delivery", id));
+            api::encode_ack(true, &[0u8; 32], "")
+        }
+        None => api::encode_ack(false, &[0u8; 32], "unrecognized command"),
+    };
+
+    // Authoring our own event may have finalized others (e.g. single-node).
+    deliver_committed(&dag, &conns, &app_id, &mut delivered);
+
+    let delivered_vec: Vec<Hash> = delivered.iter().copied().collect();
+    Ok((
+        ActorState {
+            dag_json: dag_to_json(&dag),
+            pending_json: events_to_json(&dag.pending_events()),
+            delivered_json: hashes_to_json(&delivered_vec),
+            self_head_hex: self_head.map(|h| hex(&h)).unwrap_or_default(),
+            app_id,
+            ..state
+        },
+        (Some(ack),),
+    ))
+}
+
+/// Encode a command result as an ack payload.
+fn ack_bytes(result: Result<Hash, String>) -> Vec<u8> {
+    match result {
+        Ok(h) => api::encode_ack(true, &h, ""),
+        Err(e) => api::encode_ack(false, &[0u8; 32], &e),
+    }
 }
 
 // ---- handshake steps ----
@@ -685,6 +800,28 @@ fn author_and_broadcast(
     }
 }
 
+/// Author an event on our chain and gossip it to peers, returning the new
+/// self_head and a result carrying the event hash (for an app ack). Unlike
+/// `author_and_broadcast` this sends no TCP ACK — the caller (the message-server
+/// path) returns the ack itself.
+fn run_command(
+    dag: &mut Dag,
+    conns: &BTreeMap<String, ConnState>,
+    signing_key: &SigningKey,
+    self_head: Option<Hash>,
+    payload: Vec<u8>,
+    system: Option<SystemOp>,
+) -> (Option<Hash>, Result<Hash, String>) {
+    match author_event(dag, signing_key, self_head, payload, system) {
+        Ok(ev) => {
+            let h = ev.event_hash();
+            broadcast(conns, "", &encode_deliver(&ev.encode()));
+            (Some(h), Ok(h))
+        }
+        Err(e) => (self_head, Err(e)),
+    }
+}
+
 /// Heads of every member other than `me` that we currently hold.
 fn foreign_heads(dag: &Dag, me: &PubKey) -> Vec<Hash> {
     let mut out = Vec::new();
@@ -746,7 +883,12 @@ fn broadcast(conns: &BTreeMap<String, ConnState>, exclude: &str, frame: &[u8]) {
 /// every payload-bearing event not yet delivered (tracked in `delivered`). The
 /// substrate is payload-agnostic: addressing / message-type / routing all live
 /// in the payload bytes and are the application's concern.
-fn deliver_committed(dag: &Dag, conns: &BTreeMap<String, ConnState>, delivered: &mut BTreeSet<Hash>) {
+fn deliver_committed(
+    dag: &Dag,
+    conns: &BTreeMap<String, ConnState>,
+    app_id: &str,
+    delivered: &mut BTreeSet<Hash>,
+) {
     for h in dag.ordered_finalized() {
         let Some(ev) = dag.events.get(&h) else {
             continue;
@@ -754,11 +896,16 @@ fn deliver_committed(dag: &Dag, conns: &BTreeMap<String, ConnState>, delivered: 
         if ev.payload.is_empty() || !delivered.insert(h) {
             continue;
         }
+        // TCP app clients (test harness) get a NOTIFY frame...
         let frame = encode_notify(&ev.author, &ev.payload);
         for (cid, cs) in conns {
             if matches!(cs.phase, Phase::Authed { .. }) {
                 let _ = tcp_send(cid.clone(), frame.clone());
             }
+        }
+        // ...the co-located app actor gets a message-server delivery.
+        if !app_id.is_empty() {
+            let _ = message_server_send(app_id.to_string(), api::encode_delivery(&ev.author, &ev.payload));
         }
     }
 }
