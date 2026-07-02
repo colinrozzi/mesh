@@ -214,9 +214,13 @@ fn init(state: Value) -> Result<(ActorState, ()), String> {
         log(format!("[mesh] set-interval failed: {}", e));
     }
     // Register with the message server so a co-located app actor can drive us
-    // (Submit/Introduce/Depart/Register) and receive committed payloads.
+    // (Submit/Introduce/Depart/Register) and receive committed payloads. Theater
+    // auto-registers actors that declare the handler, so "Already registered" is
+    // the normal case — only surface a genuinely unexpected failure.
     if let Err(e) = message_server_register() {
-        log(format!("[mesh] message-server register failed: {}", e));
+        if !e.contains("Already registered") {
+            log(format!("[mesh] message-server register failed: {}", e));
+        }
     }
 
     // Dial peers, handshake from the client side, register them as authed.

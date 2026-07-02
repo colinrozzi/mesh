@@ -242,6 +242,13 @@ witnessing / catch-up; all-members finality; broadcast delivery of committed
 payloads; **pruning/compaction with snapshot transfer** (bounded storage, and a
 behind node bootstraps from a checkpoint); single- and multi-node operation.
 
+**App interface** (`DESIGN.md` → *App interface*): a co-located app actor drives
+its own node over theater's `message-server` — `request` commands + a
+`send`-callback delivery stream (the `mesh-api` envelope). Node side implemented
++ verified; `mesh-example-app` + `app-test` are the app half. End-to-end is gated
+on two theater primitives (`runtime.get-self`; parent→spawned-child
+message-server addressability).
+
 **Near-term** (see `DESIGN.md`): incremental finality/delivery (currently
 re-scans the retained DAG each callback), batched emission (currently
 emit-on-event).

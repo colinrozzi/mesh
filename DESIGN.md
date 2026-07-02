@@ -318,6 +318,21 @@ late subscriber misses nothing.) This is the same committed-delivery stream the
 TCP `NOTIFY` path carries for test clients — the substrate stays
 payload-agnostic; addressing and message-type live in the payload bytes.
 
+> Status: node side implemented + verified (compiles, instantiates, registers,
+> `spawn`-with-config works). The `mesh-example-app` crate is the app half, and
+> `app-test` the end-to-end harness — both compile and run up to two **theater**
+> integration points that are prerequisites, not mesh work:
+>
+>   1. **`runtime.get-self`** — an app must learn its own actor-id to `Register`.
+>      Not yet in theater (isolated in the example's `my_actor_id()`).
+>   2. **Parent → spawned-child addressability.** A parent's `message-server
+>      request` to the id `supervisor.spawn` returned fails "Actor not found",
+>      even though the child auto-registers ("Already registered"). Needed for
+>      the app to command its node child.
+>
+> An app must also drive its node from a *tick*, not from `init`: `spawn` returns
+> before the child is reachable, so init-time `request` can't route.
+
 ## Liveness — halting is the contract, not a bug
 
 Finality requires **all** members, so a member that goes down **halts
