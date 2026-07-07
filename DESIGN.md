@@ -318,20 +318,23 @@ late subscriber misses nothing.) This is the same committed-delivery stream the
 TCP `NOTIFY` path carries for test clients — the substrate stays
 payload-agnostic; addressing and message-type live in the payload bytes.
 
-> Status: node side implemented + verified (compiles, instantiates, registers,
-> `spawn`-with-config works). The `mesh-example-app` crate is the app half, and
-> `app-test` the end-to-end harness — both compile and run up to two **theater**
-> integration points that are prerequisites, not mesh work:
+> Status: **working end to end.** `mesh-example-app` supervises a node child and
+> drives it over message-server; `app-test` shows two apps exchanging messages
+> across the substrate (each receives the other's greeting via `handle-send`).
 >
->   1. **`runtime.get-self`** — an app must learn its own actor-id to `Register`.
->      Not yet in theater (isolated in the example's `my_actor_id()`).
->   2. **Parent → spawned-child addressability.** A parent's `message-server
->      request` to the id `supervisor.spawn` returned fails "Actor not found",
->      even though the child auto-registers ("Already registered"). Needed for
->      the app to command its node child.
+> Getting here needed two theater primitives (both landed): **`runtime.self`**
+> (theater #127, an actor's own id — declared as an `#[import]` only, since `self`
+> is a WIT keyword `pack_types!` can't express) and **fresh per-actor
+> message-server state** (theater #129, so a supervisor-spawned child is
+> reachable). Two mesh-side gotchas: packr passes handler params **flat**, so
+> `handle-request`/`handle-send` take positional args, not a nested tuple; and an
+> app must drive its node from a **tick, not `init`** (`spawn` returns before the
+> child is routable).
 >
-> An app must also drive its node from a *tick*, not from `init`: `spawn` returns
-> before the child is reachable, so init-time `request` can't route.
+> Known edge: an event a node authors *before* a peer has connected finalizes
+> only via catch-up, which is currently slow/flaky — so an app that submits
+> immediately on startup may see delayed delivery. Submitting once the mesh is
+> connected is reliable; tightening early-author finality is future work.
 
 ## Liveness — halting is the contract, not a bug
 

@@ -487,10 +487,14 @@ fn handle_tick(state: ActorState, _timer_name: String) -> Result<(ActorState, ()
 /// A 1-tuple because the message-server ABI wraps the response that way.
 type RequestReply = (Option<Vec<u8>>,);
 
+// packr passes handler params flat (like on_data's state/conn_id/data), so the
+// message-server `params: tuple<string, list<u8>>` arrives as two positional
+// args (request_id, data) — NOT one nested tuple.
 #[export(name = "theater:simple/message-server-client.handle-request")]
 fn handle_request(
     state: ActorState,
-    params: (String, Vec<u8>),
+    _request_id: String,
+    body: Vec<u8>,
 ) -> Result<(ActorState, RequestReply), String> {
     let signing_key = SigningKey::from_bytes(&from_hex32(&state.signing_key_hex)?);
     let mut dag = dag_from_json(&state.dag_json)?;
@@ -507,7 +511,6 @@ fn handle_request(
         hashes_from_json(&state.delivered_json).into_iter().collect();
     let mut app_id = state.app_id.clone();
 
-    let (_request_id, body) = params;
     let ack = match api::decode_command(&body) {
         Some(api::Command::Submit(payload)) => {
             let (h, result) = run_command(&mut dag, &conns, &signing_key, self_head, payload, None);

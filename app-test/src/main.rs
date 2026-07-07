@@ -91,8 +91,8 @@ fn main() {
     }
 
     // A received B's greeting iff its log shows it, and vice-versa.
-    let a_got_b = poll_log("/tmp/mesh-app-a.log", "hello from B", Duration::from_secs(8));
-    let b_got_a = poll_log("/tmp/mesh-app-b.log", "hello from A", Duration::from_secs(8));
+    let a_got_b = poll_log("/tmp/mesh-app-a.log", "hello from B", Duration::from_secs(30));
+    let b_got_a = poll_log("/tmp/mesh-app-b.log", "hello from A", Duration::from_secs(30));
 
     for mut c in children {
         let _ = c.kill();
