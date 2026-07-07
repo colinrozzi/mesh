@@ -35,7 +35,7 @@ pack_types! {
     imports {
         theater:simple/runtime {
             log: func(msg: string),
-            get-self: func() -> string,
+            // self stubbed
         }
         theater:simple/supervisor {
             spawn: func(manifest: string, init-state: option<value>, wasm-bytes: option<list<u8>>) -> result<string, string>,
@@ -57,8 +57,10 @@ pack_types! {
 
 #[import(module = "theater:simple/runtime", name = "log")]
 fn log(msg: String);
-#[import(module = "theater:simple/runtime", name = "get-self")]
-fn runtime_get_self() -> String;
+// `self` is a WIT keyword the pack_types! tokenizer can't express (no %self
+// escape), so it's declared only as an #[import] binding, not in the metadata.
+#[import(module = "theater:simple/runtime", name = "self")]
+fn runtime_self() -> String;
 #[import(module = "theater:simple/supervisor", name = "spawn")]
 fn supervisor_spawn(
     manifest: String,
@@ -72,10 +74,9 @@ fn message_server_register() -> Result<(), String>;
 #[import(module = "theater:simple/message-server-host", name = "request")]
 fn message_server_request(actor_id: String, msg: Vec<u8>) -> Result<Vec<u8>, String>;
 
-/// The single spot that depends on theater's `get-self`. Reconcile here if the
-/// primitive lands under a different name/signature.
+/// The actor's own id, via theater's `runtime.self` (added in #127).
 fn my_actor_id() -> String {
-    runtime_get_self()
+    runtime_self()
 }
 
 #[derive(Clone, GraphValue)]
@@ -130,8 +131,10 @@ fn init(state: Value) -> Result<(AppState, ()), String> {
     log(format!("[app {}] spawned node {}", cfg.label, node_id));
 
     // Defer commands to the first tick — the node isn't reachable via the
-    // message-server router until after spawn returns.
-    if let Err(e) = timer_set_interval("arm".to_string(), 500) {
+    // message-server router until after spawn returns. Wait a few seconds so the
+    // peer mesh has connected before we submit (an event authored before any peer
+    // is present only finalizes later, via catch-up).
+    if let Err(e) = timer_set_interval("arm".to_string(), 3000) {
         log(format!("[app {}] set-interval failed: {}", cfg.label, e));
     }
 
@@ -160,9 +163,10 @@ fn handle_tick(state: AppState, _timer: String) -> Result<(AppState, ()), String
 
 /// A committed payload arrived from our node — this handler is the delivery
 /// callback. Log `(from, body)` so an integration test can observe it.
+// packr passes params flat: the message-server `params: tuple<list<u8>>` arrives
+// as a single positional `msg` arg, not a nested 1-tuple.
 #[export(name = "theater:simple/message-server-client.handle-send")]
-fn handle_send(state: AppState, params: (Vec<u8>,)) -> Result<(AppState, ()), String> {
-    let (msg,) = params;
+fn handle_send(state: AppState, msg: Vec<u8>) -> Result<(AppState, ()), String> {
     match mesh_api::decode_delivery(&msg) {
         Some((from, body)) => log(format!(
             "[app {}] RECEIVED from {}: {}",
