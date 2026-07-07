@@ -22,6 +22,11 @@
 #![cfg_attr(not(test), no_std)]
 extern crate alloc;
 
+/// App-layer request/response + lifecycle envelope carried *inside* a Submit
+/// payload (orchestrator ↔ sentinel over the broadcast DAG). Rides above the
+/// node↔app layer in this file; the mesh node never parses it.
+pub mod control;
+
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 

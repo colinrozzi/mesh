@@ -708,21 +708,27 @@ fn ingest_and_propagate(
     if dag.has(&event.event_hash()) {
         return self_head; // dedup — already have it
     }
-    // Anything that must reach finality — a payload event or a membership change
-    // — we witness by grafting. Pure heartbeats (empty payload, no system op)
-    // are only forwarded, so grafts don't beget grafts forever.
-    let needs_witness = !event.payload.is_empty() || event.system.is_some();
     let encoded = event.encode();
     let missing = missing_deps(dag, &event); // compute before `ingest` consumes it
 
-    match dag.ingest(event) {
-        Ok(true) => {
+    match dag.ingest_admitted(event) {
+        Ok(admitted) if !admitted.is_empty() => {
             // Forward to every other peer (the source is excluded — it's not in
             // `conns` right now, having been removed for the duration of on-data).
             broadcast(conns, from_conn, &encode_deliver(&encoded));
+
+            // Witness if ANY newly-admitted event needs finality — the event
+            // itself, or a buffered waiter that resolved when it landed. Catch-up
+            // delivers events newest-first, so a payload event usually arrives
+            // before its deps and is admitted later as a *waiter*; checking only
+            // the directly-ingested event would miss it and it would never
+            // finalize. One graft refs all foreign heads, witnessing them all.
+            // Pure heartbeats (empty payload, no system op) don't warrant a graft,
+            // so grafts don't beget grafts forever.
+            let needs_witness = admitted.iter().any(|h| {
+                dag.events.get(h).is_some_and(|e| !e.payload.is_empty() || e.system.is_some())
+            });
             if needs_witness {
-                // Witness it: author a graft whose refs cover the new head.
-                // (Delivery happens on finality, via deliver_committed.)
                 match author_event(dag, signing_key, self_head, Vec::new(), None) {
                     Ok(graft) => {
                         // Send our witness to every peer INCLUDING the source. The
@@ -740,8 +746,8 @@ fn ingest_and_propagate(
             }
             self_head
         }
-        Ok(false) => {
-            // Missing a dependency — ask the source for it.
+        Ok(_) => {
+            // Buffered — missing a dependency; ask the source for it.
             if !missing.is_empty() {
                 let _ = tcp_send(from_conn.to_string(), encode_hashes(FRAME_WANT, &missing));
             }

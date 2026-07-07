@@ -86,6 +86,27 @@ impl Dag {
     /// `Ok(false)` when buffered pending a missing dependency, `Err` on hard
     /// validation failure.
     pub fn ingest(&mut self, event: Event) -> Result<bool, String> {
+        let mut admitted = Vec::new();
+        self.ingest_into(event, &mut admitted)
+    }
+
+    /// Like [`ingest`], but returns the hashes of every event **newly admitted**
+    /// as a result — the event itself plus any buffered waiters that resolved
+    /// because it landed. Empty when the event was buffered or already present.
+    ///
+    /// The distinction matters for witnessing: during catch-up, a payload event
+    /// often arrives before its dependencies and is admitted later as a *waiter*.
+    /// The caller must witness those too, or they never reach finality.
+    pub fn ingest_admitted(&mut self, event: Event) -> Result<Vec<Hash>, String> {
+        let mut admitted = Vec::new();
+        self.ingest_into(event, &mut admitted)?;
+        Ok(admitted)
+    }
+
+    /// Core ingest, pushing each newly-admitted hash (event + resolved waiters,
+    /// transitively) into `admitted`. Returns `true` if `event` was admitted (or
+    /// already present), `false` if buffered.
+    fn ingest_into(&mut self, event: Event, admitted: &mut Vec<Hash>) -> Result<bool, String> {
         event.verify_signature()?;
         let h = event.event_hash();
         if self.events.contains_key(&h) {
@@ -137,10 +158,11 @@ impl Dag {
         }
 
         self.insert(h, event);
+        admitted.push(h);
 
         if let Some(waiters) = self.pending.remove(&h) {
             for w in waiters {
-                let _ = self.ingest(w);
+                let _ = self.ingest_into(w, admitted);
             }
         }
         Ok(true)
@@ -547,6 +569,32 @@ mod tests {
         assert!(!dag.has(&a1h));
         dag.ingest(gb).unwrap();
         assert!(dag.has(&a1h));
+    }
+
+    #[test]
+    fn ingest_admitted_reports_resolved_waiters() {
+        // A payload event that arrives before its dep is buffered, then admitted
+        // as a *waiter* when the dep lands. `ingest_admitted` must report it so
+        // the caller witnesses it — otherwise a caught-up payload never finalizes.
+        let a = key(1);
+        let b = key(2);
+        let mut dag = Dag::new(members(&[&a, &b]));
+        let ga = ev(&a, None, Vec::new(), Vec::new());
+        let gah = ga.event_hash();
+        dag.ingest(ga).unwrap();
+
+        // b's payload event depends on ga (a ref); arrives before gb (its self_parent).
+        let gb = ev(&b, None, Vec::new(), Vec::new());
+        let gbh = gb.event_hash();
+        let b1 = ev(&b, Some(gbh), alloc::vec![gah], b"hi".to_vec());
+        let b1h = b1.event_hash();
+        assert!(dag.ingest_admitted(b1).unwrap().is_empty(), "buffered, nothing admitted yet");
+
+        // gb lands → it and the buffered payload waiter b1 are both admitted, and
+        // both must be reported.
+        let admitted = dag.ingest_admitted(gb).unwrap();
+        assert!(admitted.contains(&gbh));
+        assert!(admitted.contains(&b1h), "the resolved payload waiter must be reported");
     }
 
     #[test]

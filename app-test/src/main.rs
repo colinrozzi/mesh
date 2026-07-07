@@ -79,20 +79,31 @@ fn main() {
 
     let _ = MESH_DIR; // (node manifests already point at the built mesh.wasm)
 
+    // Bring up A's node first and wait for it to listen before starting B —
+    // B's node dials A on startup, and the mesh does a one-shot dial with no
+    // retry, so if A isn't listening yet the peers never connect. (Reconnect /
+    // dial-retry in the substrate would remove this ordering requirement.)
     let mut children: Vec<Child> = Vec::new();
     children.push(spawn_mesh("/tmp/mesh-app-a.toml", "/tmp/mesh-app-a.log"));
+    let a_up = wait_for_port(ADDR_A, Duration::from_secs(10));
     children.push(spawn_mesh("/tmp/mesh-app-b.toml", "/tmp/mesh-app-b.log"));
-
-    let up = wait_for_port(ADDR_A, Duration::from_secs(6)) && wait_for_port(ADDR_B, Duration::from_secs(6));
+    let up = a_up && wait_for_port(ADDR_B, Duration::from_secs(10));
     if up {
         println!("✓ both apps up; nodes listening on {ADDR_A} / {ADDR_B}");
     } else {
         println!("✗ nodes failed to listen (apps may have failed to spawn their node children)");
     }
 
-    // A received B's greeting iff its log shows it, and vice-versa.
-    let a_got_b = poll_log("/tmp/mesh-app-a.log", "hello from B", Duration::from_secs(30));
-    let b_got_a = poll_log("/tmp/mesh-app-b.log", "hello from A", Duration::from_secs(30));
+    // Each app must receive the other's greeting. Poll both concurrently under
+    // one shared deadline (not two sequential ones) and stop as soon as both land.
+    let deadline = Duration::from_secs(40);
+    let start = Instant::now();
+    let (mut a_got_b, mut b_got_a) = (false, false);
+    while start.elapsed() < deadline && !(a_got_b && b_got_a) {
+        a_got_b = a_got_b || log_contains("/tmp/mesh-app-a.log", "hello from B");
+        b_got_a = b_got_a || log_contains("/tmp/mesh-app-b.log", "hello from A");
+        std::thread::sleep(Duration::from_millis(200));
+    }
 
     for mut c in children {
         let _ = c.kill();
@@ -109,16 +120,7 @@ fn main() {
     std::process::exit(1);
 }
 
-/// Poll a log file until it contains `needle` or the deadline elapses.
-fn poll_log(path: &str, needle: &str, deadline: Duration) -> bool {
-    let start = Instant::now();
-    while start.elapsed() < deadline {
-        if let Ok(s) = std::fs::read_to_string(path) {
-            if s.contains(needle) {
-                return true;
-            }
-        }
-        std::thread::sleep(Duration::from_millis(200));
-    }
-    false
+/// Whether `path` currently contains `needle`.
+fn log_contains(path: &str, needle: &str) -> bool {
+    std::fs::read_to_string(path).map(|s| s.contains(needle)).unwrap_or(false)
 }

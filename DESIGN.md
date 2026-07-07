@@ -331,10 +331,15 @@ payload-agnostic; addressing and message-type live in the payload bytes.
 > app must drive its node from a **tick, not `init`** (`spawn` returns before the
 > child is routable).
 >
-> Known edge: an event a node authors *before* a peer has connected finalizes
-> only via catch-up, which is currently slow/flaky — so an app that submits
-> immediately on startup may see delayed delivery. Submitting once the mesh is
-> connected is reliable; tightening early-author finality is future work.
+> Catch-up witnessing: an event a node authors *before* a peer connects reaches
+> the peer newest-first, so it lands as a buffered *waiter* when its deps arrive.
+> `ingest_admitted` reports those resolved waiters so the node witnesses them
+> (grafts) — without that they'd be admitted but never finalized. With this,
+> app-to-app delivery is reliable once the nodes peer (`app-test` is 8/8).
+>
+> Remaining robustness gap: the initial peer **dial is one-shot** — if the target
+> isn't listening yet, the peers never connect (no reconnect/retry). `app-test`
+> sidesteps it by starting A's node before B dials; production wants dial-retry.
 
 ## Liveness — halting is the contract, not a bug
 
@@ -377,6 +382,10 @@ future reconfiguration protocol) that a member is gone.
   drop this from O(retained²) to incremental.
 - **Batched emission.** Replace on-event grafting with a tick that collapses
   many refs into one witness — the scaling fix for N>2 and idle cost.
+- **Dial retry / reconnect.** The initial peer dial is one-shot: if the target
+  isn't listening yet, the peers never connect. A periodic re-dial of configured
+  peers we're not connected to would make startup order-independent and recover
+  from transient drops.
 
 ## Dynamic membership — introduction & departure
 
