@@ -51,6 +51,9 @@ pack_types! {
     exports {
         theater:simple/actor.init: func(state: value) -> result<actor-state, string>,
         theater:simple/timer.handle-tick: func(state: actor-state, timer-name: string) -> result<actor-state, string>,
+        // NOTE: `params: tuple<list<u8>>` is the wire contract; packr delivers it
+        // POSITIONALLY — the impl is `fn(state, data: list<u8>)`, NOT a 1-tuple
+        // `(Vec<u8>,)`. Same convention as handle-request / handle-child-event.
         theater:simple/message-server-client.handle-send: func(state: actor-state, params: tuple<list<u8>>) -> result<actor-state, string>,
     }
 }
