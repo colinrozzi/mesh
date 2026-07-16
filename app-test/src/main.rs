@@ -19,7 +19,7 @@ use std::process::Child;
 use std::time::{Duration, Instant};
 
 const APP_WASM: &str =
-    "/home/colin/work/actors/mesh/example-app/target/wasm32-unknown-unknown/release/mesh_example_app.wasm";
+    "/home/colin/work/actors/mesh/example-app/target/wasm32-unknown-unknown/release/mesh_example_app.composite.wasm";
 const ADDR_A: &str = "127.0.0.1:9550";
 const ADDR_B: &str = "127.0.0.1:9551";
 
