@@ -40,7 +40,7 @@ fn write_manifest(path: &str, initial_state: &str, store_path: &str) {
     let template = format!(
         r#"name = "mesh-multi-node"
 version = "0.1.0"
-package = "{mesh_dir}/target/wasm32-unknown-unknown/release/mesh.wasm"
+package = "{mesh_dir}/target/wasm32-unknown-unknown/release/mesh.composite.wasm"
 static_package = true
 initial_state = '{initial_state}'
 

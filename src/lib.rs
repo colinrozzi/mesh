@@ -205,9 +205,9 @@ fn init(state: Value) -> Result<(ActorState, ()), String> {
         tcp_listen(listen_addr.clone()).map_err(|e| format!("listen failed: {}", e))?;
     log(format!(
         "[mesh] listening on {} (id={}); self={}; members={}",
-        &listen_addr,
+        listen_addr,
         listener_id,
-        &hex(&self_pubkey),
+        hex(&self_pubkey),
         members.len(),
     ));
     if let Err(e) = timer_set_interval(HEARTBEAT_TIMER.to_string(), heartbeat_ms) {
@@ -228,10 +228,10 @@ fn init(state: Value) -> Result<(ActorState, ()), String> {
     for p in &cfg.dial {
         match open_peer_connection(&p.address, &signing_key, &dag) {
             Ok(conn_id) => {
-                log(format!("[mesh] dialed peer {} (conn {})", &p.address, conn_id));
+                log(format!("[mesh] dialed peer {} (conn {})", p.address, conn_id));
                 conns.insert(conn_id, ConnState::authed(p.pubkey.clone()));
             }
-            Err(e) => log(format!("[mesh] dial {} failed: {}", &p.address, e)),
+            Err(e) => log(format!("[mesh] dial {} failed: {}", p.address, e)),
         }
     }
 
