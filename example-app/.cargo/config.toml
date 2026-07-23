@@ -1,0 +1,6 @@
+# packr 0.11.0 plain-build recipe — see the node's .cargo/config.toml.
+[target.wasm32-unknown-unknown]
+rustflags = [
+    "-C", "link-arg=--export-memory",
+    "-C", "link-arg=--no-entry",
+]

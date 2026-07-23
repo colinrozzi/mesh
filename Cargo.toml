@@ -8,7 +8,7 @@ crate-type = ["cdylib"]
 
 [dependencies]
 mesh-api = { path = "mesh-api" }
-packr-guest = { version = "0.10.2", features = ["derive"] }
+packr-guest = { version = "0.11.0", features = ["derive"] }
 ed25519-dalek = { version = "2", default-features = false, features = ["alloc"] }
 sha2 = { version = "0.10", default-features = false }
 serde = { version = "1", default-features = false, features = ["alloc", "derive"] }
