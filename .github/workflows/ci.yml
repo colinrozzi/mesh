@@ -41,6 +41,7 @@ jobs:
         run: |
           cargo test --lib
           cargo test --manifest-path mesh-api/Cargo.toml
+          cargo test --manifest-path mesh-client/Cargo.toml
 
       # Compile the integration-test clients so they don't bit-rot. They aren't
       # *run* in CI — they spawn the `theater` runtime, which isn't available on
