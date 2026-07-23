@@ -1,0 +1,9 @@
+# packr 0.11.0 plain-build recipe (composites retired). The cdylib exports its
+# own growable memory + __pack_alloc/__pack_free + lifecycle and imports only
+# host theater:simple/*; the resulting mesh.wasm is directly loadable — no
+# compose step. See theater docs/self-contained-actor-recipe.md.
+[target.wasm32-unknown-unknown]
+rustflags = [
+    "-C", "link-arg=--export-memory",
+    "-C", "link-arg=--no-entry",
+]

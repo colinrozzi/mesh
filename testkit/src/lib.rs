@@ -161,7 +161,7 @@ pub fn write_manifest(path: &str, initial_state: &str, store_path: &str, store_i
     let template = format!(
         r#"name = "{store_id}"
 version = "0.1.0"
-package = "{MESH_DIR}/target/wasm32-unknown-unknown/release/mesh.composite.wasm"
+package = "{MESH_DIR}/target/wasm32-unknown-unknown/release/mesh.wasm"
 static_package = true
 initial_state = '{initial_state}'
 
