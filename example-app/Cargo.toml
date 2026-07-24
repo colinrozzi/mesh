@@ -8,7 +8,7 @@ description = "Example theater app actor that supervises a mesh node and talks t
 crate-type = ["cdylib"]
 
 [dependencies]
-mesh-api = { path = "../mesh-api" }
+mesh-client = { path = "../mesh-client" }
 packr-guest = { version = "0.11.0", features = ["derive"] }
 serde = { version = "1", default-features = false, features = ["alloc", "derive"] }
 serde_json = { version = "1", default-features = false, features = ["alloc"] }

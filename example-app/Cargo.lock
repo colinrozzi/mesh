@@ -118,10 +118,17 @@ name = "mesh-api"
 version = "0.1.0"
 
 [[package]]
-name = "mesh-example-app"
+name = "mesh-client"
 version = "0.1.0"
 dependencies = [
  "mesh-api",
+]
+
+[[package]]
+name = "mesh-example-app"
+version = "0.1.0"
+dependencies = [
+ "mesh-client",
  "packr-guest",
  "serde",
  "serde_json",

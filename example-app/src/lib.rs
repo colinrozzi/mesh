@@ -154,13 +154,16 @@ fn handle_tick(state: AppState, _timer: String) -> Result<(AppState, ()), String
     if state.armed {
         return Ok((state, ()));
     }
-    request_ok(&state.node_id, mesh_api::encode_register(&state.my_id), &state.label, "register");
-    request_ok(
-        &state.node_id,
-        mesh_api::encode_submit(state.greeting.as_bytes()),
-        &state.label,
-        "submit",
-    );
+    // Drive the node via the mesh-client library — no envelope/message-server
+    // code here. `message_server_request` is our bound host import.
+    match mesh_client::register(message_server_request, &state.node_id, &state.my_id) {
+        Ok(()) => log(format!("[app {}] registered for delivery", state.label)),
+        Err(e) => log(format!("[app {}] register failed: {}", state.label, e)),
+    }
+    match mesh_client::submit(message_server_request, &state.node_id, state.greeting.as_bytes()) {
+        Ok(h) => log(format!("[app {}] submitted ({})", state.label, short_hex(&h))),
+        Err(e) => log(format!("[app {}] submit failed: {}", state.label, e)),
+    }
     Ok((AppState { armed: true, ..state }, ()))
 }
 
@@ -170,7 +173,7 @@ fn handle_tick(state: AppState, _timer: String) -> Result<(AppState, ()), String
 // as a single positional `msg` arg, not a nested 1-tuple.
 #[export(name = "theater:simple/message-server-client.handle-send")]
 fn handle_send(state: AppState, msg: Vec<u8>) -> Result<(AppState, ()), String> {
-    match mesh_api::decode_delivery(&msg) {
+    match mesh_client::delivery(&msg) {
         Some((from, body)) => log(format!(
             "[app {}] RECEIVED from {}: {}",
             state.label,
@@ -182,25 +185,12 @@ fn handle_send(state: AppState, msg: Vec<u8>) -> Result<(AppState, ()), String> 
     Ok((state, ()))
 }
 
-/// Build the mesh node's `InitConfig` JSON from our app config.
+/// Build the mesh node's `InitConfig` JSON from our app config, via mesh-client.
 fn build_node_init(cfg: &AppConfig) -> String {
-    let members = serde_json::to_string(&cfg.members).unwrap_or_else(|_| "[]".to_string());
-    let dial = serde_json::to_string(&cfg.dial).unwrap_or_else(|_| "[]".to_string());
-    format!(
-        r#"{{"node_seed":"{}","listen_addr":"{}","members":{},"dial":{}}}"#,
-        cfg.node_seed, cfg.node_listen, members, dial,
-    )
-}
-
-/// Send a command to our node, logging the ack (or error).
-fn request_ok(node_id: &str, cmd: Vec<u8>, label: &str, what: &str) {
-    match message_server_request(node_id.to_string(), cmd) {
-        Ok(reply) => match mesh_api::decode_ack(&reply) {
-            Ok(h) => log(format!("[app {}] {} ok ({})", label, what, short_hex(&h))),
-            Err(e) => log(format!("[app {}] {} rejected: {}", label, what, e)),
-        },
-        Err(e) => log(format!("[app {}] {} request failed: {}", label, what, e)),
-    }
+    let members: Vec<&str> = cfg.members.iter().map(String::as_str).collect();
+    let dial: Vec<(&str, &str)> =
+        cfg.dial.iter().map(|p| (p.pubkey.as_str(), p.address.as_str())).collect();
+    mesh_client::node_config(&cfg.node_seed, &cfg.node_listen, &members, &dial)
 }
 
 fn short_hex(bytes: &[u8]) -> String {
