@@ -277,15 +277,17 @@ message-server addressability).
 protocol (see *Using mesh from an actor*). Built + proven end-to-end
 (`compose-smoke`); the mesh interface + the opt-in `mesh-control` envelope.
 
-**In progress — v0.3 (ephemeral membership; see `DESIGN-ephemeral-membership.md`
+**Released — v0.3 (ephemeral membership; see `DESIGN-ephemeral-membership.md`
 + `DESIGN-retention.md`):** signed event timestamps; **self-serve join**
 (`join_allow` + auto-introduce, so a node joins without an out-of-band introduce —
 `join-test`); a **heartbeat pump** (members author noop events so the frontier keeps
 advancing → per-member liveness + continuous compaction); a **sync-ready** signal
 (the node tells the app when it's admitted+synced); **quorum eviction** (a stale
 member is voted out by a majority — 2f+1 — and at N=2 the node shuts down instead;
-`evict-test`); and **retention** that keeps only net membership history + trims
-payloads. Breaking event/delivery-format change → lands as mesh v0.3.
+`evict-test`); and **retention** that retains net membership history + trims
+payloads, with no checkpoint on the wire (a peer answers a `WANT` for a pruned hash
+with a `SEALED` marker derived from its own history). A breaking event/delivery
+format change (signed timestamps) → a v0.3 node interoperates only with v0.3 peers.
 
 **Near-term** (see `DESIGN.md`): incremental finality/delivery (currently
 re-scans the retained DAG each callback), batched emission (currently

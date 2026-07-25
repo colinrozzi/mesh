@@ -156,8 +156,11 @@ const EVICT_TIMEOUT_MS: u64 = 20_000;
 #[derive(serde::Deserialize)]
 struct InitConfig {
     node_seed: String,
-    /// All other member pubkeys (hex). These, plus this node's own, form the
-    /// static member set. Membership is independent of who we dial.
+    /// The genesis member set (hex pubkeys), **identical on every node**. Self
+    /// is NOT auto-added: a node whose key is in this set is a bootstrap member
+    /// (authors a genesis at init); a node whose key is *absent* is a *joining*
+    /// node, admitted later via an Introduce. Empty => `{self}` (single-node).
+    /// Membership evolves from here at runtime; independent of who we dial.
     #[serde(default)]
     members: Vec<String>,
     /// Pubkeys (hex) permitted to SELF-JOIN. A node presenting one of these
