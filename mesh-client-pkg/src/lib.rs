@@ -54,27 +54,9 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use mesh_api::control::{Control, CTRL_COMMAND, CTRL_LIFECYCLE, CTRL_RESPONSE};
-use packr_guest::composite_abi::{ConversionError, FromValue, Value};
 use packr_guest::{export, import_from};
 
 packr_guest::setup_guest!();
-
-/// The reply from the host `request` import, i.e. `result<list<u8>, string>`.
-///
-/// This newtype exists only to work around a gap in `#[import_from]`: the macro
-/// decodes an import's return value with `TryFrom<Value>`, which the composite
-/// ABI does *not* implement for `Result<T, E>` (only `FromValue` is). A bare
-/// `-> Result<Vec<u8>, String>` therefore fails to compile. We own this newtype,
-/// so we can bridge `TryFrom<Value>` to the working `FromValue for Result` impl.
-/// (Reported upstream — once `import_from` decodes via `FromValue`, this can go.)
-struct HostReply(Result<Vec<u8>, String>);
-
-impl TryFrom<Value> for HostReply {
-    type Error = ConversionError;
-    fn try_from(v: Value) -> Result<Self, Self::Error> {
-        Ok(HostReply(FromValue::from_value(v)?))
-    }
-}
 
 packr_guest::pack_types! {
     imports {
@@ -116,16 +98,11 @@ packr_guest::pack_types! {
 }
 
 /// The residual host import — send `msg` to actor `node`, get its reply. This is
-/// the async boundary the exported functions suspend on. Imported under its real
-/// name `request`; bound to a `_raw` fn returning [`HostReply`] (see above).
+/// the async boundary the exported functions suspend on. Since packr-guest 0.12.1
+/// `#[import_from]` decodes returns via `FromValue`, so the `Result` return binds
+/// directly (no newtype shim needed).
 #[import_from("theater:simple/message-server-host", name = "request")]
-fn request_raw(actor_id: String, msg: Vec<u8>) -> HostReply;
-
-/// The `request` shape the `mesh-client` library expects: `FnOnce(String,
-/// Vec<u8>) -> Result<Vec<u8>, String>`. Unwraps the [`HostReply`] newtype.
-fn request(actor_id: String, msg: Vec<u8>) -> Result<Vec<u8>, String> {
-    request_raw(actor_id, msg).0
-}
+fn request(actor_id: String, msg: Vec<u8>) -> Result<Vec<u8>, String>;
 
 /// Submit a payload to `node`; returns the committed event hash (32 bytes).
 #[export]

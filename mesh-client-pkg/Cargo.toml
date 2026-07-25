@@ -14,7 +14,8 @@ mesh-client = { path = "../mesh-client" }
 # The control-envelope codec (Control::encode/decode) surfaced by the
 # `mesh-control` interface.
 mesh-api = { path = "../mesh-api" }
-packr-guest = "0.12.0"
+# 0.12.1+ decodes #[import_from] returns via FromValue (Result/Option bind directly).
+packr-guest = "0.12.1"
 
 [profile.release]
 opt-level = "s"

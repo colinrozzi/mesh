@@ -37,31 +37,21 @@ packr_guest::pack_types! {
 
 ## 3. Bind the functions you call
 
-**Heads-up (temporary):** `#[import_from]` decodes a function's return with
-`TryFrom<Value>`, which the composite ABI does **not** implement for `Result`/
-`Option`. So a `Result`-returning `mesh` function needs a one-line `TryFrom<Value>`
-newtype bridge to the working `FromValue` impl. (Fix requested upstream — once
-`import_from` decodes via `FromValue`, drop the newtype and bind the real type.)
+With **packr-guest 0.12.1+**, `#[import_from]` decodes returns via `FromValue`, so
+`Result`/`Option` returns bind directly — no shim:
 
 ```rust
-use packr_guest::composite_abi::{ConversionError, FromValue, Value};
 use packr_guest::import_from;
 
-struct Hashed(Result<Vec<u8>, String>);
-impl TryFrom<Value> for Hashed {
-    type Error = ConversionError;
-    fn try_from(v: Value) -> Result<Self, Self::Error> { Ok(Hashed(FromValue::from_value(v)?)) }
-}
-
 #[import_from("mesh", name = "submit")]
-fn mesh_submit_raw(node: String, payload: Vec<u8>) -> Hashed;
-fn mesh_submit(node: String, payload: Vec<u8>) -> Result<Vec<u8>, String> {
-    mesh_submit_raw(node, payload).0
-}
+fn mesh_submit(node: String, payload: Vec<u8>) -> Result<Vec<u8>, String>;
+
+#[import_from("mesh", name = "delivery")]
+fn mesh_delivery(msg: Vec<u8>) -> Option<(Vec<u8>, Vec<u8>)>;
 ```
 
-`delivery` returns `option<...>` (same gap → bridge to `Option<(Vec<u8>, Vec<u8>)>`);
-`node-config` returns `string` (no bridge needed).
+(On packr-guest ≤ 0.12.0 a `Result`/`Option` return needed a one-line
+`TryFrom<Value>` newtype bridge to the `FromValue` impl; 0.12.1 removed that need.)
 
 ## 4. Compose
 
@@ -105,9 +95,8 @@ Command / Response / Lifecycle envelope carried *inside* a Submit payload (see
 `mesh-control.pact`). Declare the complete interface, bind what you use, and add a
 `[[link]]` per function (`import = "mesh-control.decode-command"`, `export =
 "decode-command"`, …). `encode-*` build a payload you then `submit`; `control-kind`
-+ `decode-*` parse a payload you got from `delivery`. `decode-*` return
-`option<tuple<...>>`, so they need the same `TryFrom<Value>` shim (bridged to
-`Option<...>`). Typical loop:
++ `decode-*` parse a payload you got from `delivery` (`decode-*` return
+`option<tuple<...>>`, which binds directly on 0.12.1+). Typical loop:
 
 ```rust
 if let Some((from, body)) = mesh_delivery(msg) {
