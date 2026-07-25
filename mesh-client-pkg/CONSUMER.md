@@ -28,11 +28,21 @@ packr_guest::pack_types! {
             depart: func(node: string) -> result<list<u8>, string>,
             register: func(node: string, app-id: string) -> result<bool, string>,
             delivery: func(msg: list<u8>) -> option<tuple<list<u8>, list<u8>>>,
+            is-ready: func(msg: list<u8>) -> bool,
             node-config: func(seed: string, listen: string, members: list<string>, dial: list<tuple<string, string>>) -> string,
         }
     }
     exports { /* your actor's own exports */ }
 }
+```
+
+In your `handle-send`, route incoming node→app messages: call `is-ready` first (a
+one-shot "node admitted + synced, act now" signal), else `delivery` for a committed
+`(from, body)`:
+
+```rust
+if mesh_is_ready(msg.clone()) { /* node is ready — submit your first command */ }
+else if let Some((from, body)) = mesh_delivery(msg) { /* handle a delivered payload */ }
 ```
 
 ## 3. Bind the functions you call

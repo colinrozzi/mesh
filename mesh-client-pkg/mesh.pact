@@ -28,6 +28,10 @@ interface mesh {
         // Decode a delivery received in handle-send into (from, body). Pure.
         delivery: func(msg: list<u8>) -> option<tuple<list<u8>, list<u8>>>
 
+        // Whether a handle-send message is the one-shot Ready signal (node
+        // admitted + synced). Route: is-ready first, else delivery. Pure.
+        is-ready: func(msg: list<u8>) -> bool
+
         // Build a node InitConfig JSON for supervisor.spawn. Pure.
         node-config: func(seed: string, listen: string, members: list<string>, dial: list<tuple<string, string>>) -> string
     }

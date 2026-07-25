@@ -173,14 +173,17 @@ fn handle_tick(state: AppState, _timer: String) -> Result<(AppState, ()), String
 // as a single positional `msg` arg, not a nested 1-tuple.
 #[export(name = "theater:simple/message-server-client.handle-send")]
 fn handle_send(state: AppState, msg: Vec<u8>) -> Result<(AppState, ()), String> {
-    match mesh_client::delivery(&msg) {
-        Some((from, body)) => log(format!(
+    match mesh_client::incoming(&msg) {
+        Some(mesh_client::Incoming::Ready) => {
+            log(format!("[app {}] READY (node admitted + synced)", state.label))
+        }
+        Some(mesh_client::Incoming::Delivery { from, body }) => log(format!(
             "[app {}] RECEIVED from {}: {}",
             state.label,
             short_hex(&from),
             String::from_utf8_lossy(&body),
         )),
-        None => log(format!("[app {}] malformed delivery ({} bytes)", state.label, msg.len())),
+        None => log(format!("[app {}] malformed message ({} bytes)", state.label, msg.len())),
     }
     Ok((state, ()))
 }

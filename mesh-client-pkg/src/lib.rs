@@ -76,6 +76,7 @@ packr_guest::pack_types! {
             depart: func(node: string) -> result<list<u8>, string>,
             register: func(node: string, app-id: string) -> result<bool, string>,
             delivery: func(msg: list<u8>) -> option<tuple<list<u8>, list<u8>>>,
+            is-ready: func(msg: list<u8>) -> bool,
             node-config: func(seed: string, listen: string, members: list<string>, dial: list<tuple<string, string>>) -> string,
         }
         // The mesh-control interface — the app-level CONTROL envelope carried
@@ -137,6 +138,13 @@ fn register(node: String, app_id: String) -> Result<bool, String> {
 #[export]
 fn delivery(msg: Vec<u8>) -> Option<(Vec<u8>, Vec<u8>)> {
     mesh_client::delivery(&msg).map(|(from, body)| (from.to_vec(), body))
+}
+
+/// Whether a `handle-send` message is the one-shot Ready signal (node admitted +
+/// synced). Pair with `delivery` to route: `is-ready` first, else `delivery`.
+#[export(name = "is-ready")]
+fn is_ready(msg: Vec<u8>) -> bool {
+    matches!(mesh_client::incoming(&msg), Some(mesh_client::Incoming::Ready))
 }
 
 /// Build a mesh node's `InitConfig` JSON to hand `supervisor.spawn`. `members`

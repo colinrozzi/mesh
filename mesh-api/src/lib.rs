@@ -123,24 +123,56 @@ pub fn decode_ack(bytes: &[u8]) -> Result<Hash, String> {
     }
 }
 
-// ---- delivery (node → app, via send) ----
+// ---- node → app messages (via message-server send) ----
 
-/// `from[32] || body` — a committed payload and its author.
+pub const MSG_DELIVERY: u8 = 0x01; // from[32] || body — a committed payload
+pub const MSG_READY: u8 = 0x02; // the node is admitted + synced, ready to drive
+
+/// A decoded node→app message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Incoming {
+    /// The node has joined + caught up and is ready to accept commands.
+    Ready,
+    /// A committed payload and its 32-byte author.
+    Delivery { from: PubKey, body: Vec<u8> },
+}
+
+/// `[MSG_DELIVERY] || from[32] || body` — a committed payload and its author.
 pub fn encode_delivery(from: &PubKey, body: &[u8]) -> Vec<u8> {
-    let mut v = Vec::with_capacity(32 + body.len());
+    let mut v = Vec::with_capacity(1 + 32 + body.len());
+    v.push(MSG_DELIVERY);
     v.extend_from_slice(from);
     v.extend_from_slice(body);
     v
 }
 
-/// Decode a delivery into `(from, body)`. Client-side helper for `handle_send`.
-pub fn decode_delivery(bytes: &[u8]) -> Option<(PubKey, Vec<u8>)> {
-    if bytes.len() < 32 {
-        return None;
+/// `[MSG_READY]` — a one-shot "you're admitted + synced" signal.
+pub fn encode_ready() -> Vec<u8> {
+    let mut v = Vec::with_capacity(1);
+    v.push(MSG_READY);
+    v
+}
+
+/// Decode a node→app message (Ready or Delivery). `None` if malformed.
+pub fn decode_incoming(bytes: &[u8]) -> Option<Incoming> {
+    match bytes.split_first()? {
+        (&MSG_READY, _) => Some(Incoming::Ready),
+        (&MSG_DELIVERY, rest) if rest.len() >= 32 => {
+            let mut from = [0u8; 32];
+            from.copy_from_slice(&rest[..32]);
+            Some(Incoming::Delivery { from, body: rest[32..].to_vec() })
+        }
+        _ => None,
     }
-    let mut from = [0u8; 32];
-    from.copy_from_slice(&bytes[..32]);
-    Some((from, bytes[32..].to_vec()))
+}
+
+/// Back-compat: decode only a Delivery into `(from, body)`; `None` for Ready or a
+/// malformed message. Prefer [`decode_incoming`].
+pub fn decode_delivery(bytes: &[u8]) -> Option<(PubKey, Vec<u8>)> {
+    match decode_incoming(bytes)? {
+        Incoming::Delivery { from, body } => Some((from, body)),
+        Incoming::Ready => None,
+    }
 }
 
 #[cfg(test)]
@@ -190,5 +222,19 @@ mod tests {
         let (from, body) = decode_delivery(&encode_delivery(&[3u8; 32], b"hi")).unwrap();
         assert_eq!(from, [3u8; 32]);
         assert_eq!(body, b"hi");
+    }
+
+    #[test]
+    fn incoming_distinguishes_ready_from_delivery() {
+        assert_eq!(decode_incoming(&encode_ready()), Some(Incoming::Ready));
+        assert_eq!(
+            decode_incoming(&encode_delivery(&[3u8; 32], b"hi")),
+            Some(Incoming::Delivery { from: [3u8; 32], body: b"hi".to_vec() })
+        );
+        // A Ready decodes as "not a delivery" for the back-compat helper.
+        assert_eq!(decode_delivery(&encode_ready()), None);
+        // Garbage / empty → None.
+        assert_eq!(decode_incoming(&[]), None);
+        assert_eq!(decode_incoming(&[0xff]), None);
     }
 }

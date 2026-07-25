@@ -23,6 +23,33 @@ use crate::event::{Event, Hash, PubKey, SystemOp};
 
 /// The back-edges of an event: its `self_parent` (if any) and its `refs`,
 /// de-duplicated (an honest event won't repeat, but decode permits it).
+/// Remove every node a majority of the current member set has voted to evict.
+/// Loops because removing one member changes `n` and voter validity; sorted
+/// (`BTreeMap`) iteration keeps the choice deterministic across nodes.
+fn apply_evictions(members: &mut BTreeSet<PubKey>, votes: &mut BTreeMap<PubKey, BTreeSet<PubKey>>) {
+    loop {
+        let majority = members.len() / 2 + 1;
+        let mut evict = None;
+        for (node, voters) in votes.iter() {
+            if !members.contains(node) {
+                continue;
+            }
+            let valid = voters.iter().filter(|v| members.contains(*v)).count();
+            if valid >= majority {
+                evict = Some(*node);
+                break;
+            }
+        }
+        match evict {
+            Some(node) => {
+                members.remove(&node);
+                votes.remove(&node);
+            }
+            None => break,
+        }
+    }
+}
+
 fn dep_set(ev: &Event) -> BTreeSet<Hash> {
     let mut deps = BTreeSet::new();
     if let Some(sp) = ev.self_parent {
@@ -154,6 +181,16 @@ impl Dag {
                         return Err("Depart must be self-authored".into());
                     }
                 }
+                SystemOp::Evict { node } => {
+                    // The author is already verified a member above. A vote is for
+                    // a current member, and never for oneself.
+                    if !members.contains(node) {
+                        return Err(format!("Evict: {} not a member", hex(node)));
+                    }
+                    if *node == event.author {
+                        return Err("Evict must not be self-authored".into());
+                    }
+                }
             }
         }
 
@@ -223,44 +260,52 @@ impl Dag {
         seen
     }
 
-    /// Members live at a point whose causal past is `frontier` — genesis members
-    /// with every Introduce/Depart in that ancestry folded in canonical order.
-    /// Structural (not finality-gated): a pure function of the DAG, so every
-    /// node agrees.
-    fn members_at_frontier(&self, frontier: &[Hash]) -> BTreeSet<PubKey> {
-        let ancestors = self.ancestors_of(frontier);
-        let ordered = self.topo_sort(&ancestors);
+    /// Fold an ordered event sequence into the live member set: `Introduce` adds,
+    /// `Depart` removes, and `Evict` is a *vote* — a node leaves once a majority of
+    /// the current member set (2f+1) has voted to evict it. A fresh
+    /// `Introduce`/`Depart` for a node voids its accumulated votes (a re-joined
+    /// node starts clean). Deterministic given the order, so every node agrees.
+    fn fold_membership(&self, ordered: &[Hash]) -> BTreeSet<PubKey> {
         let mut members = self.base_members.clone();
+        let mut votes: BTreeMap<PubKey, BTreeSet<PubKey>> = BTreeMap::new();
         for h in ordered {
-            match self.events.get(&h).and_then(|e| e.system.as_ref()) {
+            let Some(ev) = self.events.get(h) else { continue };
+            match ev.system.as_ref() {
                 Some(SystemOp::Introduce { node }) => {
                     members.insert(*node);
+                    votes.remove(node);
                 }
                 Some(SystemOp::Depart { node }) => {
                     members.remove(node);
+                    votes.remove(node);
+                }
+                Some(SystemOp::Evict { node }) => {
+                    // A vote counts only from a current member other than the evictee.
+                    if ev.author != *node
+                        && members.contains(node)
+                        && members.contains(&ev.author)
+                    {
+                        votes.entry(*node).or_default().insert(ev.author);
+                    }
                 }
                 None => {}
             }
+            apply_evictions(&mut members, &mut votes);
         }
         members
+    }
+
+    /// Members live at a point whose causal past is `frontier`. Structural (not
+    /// finality-gated): a pure function of the DAG, so every node agrees.
+    fn members_at_frontier(&self, frontier: &[Hash]) -> BTreeSet<PubKey> {
+        let ordered = self.topo_sort(&self.ancestors_of(frontier));
+        self.fold_membership(&ordered)
     }
 
     /// The agreed current member set — genesis members with every *finalized*
     /// membership op folded in canonical order. Used for the handshake.
     pub fn consensus_members(&self) -> BTreeSet<PubKey> {
-        let mut members = self.base_members.clone();
-        for h in self.ordered_finalized() {
-            match self.events.get(&h).and_then(|e| e.system.as_ref()) {
-                Some(SystemOp::Introduce { node }) => {
-                    members.insert(*node);
-                }
-                Some(SystemOp::Depart { node }) => {
-                    members.remove(node);
-                }
-                None => {}
-            }
-        }
-        members
+        self.fold_membership(&self.ordered_finalized())
     }
 
     // ===== Finality ============================================================
@@ -301,7 +346,14 @@ impl Dag {
             return false;
         };
         let deps: Vec<Hash> = dep_set(ev).into_iter().collect();
-        let required = self.members_at_frontier(&deps);
+        let mut required = self.members_at_frontier(&deps);
+        // An Evict vote doesn't require the (presumed-dead) evictee to witness its
+        // own removal — mirrors how an Introduce excludes the new node. Without
+        // this, an Evict could never finalize (the evictee never witnesses), so
+        // the handshake set would never drop it.
+        if let Some(SystemOp::Evict { node }) = ev.system.as_ref() {
+            required.remove(node);
+        }
         required.is_subset(&self.witnessing_authors(target))
     }
 
@@ -351,28 +403,22 @@ impl Dag {
             .into_iter()
             .filter(|h| self.is_finalized(h))
             .filter(|h| {
-                self.events
-                    .get(h)
-                    .is_some_and(|e| e.payload.is_empty() || delivered.contains(h))
+                // Retain membership (system) events forever so the member set is
+                // always derivable from signed history; prune only heartbeats and
+                // already-delivered payloads.
+                self.events.get(h).is_some_and(|e| {
+                    e.system.is_none() && (e.payload.is_empty() || delivered.contains(h))
+                })
             })
             .collect();
         if prunable.is_empty() {
             return Vec::new();
         }
 
-        // Fold pruned membership ops into the derivation base (canonical order),
-        // so members_at above the watermark stays correct without them.
-        for h in self.topo_sort(&prunable) {
-            match self.events.get(&h).and_then(|e| e.system.as_ref()) {
-                Some(SystemOp::Introduce { node }) => {
-                    self.base_members.insert(*node);
-                }
-                Some(SystemOp::Depart { node }) => {
-                    self.base_members.remove(node);
-                }
-                None => {}
-            }
-        }
+        // Membership (system) events are NOT pruned (see the filter above), so
+        // `base_members` stays the genesis set and the full membership history —
+        // including Evict votes — remains derivable from retained signed events.
+        // No fold-into-base is needed.
 
         // Drop the events; clean their entries out of the reverse index.
         for h in &prunable {
@@ -404,32 +450,24 @@ impl Dag {
         self.sealed = sealed;
     }
 
-    /// Install a peer's checkpoint iff we're behind its pruned watermark — it
-    /// sealed an event we neither hold nor already seal. Adopts its
-    /// `base_members` + boundary anchors, drops any now-sealed events we still
-    /// hold, and re-drives buffered events waiting on the newly-sealed hashes.
-    /// A no-op once we're caught up (the `members_at` invariant keeps peers
-    /// consistent without adopting, so pruning stays a local decision).
-    pub fn install_checkpoint(&mut self, base_members: BTreeSet<PubKey>, sealed: BTreeSet<Hash>) {
-        let behind = sealed
-            .iter()
-            .any(|h| !self.events.contains_key(h) && !self.sealed.contains(h));
-        if !behind {
-            return;
-        }
-        self.base_members = base_members;
-        let newly: Vec<Hash> = sealed.difference(&self.sealed).copied().collect();
-        self.sealed.extend(sealed);
-        for h in &newly {
-            self.events.remove(h);
-            self.observed_by.remove(h);
-        }
-        for h in &newly {
-            if let Some(waiters) = self.pending.remove(h) {
-                for w in waiters {
-                    let _ = self.ingest(w);
+
+    /// Mark WANTed-but-pruned hashes as sealed anchors — a peer vouches (from its
+    /// own pruning) that they're pruned-and-settled — then re-drive buffered
+    /// events waiting on them. Replaces bulk checkpoint adoption: sealed info flows
+    /// on-demand, per hash, derived from each peer's own history. Safe because a
+    /// pruned event is never a membership op (those are retained), so sealing it
+    /// can't change the member set.
+    pub fn mark_sealed(&mut self, hashes: &[Hash]) {
+        let mut redrive = Vec::new();
+        for h in hashes {
+            if !self.events.contains_key(h) && self.sealed.insert(*h) {
+                if let Some(waiters) = self.pending.remove(h) {
+                    redrive.extend(waiters);
                 }
             }
+        }
+        for ev in redrive {
+            let _ = self.ingest(ev);
         }
     }
 
@@ -496,11 +534,11 @@ mod tests {
     }
 
     fn ev(sk: &SigningKey, sp: Option<Hash>, refs: Vec<Hash>, payload: Vec<u8>) -> Event {
-        Event::sign(sk, sp, refs, payload, None)
+        Event::sign(sk, 0, sp, refs, payload, None)
     }
 
     fn sys(sk: &SigningKey, sp: Option<Hash>, refs: Vec<Hash>, op: SystemOp) -> Event {
-        Event::sign(sk, sp, refs, Vec::new(), Some(op))
+        Event::sign(sk, 0, sp, refs, Vec::new(), Some(op))
     }
 
     #[test]
@@ -719,6 +757,86 @@ mod tests {
         assert!(dag.ingest(bad).is_err());
     }
 
+    #[test]
+    fn evict_rejects_self_authored() {
+        let a = key(1);
+        let b = key(2);
+        let mut dag = Dag::new(members(&[&a, &b]));
+        let ga = ev(&a, None, Vec::new(), Vec::new());
+        let gb = ev(&b, None, Vec::new(), Vec::new());
+        let (gah, gbh) = (ga.event_hash(), gb.event_hash());
+        dag.ingest(ga).unwrap();
+        dag.ingest(gb).unwrap();
+        // A can't vote to evict itself.
+        let bad = sys(&a, Some(gah), alloc::vec![gbh], SystemOp::Evict { node: pk(&a) });
+        assert!(dag.ingest(bad).is_err());
+    }
+
+    #[test]
+    fn evict_impossible_at_two_members() {
+        // A 2-member mesh can't evict: a majority (2) is unreachable when one is the
+        // evictee, so the sole survivor's vote never removes it (the N=2 case).
+        let a = key(1);
+        let b = key(2);
+        let mut dag = Dag::new(members(&[&a, &b]));
+        let ga = ev(&a, None, Vec::new(), Vec::new());
+        let gb = ev(&b, None, Vec::new(), Vec::new());
+        let (gah, gbh) = (ga.event_hash(), gb.event_hash());
+        dag.ingest(ga).unwrap();
+        dag.ingest(gb).unwrap();
+        let ea = sys(&a, Some(gah), alloc::vec![gbh], SystemOp::Evict { node: pk(&b) });
+        dag.ingest(ea).unwrap();
+        assert!(dag.consensus_members().contains(&pk(&b)), "no majority at N=2 — b stays");
+    }
+
+    #[test]
+    fn evict_below_majority_keeps_member() {
+        // 3 members, one vote (< majority of 2) — the target stays.
+        let (a, b, c) = (key(1), key(2), key(3));
+        let mut dag = Dag::new(members(&[&a, &b, &c]));
+        let ga = ev(&a, None, Vec::new(), Vec::new());
+        let gb = ev(&b, None, Vec::new(), Vec::new());
+        let gc = ev(&c, None, Vec::new(), Vec::new());
+        let (gah, gbh, gch) = (ga.event_hash(), gb.event_hash(), gc.event_hash());
+        dag.ingest(ga).unwrap();
+        dag.ingest(gb).unwrap();
+        dag.ingest(gc).unwrap();
+        let ea = sys(&a, Some(gah), alloc::vec![gbh, gch], SystemOp::Evict { node: pk(&c) });
+        dag.ingest(ea).unwrap();
+        assert!(dag.consensus_members().contains(&pk(&c)), "one vote < majority — c stays");
+    }
+
+    #[test]
+    fn evict_by_majority_removes_member() {
+        // 3 members: a + b vote to evict c (majority of 3 = 2). The votes finalize
+        // among {a, b} (c needn't witness its own removal), and c is dropped.
+        let (a, b, c) = (key(1), key(2), key(3));
+        let mut dag = Dag::new(members(&[&a, &b, &c]));
+        let ga = ev(&a, None, Vec::new(), Vec::new());
+        let gb = ev(&b, None, Vec::new(), Vec::new());
+        let gc = ev(&c, None, Vec::new(), Vec::new());
+        let (gah, gbh, gch) = (ga.event_hash(), gb.event_hash(), gc.event_hash());
+        dag.ingest(ga).unwrap();
+        dag.ingest(gb).unwrap();
+        dag.ingest(gc).unwrap();
+
+        let ea = sys(&a, Some(gah), alloc::vec![gbh, gch], SystemOp::Evict { node: pk(&c) });
+        let eah = ea.event_hash();
+        dag.ingest(ea).unwrap();
+        let eb = sys(&b, Some(gbh), alloc::vec![eah, gch], SystemOp::Evict { node: pk(&c) });
+        let ebh = eb.event_hash();
+        dag.ingest(eb).unwrap();
+        // a witnesses b's vote so both evicts finalize among {a, b}.
+        let a2 = ev(&a, Some(eah), alloc::vec![ebh], Vec::new());
+        dag.ingest(a2).unwrap();
+
+        assert!(dag.is_finalized(&eah), "a's evict finalizes without c");
+        assert!(dag.is_finalized(&ebh), "b's evict finalizes without c");
+        let m = dag.consensus_members();
+        assert!(!m.contains(&pk(&c)), "c evicted by majority (2 of 3)");
+        assert!(m.contains(&pk(&a)) && m.contains(&pk(&b)));
+    }
+
     // ----- pruning -----
 
     #[test]
@@ -760,7 +878,7 @@ mod tests {
     }
 
     #[test]
-    fn compact_folds_pruned_membership_into_base() {
+    fn compact_retains_membership_events() {
         let a = key(1);
         let b = key(2);
         let n = key(7);
@@ -787,15 +905,17 @@ mod tests {
         dag.ingest(b2).unwrap();
 
         let pruned = dag.compact(&BTreeSet::new());
-        assert!(pruned.contains(&ih), "the introduce should be pruned");
-        assert!(!dag.has(&ih));
-        // N is still a member — the pruned Introduce was folded into base_members.
-        assert!(dag.base_members.contains(&pk(&n)));
-        assert!(dag.consensus_members().contains(&pk(&n)));
+        // Membership events are RETAINED (not pruned or folded) — the member set
+        // stays derivable from signed history; base_members stays the genesis set.
+        assert!(!pruned.contains(&ih), "the Introduce is retained");
+        assert!(dag.has(&ih));
+        assert!(!dag.base_members.contains(&pk(&n)), "base_members stays the genesis set");
+        assert!(dag.consensus_members().contains(&pk(&n)), "N still derived as a member");
+        assert!(!pruned.is_empty(), "non-system events below the frontier are pruned");
     }
 
     #[test]
-    fn install_checkpoint_lets_a_behind_node_bootstrap_past_the_watermark() {
+    fn mark_sealed_lets_a_behind_node_bootstrap_past_the_watermark() {
         // A builds history admitting N, then prunes it into a checkpoint.
         let a = key(1);
         let b = key(2);
@@ -819,28 +939,24 @@ mod tests {
         src.ingest(b2.clone()).unwrap();
 
         src.compact(&BTreeSet::new());
-        assert!(!src.has(&ih) && !src.sealed.is_empty());
+        // The Introduce is retained; pruned non-system deps become sealed anchors.
+        assert!(src.has(&ih), "membership events survive compaction");
+        assert!(!src.sealed.is_empty(), "pruned non-system deps become sealed anchors");
 
-        // A fresh node installs the checkpoint, then syncs the retained events
-        // (whose deps are now sealed anchors) exactly as it would from a peer.
-        let retained: Vec<Event> =
-            src.events.values().cloned().collect(); // what a peer would DELIVER
+        // A fresh node (genesis members from config) syncs the retained events; for
+        // the pruned boundary deps a peer answers its WANT with a SEALED marker →
+        // mark_sealed. No bulk checkpoint, no transferred base_members.
+        let retained: Vec<Event> = src.events.values().cloned().collect();
+        let sealed: Vec<Hash> = src.sealed.iter().copied().collect();
         let mut joiner = Dag::new(members(&[&a, &b]));
-        joiner.install_checkpoint(src.base_members.clone(), src.sealed.clone());
-        assert!(joiner.base_members.contains(&pk(&n)), "adopted the admitted member");
-        // Feed them in any order; missing deps re-drive as their siblings land.
         for ev in &retained {
-            let _ = joiner.ingest(ev.clone());
+            let _ = joiner.ingest(ev.clone()); // some buffer on the pruned boundary
         }
+        joiner.mark_sealed(&sealed); // peer vouches the boundary deps are pruned
         for ev in &retained {
-            let _ = joiner.ingest(ev.clone());
+            let _ = joiner.ingest(ev.clone()); // re-drive now that the boundary is sealed
         }
         assert!(joiner.has(&a2h), "retained events reconstructed past the watermark");
-        assert!(joiner.consensus_members().contains(&pk(&n)));
-
-        // Idempotent: installing again when caught up is a no-op.
-        let before = joiner.base_members.clone();
-        joiner.install_checkpoint(src.base_members.clone(), src.sealed.clone());
-        assert_eq!(joiner.base_members, before);
+        assert!(joiner.consensus_members().contains(&pk(&n)), "N derived from the retained Introduce");
     }
 }

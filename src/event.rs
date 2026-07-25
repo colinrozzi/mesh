@@ -11,6 +11,7 @@
 //! machines and language ports):
 //!
 //!   author:       32 bytes (ed25519 verifying key)
+//!   timestamp:    8 bytes (u64 BE, ms since epoch, author's wall clock)
 //!   self_parent:  1 tag byte (0 = none, 1 = present) + 32 bytes iff present
 //!   refs:         u16 count (BE) + count * 32 bytes
 //!   payload:      u32 len (BE) + len bytes
@@ -35,12 +36,20 @@ pub enum SystemOp {
     Introduce { node: PubKey },
     /// Remove `node` from the member set (self-announced).
     Depart { node: PubKey },
+    /// A *vote* by the author to evict `node` (a peer observed stale). `node`
+    /// leaves once a majority of the current member set has voted (2f+1 quorum);
+    /// see dag.rs. Author must be a member other than `node`.
+    Evict { node: PubKey },
 }
 
 #[derive(Clone, Debug)]
 pub struct Event {
     /// The member node that signed this event.
     pub author: PubKey,
+    /// Author's wall-clock time (ms since epoch) when it signed this event.
+    /// Carried for ordering / reference; the eviction *staleness* check uses
+    /// observer-local receipt time, not this self-reported stamp.
+    pub timestamp: u64,
     /// This author's previous event. `None` only for the author's genesis.
     /// Not required to be unique — an author that forks is admitted as
     /// concurrent siblings (see DESIGN.md / dag.rs).
@@ -60,28 +69,31 @@ impl Event {
     /// Build and sign an event with `signing_key`.
     pub fn sign(
         signing_key: &SigningKey,
+        timestamp: u64,
         self_parent: Option<Hash>,
         refs: Vec<Hash>,
         payload: Vec<u8>,
         system: Option<SystemOp>,
     ) -> Event {
         let author = signing_key.verifying_key().to_bytes();
-        let signing_hash = Self::signing_hash(&author, &self_parent, &refs, &payload, &system);
+        let signing_hash =
+            Self::signing_hash(&author, timestamp, &self_parent, &refs, &payload, &system);
         let signature = signing_key.sign(&signing_hash).to_bytes();
-        Event { author, self_parent, refs, payload, system, signature }
+        Event { author, timestamp, self_parent, refs, payload, system, signature }
     }
 
     /// The hash that gets signed: sha256 over the canonical encoding minus the
     /// signature. Static so a builder can compute it before signing.
     pub fn signing_hash(
         author: &PubKey,
+        timestamp: u64,
         self_parent: &Option<Hash>,
         refs: &[Hash],
         payload: &[u8],
         system: &Option<SystemOp>,
     ) -> Hash {
-        let mut buf = Vec::with_capacity(32 + 33 + 2 + refs.len() * 32 + 4 + payload.len() + 33);
-        encode_unsigned(author, self_parent, refs, payload, system, &mut buf);
+        let mut buf = Vec::with_capacity(32 + 8 + 33 + 2 + refs.len() * 32 + 4 + payload.len() + 33);
+        encode_unsigned(author, timestamp, self_parent, refs, payload, system, &mut buf);
         sha256(&buf)
     }
 
@@ -92,17 +104,32 @@ impl Event {
     }
 
     pub fn verify_signature(&self) -> Result<(), String> {
-        let hash =
-            Self::signing_hash(&self.author, &self.self_parent, &self.refs, &self.payload, &self.system);
+        let hash = Self::signing_hash(
+            &self.author,
+            self.timestamp,
+            &self.self_parent,
+            &self.refs,
+            &self.payload,
+            &self.system,
+        );
         let vk = VerifyingKey::from_bytes(&self.author).map_err(|e| format!("bad pubkey: {}", e))?;
         let sig = Signature::from_bytes(&self.signature);
         vk.verify(&hash, &sig).map_err(|e| format!("signature: {}", e))
     }
 
     pub fn encode(&self) -> Vec<u8> {
-        let mut out =
-            Vec::with_capacity(32 + 33 + 2 + self.refs.len() * 32 + 4 + self.payload.len() + 33 + 64);
-        encode_unsigned(&self.author, &self.self_parent, &self.refs, &self.payload, &self.system, &mut out);
+        let mut out = Vec::with_capacity(
+            32 + 8 + 33 + 2 + self.refs.len() * 32 + 4 + self.payload.len() + 33 + 64,
+        );
+        encode_unsigned(
+            &self.author,
+            self.timestamp,
+            &self.self_parent,
+            &self.refs,
+            &self.payload,
+            &self.system,
+            &mut out,
+        );
         out.extend_from_slice(&self.signature);
         out
     }
@@ -110,6 +137,7 @@ impl Event {
     pub fn decode(buf: &[u8]) -> Result<Self, String> {
         let mut cur = Cursor::new(buf);
         let author = cur.take_array::<32>()?;
+        let timestamp = cur.take_u64()?;
         let self_parent = match cur.take(1)?[0] {
             0 => None,
             1 => Some(cur.take_array::<32>()?),
@@ -126,15 +154,17 @@ impl Event {
             0 => None,
             1 => Some(SystemOp::Introduce { node: cur.take_array::<32>()? }),
             2 => Some(SystemOp::Depart { node: cur.take_array::<32>()? }),
+            3 => Some(SystemOp::Evict { node: cur.take_array::<32>()? }),
             t => return Err(format!("bad system tag: {}", t)),
         };
         let signature = cur.take_array::<64>()?;
-        Ok(Event { author, self_parent, refs, payload, system, signature })
+        Ok(Event { author, timestamp, self_parent, refs, payload, system, signature })
     }
 }
 
 fn encode_unsigned(
     author: &PubKey,
+    timestamp: u64,
     self_parent: &Option<Hash>,
     refs: &[Hash],
     payload: &[u8],
@@ -142,6 +172,7 @@ fn encode_unsigned(
     out: &mut Vec<u8>,
 ) {
     out.extend_from_slice(author);
+    out.extend_from_slice(&timestamp.to_be_bytes());
     match self_parent {
         None => out.push(0),
         Some(h) => {
@@ -163,6 +194,10 @@ fn encode_unsigned(
         }
         Some(SystemOp::Depart { node }) => {
             out.push(2);
+            out.extend_from_slice(node);
+        }
+        Some(SystemOp::Evict { node }) => {
+            out.push(3);
             out.extend_from_slice(node);
         }
     }
@@ -216,6 +251,11 @@ impl<'a> Cursor<'a> {
         let b = self.take(4)?;
         Ok(u32::from_be_bytes([b[0], b[1], b[2], b[3]]) as usize)
     }
+
+    fn take_u64(&mut self) -> Result<u64, String> {
+        let b = self.take(8)?;
+        Ok(u64::from_be_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]))
+    }
 }
 
 #[cfg(test)]
@@ -228,12 +268,12 @@ mod tests {
 
     fn samples(sk: &SigningKey) -> Vec<Event> {
         alloc::vec![
-            Event::sign(sk, None, Vec::new(), Vec::new(), None), // genesis
-            Event::sign(sk, Some([1u8; 32]), Vec::new(), Vec::new(), None), // plain append
-            Event::sign(sk, Some([1u8; 32]), alloc::vec![[2u8; 32]], Vec::new(), None), // graft
-            Event::sign(sk, Some([1u8; 32]), alloc::vec![[2u8; 32]], b"hi".to_vec(), None), // graft+payload
-            Event::sign(sk, Some([1u8; 32]), Vec::new(), Vec::new(), Some(SystemOp::Introduce { node: [7u8; 32] })),
-            Event::sign(sk, Some([1u8; 32]), Vec::new(), Vec::new(), Some(SystemOp::Depart { node: [8u8; 32] })),
+            Event::sign(sk, 1000, None, Vec::new(), Vec::new(), None), // genesis
+            Event::sign(sk, 1001, Some([1u8; 32]), Vec::new(), Vec::new(), None), // plain append
+            Event::sign(sk, 1002, Some([1u8; 32]), alloc::vec![[2u8; 32]], Vec::new(), None), // graft
+            Event::sign(sk, 1003, Some([1u8; 32]), alloc::vec![[2u8; 32]], b"hi".to_vec(), None), // graft+payload
+            Event::sign(sk, 1004, Some([1u8; 32]), Vec::new(), Vec::new(), Some(SystemOp::Introduce { node: [7u8; 32] })),
+            Event::sign(sk, 1005, Some([1u8; 32]), Vec::new(), Vec::new(), Some(SystemOp::Depart { node: [8u8; 32] })),
         ]
     }
 
@@ -245,11 +285,22 @@ mod tests {
             let decoded = Event::decode(&bytes).expect("decode");
             assert_eq!(decoded.encode(), bytes, "re-encode must reproduce bytes");
             decoded.verify_signature().expect("signature verifies");
+            assert_eq!(decoded.timestamp, ev.timestamp);
             assert_eq!(decoded.self_parent, ev.self_parent);
             assert_eq!(decoded.refs, ev.refs);
             assert_eq!(decoded.payload, ev.payload);
             assert_eq!(decoded.system, ev.system);
         }
+    }
+
+    #[test]
+    fn signature_covers_the_timestamp() {
+        // The timestamp is signed — tampering with it must invalidate the event,
+        // so a node can't be made to look fresh/stale by rewriting its clock field.
+        let sk = key(1);
+        let mut ev = Event::sign(&sk, 5000, Some([1u8; 32]), Vec::new(), Vec::new(), None);
+        ev.timestamp = 9999;
+        assert!(ev.verify_signature().is_err());
     }
 
     #[test]
@@ -259,6 +310,7 @@ mod tests {
         let sk = key(1);
         let mut ev = Event::sign(
             &sk,
+            1000,
             Some([1u8; 32]),
             Vec::new(),
             Vec::new(),
@@ -273,6 +325,7 @@ mod tests {
         let sk = key(1);
         let ev = Event::sign(
             &sk,
+            1000,
             Some([1u8; 32]),
             alloc::vec![[2u8; 32]],
             b"abc".to_vec(),
@@ -288,17 +341,17 @@ mod tests {
     #[test]
     fn decode_rejects_bad_tags() {
         let sk = key(1);
-        let bytes = Event::sign(&sk, None, Vec::new(), Vec::new(), None).encode();
-        // self_parent tag at offset 32.
+        let bytes = Event::sign(&sk, 1000, None, Vec::new(), Vec::new(), None).encode();
+        // self_parent tag at offset 40 (author[32] + timestamp[8]).
         let mut bad_sp = bytes.clone();
-        bad_sp[32] = 7;
+        bad_sp[40] = 7;
         assert!(Event::decode(&bad_sp).is_err());
     }
 
     #[test]
     fn tampered_payload_fails_verification() {
         let sk = key(1);
-        let mut ev = Event::sign(&sk, Some([1u8; 32]), Vec::new(), b"x".to_vec(), None);
+        let mut ev = Event::sign(&sk, 1000, Some([1u8; 32]), Vec::new(), b"x".to_vec(), None);
         ev.payload[0] ^= 0xff;
         assert!(ev.verify_signature().is_err());
     }
@@ -306,8 +359,8 @@ mod tests {
     #[test]
     fn event_hash_is_stable_and_distinct() {
         let sk = key(1);
-        let a = Event::sign(&sk, Some([1u8; 32]), Vec::new(), b"a".to_vec(), None);
-        let b = Event::sign(&sk, Some([1u8; 32]), Vec::new(), b"b".to_vec(), None);
+        let a = Event::sign(&sk, 1000, Some([1u8; 32]), Vec::new(), b"a".to_vec(), None);
+        let b = Event::sign(&sk, 1000, Some([1u8; 32]), Vec::new(), b"b".to_vec(), None);
         assert_eq!(a.event_hash(), a.event_hash());
         assert_ne!(a.event_hash(), b.event_hash());
     }

@@ -99,9 +99,13 @@ fn main() {
     let deadline = Duration::from_secs(40);
     let start = Instant::now();
     let (mut a_got_b, mut b_got_a) = (false, false);
-    while start.elapsed() < deadline && !(a_got_b && b_got_a) {
+    let (mut a_ready, mut b_ready) = (false, false);
+    while start.elapsed() < deadline && !(a_got_b && b_got_a && a_ready && b_ready) {
         a_got_b = a_got_b || log_contains("/tmp/mesh-app-a.log", "hello from B");
         b_got_a = b_got_a || log_contains("/tmp/mesh-app-b.log", "hello from A");
+        // The node signals READY (admitted + synced) to its app — the sync-ready signal.
+        a_ready = a_ready || log_contains("/tmp/mesh-app-a.log", "READY");
+        b_ready = b_ready || log_contains("/tmp/mesh-app-b.log", "READY");
         std::thread::sleep(Duration::from_millis(200));
     }
 
@@ -110,12 +114,12 @@ fn main() {
         let _ = c.wait();
     }
 
-    if a_got_b && b_got_a {
-        println!("\nAPP TEST PASSED — apps exchanged messages over the substrate");
+    if a_got_b && b_got_a && a_ready && b_ready {
+        println!("\nAPP TEST PASSED — apps got the READY signal and exchanged messages");
         std::process::exit(0);
     }
     eprintln!(
-        "\nAPP TEST FAILED — a_got_b={a_got_b} b_got_a={b_got_a}\n(if get-self is not yet in theater, apps cannot self-register — this is expected)"
+        "\nAPP TEST FAILED — a_got_b={a_got_b} b_got_a={b_got_a} a_ready={a_ready} b_ready={b_ready}\n(if get-self is not yet in theater, apps cannot self-register — this is expected)"
     );
     std::process::exit(1);
 }

@@ -252,7 +252,9 @@ mesh/
 ├── testkit/            # shared integration-test client + spawn harness
 ├── smoke/              # single-node end-to-end test
 ├── multi-node-test/    # two-node integration test
-└── membership-test/    # dynamic introduce/depart test
+├── membership-test/    # dynamic introduce/depart test
+├── join-test/          # self-serve join (join_allow + auto-introduce)
+└── evict-test/         # quorum eviction of a crashed member
 ```
 
 ## Status
@@ -274,6 +276,16 @@ message-server addressability).
 0.12 component — an actor `packr compose`s it in instead of vendoring the
 protocol (see *Using mesh from an actor*). Built + proven end-to-end
 (`compose-smoke`); the mesh interface + the opt-in `mesh-control` envelope.
+
+**In progress — v0.3 (ephemeral membership; see `DESIGN-ephemeral-membership.md`
++ `DESIGN-retention.md`):** signed event timestamps; **self-serve join**
+(`join_allow` + auto-introduce, so a node joins without an out-of-band introduce —
+`join-test`); a **heartbeat pump** (members author noop events so the frontier keeps
+advancing → per-member liveness + continuous compaction); a **sync-ready** signal
+(the node tells the app when it's admitted+synced); **quorum eviction** (a stale
+member is voted out by a majority — 2f+1 — and at N=2 the node shuts down instead;
+`evict-test`); and **retention** that keeps only net membership history + trims
+payloads. Breaking event/delivery-format change → lands as mesh v0.3.
 
 **Near-term** (see `DESIGN.md`): incremental finality/delivery (currently
 re-scans the retained DAG each callback), batched emission (currently

@@ -33,7 +33,7 @@ use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 
-pub use mesh_api::{Hash, PubKey};
+pub use mesh_api::{Hash, Incoming, PubKey};
 
 /// The shape of the host `message-server-host.request` import: send `msg` to the
 /// actor `node` and get its reply. Pass your bound import directly.
@@ -63,8 +63,16 @@ pub fn register<F: Request>(request: F, node: &str, app_id: &str) -> Result<(), 
     request(node.into(), mesh_api::encode_register(app_id)).map(|_| ())
 }
 
+/// Decode a message received in `handle-send` into [`Incoming`] — either a
+/// `Ready` signal (the node is admitted + synced, act now) or a committed
+/// `Delivery{from, body}`. `None` if malformed. Prefer this over [`delivery`].
+pub fn incoming(msg: &[u8]) -> Option<Incoming> {
+    mesh_api::decode_incoming(msg)
+}
+
 /// Decode a delivery received in `handle-send` into `(from, body)` — the
-/// committed payload and its author. `None` if the message isn't a delivery.
+/// committed payload and its author. `None` if the message isn't a delivery
+/// (e.g. a `Ready` signal — use [`incoming`] to see those).
 pub fn delivery(msg: &[u8]) -> Option<(PubKey, Vec<u8>)> {
     mesh_api::decode_delivery(msg)
 }

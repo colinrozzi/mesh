@@ -34,7 +34,7 @@ pub const FRAME_INTRODUCE: u8 = 0x12; // author Introduce{pubkey} — admit a me
 pub const FRAME_DEPART: u8 = 0x13; // author Depart{self} — leave the network
 pub const FRAME_FRONTIER: u8 = 0x20;
 pub const FRAME_WANT: u8 = 0x21;
-pub const FRAME_CHECKPOINT: u8 = 0x22; // base members + sealed anchors (pruning)
+pub const FRAME_SEALED: u8 = 0x23; // hash-list — "these WANTed hashes are pruned/sealed"
 
 // node → client/dialer
 pub const FRAME_CHALLENGE: u8 = 0x80;
@@ -111,48 +111,6 @@ pub fn encode_hashes(kind: u8, hashes: &[Hash]) -> Vec<u8> {
     encode_frame(kind, &payload)
 }
 
-/// Encode a CHECKPOINT: base members (pubkeys) followed by sealed anchors
-/// (hashes), each a u16-count-prefixed list of 32-byte items.
-pub fn encode_checkpoint(members: &[PubKey], sealed: &[Hash]) -> Vec<u8> {
-    let mut payload = Vec::with_capacity(4 + (members.len() + sealed.len()) * 32);
-    payload.extend_from_slice(&(members.len() as u16).to_be_bytes());
-    for m in members {
-        payload.extend_from_slice(m);
-    }
-    payload.extend_from_slice(&(sealed.len() as u16).to_be_bytes());
-    for s in sealed {
-        payload.extend_from_slice(s);
-    }
-    encode_frame(FRAME_CHECKPOINT, &payload)
-}
-
-/// Decode a CHECKPOINT into `(base_members, sealed)`.
-pub fn decode_checkpoint(payload: &[u8]) -> (Vec<PubKey>, Vec<Hash>) {
-    let mut pos = 0;
-    let members = take_list(payload, &mut pos);
-    let sealed = take_list(payload, &mut pos);
-    (members, sealed)
-}
-
-/// Read a u16-count-prefixed list of 32-byte items, advancing `pos`.
-fn take_list(payload: &[u8], pos: &mut usize) -> Vec<[u8; 32]> {
-    if *pos + 2 > payload.len() {
-        return Vec::new();
-    }
-    let n = u16::from_be_bytes([payload[*pos], payload[*pos + 1]]) as usize;
-    *pos += 2;
-    let mut out = Vec::with_capacity(n);
-    for _ in 0..n {
-        if *pos + 32 > payload.len() {
-            break;
-        }
-        let mut item = [0u8; 32];
-        item.copy_from_slice(&payload[*pos..*pos + 32]);
-        *pos += 32;
-        out.push(item);
-    }
-    out
-}
 
 pub fn decode_hashes(payload: &[u8]) -> Vec<Hash> {
     if payload.len() < 2 {

@@ -32,6 +32,7 @@ packr_guest::pack_types! {
             depart: func(node: string) -> result<list<u8>, string>,
             register: func(node: string, app-id: string) -> result<bool, string>,
             delivery: func(msg: list<u8>) -> option<tuple<list<u8>, list<u8>>>,
+            is-ready: func(msg: list<u8>) -> bool,
             node-config: func(seed: string, listen: string, members: list<string>, dial: list<tuple<string, string>>) -> string,
         }
         // Full mesh-control interface declared for the hash; we bind only the two

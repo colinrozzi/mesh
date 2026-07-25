@@ -180,7 +180,7 @@ mod tests {
         let members = BTreeSet::from([apk]);
         let mut dag = Dag::new(members.clone());
 
-        let g = Event::sign(&a, None, Vec::new(), b"hi".to_vec(), None);
+        let g = Event::sign(&a, 0, None, Vec::new(), b"hi".to_vec(), None);
         let h = g.event_hash();
         dag.ingest(g).unwrap();
 
@@ -198,8 +198,9 @@ mod tests {
         let b = SigningKey::from_bytes(&[2u8; 32]);
         let members = BTreeSet::from([a.verifying_key().to_bytes(), b.verifying_key().to_bytes()]);
 
-        let sign =
-            |sk: &SigningKey, sp: Option<Hash>, refs: Vec<Hash>| Event::sign(sk, sp, refs, Vec::new(), None);
+        let sign = |sk: &SigningKey, sp: Option<Hash>, refs: Vec<Hash>| {
+            Event::sign(sk, 0, sp, refs, Vec::new(), None)
+        };
 
         let mut dag = Dag::new(members.clone());
         let ga = sign(&a, None, Vec::new());

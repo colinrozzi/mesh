@@ -45,10 +45,10 @@ use conn::{ConnState, Phase};
 use dag::Dag;
 use event::{Event, Hash, PubKey, SystemOp};
 use wire::{
-    decode_checkpoint, decode_hashes, encode_ack, encode_auth, encode_challenge, encode_checkpoint,
-    encode_deliver, encode_hashes, encode_hello, encode_notify, encode_rejected, try_parse_frame,
-    ParsedFrame, FRAME_ACCEPTED, FRAME_AUTH, FRAME_CHALLENGE, FRAME_CHECKPOINT, FRAME_DELIVER,
-    FRAME_DEPART, FRAME_FRONTIER, FRAME_HELLO, FRAME_INTRODUCE, FRAME_SUBMIT, FRAME_WANT,
+    decode_hashes, encode_ack, encode_auth, encode_challenge, encode_deliver, encode_hashes,
+    encode_hello, encode_notify, encode_rejected, try_parse_frame, ParsedFrame, FRAME_ACCEPTED,
+    FRAME_AUTH, FRAME_CHALLENGE, FRAME_DELIVER, FRAME_DEPART, FRAME_FRONTIER, FRAME_HELLO,
+    FRAME_INTRODUCE, FRAME_SEALED, FRAME_SUBMIT, FRAME_WANT,
 };
 
 #[derive(Clone, GraphValue)]
@@ -60,6 +60,8 @@ pub struct ActorState {
     pub signing_key_hex: String,
     /// The static, configured member set, JSON `[pubkey_hex, ...]`.
     pub members_json: String,
+    /// Pubkeys (hex) permitted to self-join (JSON array). See `InitConfig.join_allow`.
+    pub join_allow_json: String,
     /// This node's own chain head (hex event hash).
     pub self_head_hex: String,
     /// Persisted DAG (admitted events).
@@ -72,6 +74,15 @@ pub struct ActorState {
     /// The co-located app actor's id (theater actor-id) to `send` committed
     /// payloads to, set by a Register command. Empty = no app subscribed.
     pub app_id: String,
+    /// True once the one-shot Ready signal has been sent to the app (we became a
+    /// finalized member with an app subscribed). Prevents re-emitting it.
+    pub ready_sent: bool,
+    /// Per-member liveness: `{pubkey_hex: last_ms}` — our local clock when we last
+    /// admitted a new event authored by that member. Drives stale detection for
+    /// eviction. Observer-local (never the peer's self-stamped time).
+    pub last_heard_json: String,
+    /// A member silent for this long (ms) is voted out / triggers N=2 shutdown.
+    pub evict_timeout_ms: u64,
 }
 
 pack_types! {
@@ -135,6 +146,10 @@ fn message_server_send(actor_id: String, msg: Vec<u8>) -> Result<(), String>;
 const LISTEN_ADDR: &str = "127.0.0.1:9447";
 const HEARTBEAT_TIMER: &str = "heartbeat";
 const DEFAULT_INTERVAL_MS: u64 = 2000;
+/// A member we haven't heard a new event from in this long is stale → vote to
+/// evict it (or, at N=2 where no quorum is possible, shut down). Generous so a
+/// slow/reconnecting member isn't wrongly flagged (heartbeats are ~2s).
+const EVICT_TIMEOUT_MS: u64 = 20_000;
 
 // ---- init ----
 
@@ -145,6 +160,12 @@ struct InitConfig {
     /// static member set. Membership is independent of who we dial.
     #[serde(default)]
     members: Vec<String>,
+    /// Pubkeys (hex) permitted to SELF-JOIN. A node presenting one of these
+    /// completes the handshake even if it isn't yet a member, and the dialed node
+    /// auto-authors an `Introduce` for it. Distinct from `members` (the *current*
+    /// set) — this is the stable allow-list of *who may join*.
+    #[serde(default)]
+    join_allow: Vec<String>,
     /// Peers to outbound-connect to on init: pubkey + address. Must be a subset
     /// of `members`.
     #[serde(default)]
@@ -153,6 +174,10 @@ struct InitConfig {
     listen_addr: Option<String>,
     #[serde(default)]
     heartbeat_ms: Option<u64>,
+    /// A member silent for this long is voted out (or, at N=2, triggers shutdown).
+    /// Defaults to `EVICT_TIMEOUT_MS`.
+    #[serde(default)]
+    evict_timeout_ms: Option<u64>,
 }
 
 #[derive(serde::Deserialize)]
@@ -171,6 +196,7 @@ fn init(state: Value) -> Result<(ActorState, ()), String> {
         _ => return Err("missing init_state (need {\"node_seed\":\"...\"})".to_string()),
     };
     let heartbeat_ms = cfg.heartbeat_ms.unwrap_or(DEFAULT_INTERVAL_MS);
+    let evict_timeout_ms = cfg.evict_timeout_ms.unwrap_or(EVICT_TIMEOUT_MS);
     let listen_addr = cfg.listen_addr.clone().unwrap_or_else(|| LISTEN_ADDR.to_string());
 
     let mut h = Sha256::new();
@@ -191,6 +217,13 @@ fn init(state: Value) -> Result<(ActorState, ()), String> {
         members.insert(self_pubkey);
     }
     let is_bootstrap = members.contains(&self_pubkey);
+
+    // Stable allow-list of pubkeys permitted to self-join (distinct from the
+    // current member set).
+    let mut join_allow = members_from_json("[]");
+    for m in &cfg.join_allow {
+        join_allow.insert(from_hex32(m)?);
+    }
 
     let mut dag = Dag::new(members.clone());
     // Bootstrap members author a genesis at init; a joining node has no chain
@@ -241,12 +274,16 @@ fn init(state: Value) -> Result<(ActorState, ()), String> {
             listen_addr,
             signing_key_hex: hex(&key_bytes),
             members_json: members_to_json(&members),
+            join_allow_json: members_to_json(&join_allow),
             self_head_hex: self_head.map(|h| hex(&h)).unwrap_or_default(),
             dag_json: dag_to_json(&dag),
             pending_json: "[]".to_string(),
             delivered_json: "[]".to_string(),
             connections_json: connections_to_json(&conns),
             app_id: String::new(),
+            ready_sent: false,
+            last_heard_json: "{}".to_string(),
+            evict_timeout_ms,
         },
         (),
     ))
@@ -335,10 +372,14 @@ fn handle_connection(state: ActorState, conn_id: String) -> Result<(ActorState, 
 #[export(name = "theater:simple/tcp-client.on-data")]
 fn on_data(state: ActorState, conn_id: String, data: Vec<u8>) -> Result<(ActorState, ()), String> {
     let signing_key = SigningKey::from_bytes(&from_hex32(&state.signing_key_hex)?);
+    let self_pk = signing_key.verifying_key().to_bytes();
     let mut dag = dag_from_json(&state.dag_json)?;
     for ev in events_from_json(&state.pending_json) {
         let _ = dag.ingest(ev); // re-buffer or resolve persisted orphans
     }
+    // Snapshot what we hold, so after processing we can mark every member whose
+    // NEW event we just admitted as freshly-heard-from (observer-local liveness).
+    let known_before: BTreeSet<Hash> = dag.events.keys().copied().collect();
     let mut conns = connections_from_json(&state.connections_json);
     let mut self_head: Option<Hash> = if state.self_head_hex.is_empty() {
         None
@@ -346,6 +387,7 @@ fn on_data(state: ActorState, conn_id: String, data: Vec<u8>) -> Result<(ActorSt
         Some(from_hex32(&state.self_head_hex)?)
     };
     let mut delivered: BTreeSet<Hash> = hashes_from_json(&state.delivered_json).into_iter().collect();
+    let join_allow: BTreeSet<PubKey> = members_from_json(&state.join_allow_json);
 
     let mut conn_state = match conns.remove(&conn_id) {
         Some(c) => c,
@@ -374,7 +416,7 @@ fn on_data(state: ActorState, conn_id: String, data: Vec<u8>) -> Result<(ActorSt
         *conn_state.recv_buf_mut() = kept;
 
         match conn_state.phase.clone() {
-            Phase::AwaitingHello => match step_hello(&conn_id, &frame, &dag) {
+            Phase::AwaitingHello => match step_hello(&conn_id, &frame, &dag, &join_allow) {
                 Step::Advance(p) => conn_state.phase = p,
                 Step::Close => {
                     should_close = true;
@@ -385,9 +427,27 @@ fn on_data(state: ActorState, conn_id: String, data: Vec<u8>) -> Result<(ActorSt
                 match step_auth(&conn_id, &frame, &pubkey_hex, &nonce_hex, &dag)? {
                     Step::Advance(p) => {
                         conn_state.phase = p;
-                        // Send our checkpoint (so a behind peer can bootstrap past
-                        // our pruned watermark) then our frontier.
-                        let _ = tcp_send(conn_id.clone(), checkpoint_frame(&dag));
+                        // Self-serve join: a join-allowed pubkey that isn't yet a
+                        // member gets auto-introduced. Author the Introduce BEFORE
+                        // the frontier below, so the joiner learns of its own
+                        // admission in the same catch-up.
+                        if let Ok(pk) = from_hex32(&pubkey_hex) {
+                            if join_allow.contains(&pk) && !dag.consensus_members().contains(&pk) {
+                                let (nh, _) = run_command(
+                                    &mut dag,
+                                    &conns,
+                                    &signing_key,
+                                    self_head,
+                                    Vec::new(),
+                                    Some(SystemOp::Introduce { node: pk }),
+                                );
+                                self_head = nh;
+                                log(format!("[mesh] auto-introduced self-serve joiner {}", hex(&pk)));
+                            }
+                        }
+                        // Announce our frontier; a behind peer WANTs what it lacks
+                        // and we answer with the event, or a SEALED marker if we've
+                        // pruned it. No bulk checkpoint is sent.
                         let _ = tcp_send(
                             conn_id.clone(),
                             encode_hashes(FRAME_FRONTIER, &all_heads(&dag)),
@@ -417,6 +477,18 @@ fn on_data(state: ActorState, conn_id: String, data: Vec<u8>) -> Result<(ActorSt
     }
     // Deliver any newly-finalized messages to TCP clients and the co-located app.
     deliver_committed(&dag, &conns, &state.app_id, &mut delivered);
+    // Signal the app once we've become an admitted member (e.g. a joiner whose
+    // Introduce just finalized in this batch of frames).
+    let ready_sent = maybe_emit_ready(&state.app_id, &dag, &self_pk, state.ready_sent);
+
+    // Mark every member whose new event we just admitted as freshly heard-from.
+    let mut last_heard = last_heard_from_json(&state.last_heard_json);
+    let now = now_ms();
+    for (h, e) in &dag.events {
+        if !known_before.contains(h) {
+            last_heard.insert(e.author, now);
+        }
+    }
 
     let delivered_vec: Vec<Hash> = delivered.iter().copied().collect();
     Ok((
@@ -426,6 +498,8 @@ fn on_data(state: ActorState, conn_id: String, data: Vec<u8>) -> Result<(ActorSt
             delivered_json: hashes_to_json(&delivered_vec),
             connections_json: connections_to_json(&conns),
             self_head_hex: self_head.map(|h| hex(&h)).unwrap_or_default(),
+            ready_sent,
+            last_heard_json: last_heard_to_json(&last_heard),
             ..state
         },
         (),
@@ -442,28 +516,101 @@ fn on_close(state: ActorState, conn_id: String, reason: String) -> Result<(Actor
 
 #[export(name = "theater:simple/timer.handle-tick")]
 fn handle_tick(state: ActorState, _timer_name: String) -> Result<(ActorState, ()), String> {
-    // Periodic compaction: drop sealed history below the finalized frontier.
-    // Safe now that catch-up carries a checkpoint (base members + sealed anchors)
-    // over the sync path, so a behind node can bootstrap past the watermark.
+    let signing_key = SigningKey::from_bytes(&from_hex32(&state.signing_key_hex)?);
     let mut dag = dag_from_json(&state.dag_json)?;
     for ev in events_from_json(&state.pending_json) {
         let _ = dag.ingest(ev);
     }
+    let conns = connections_from_json(&state.connections_json);
+    let mut self_head: Option<Hash> = if state.self_head_hex.is_empty() {
+        None
+    } else {
+        Some(from_hex32(&state.self_head_hex)?)
+    };
     let mut delivered: BTreeSet<Hash> = hashes_from_json(&state.delivered_json).into_iter().collect();
 
-    let pruned = dag.compact(&delivered);
-    if pruned.is_empty() {
-        return Ok((state, ()));
+    // Heartbeat pump: if we're a member WITH peers, author a noop event each tick
+    // so the frontier keeps advancing — a per-member liveness signal that also lets
+    // compaction trim even on an otherwise-idle mesh. A sole member skips (its
+    // events auto-finalize; no one to prove liveness to), as does a not-yet-admitted
+    // joining node. Each heartbeat grafts peers' recent heads, so heartbeats
+    // mutually finalize; receiving one begets no graft, so there's no witness storm.
+    let self_pk = signing_key.verifying_key().to_bytes();
+    let members = dag.consensus_members();
+    if members.len() > 1 && members.contains(&self_pk) {
+        let (nh, _) = run_command(&mut dag, &conns, &signing_key, self_head, Vec::new(), None);
+        self_head = nh;
     }
+
+    // Periodic compaction: drop sealed history below the finalized frontier. Safe
+    // because catch-up carries a checkpoint (base members + sealed anchors), so a
+    // behind node can bootstrap past the watermark.
+    let pruned = dag.compact(&delivered);
     for h in &pruned {
         delivered.remove(h);
     }
-    log(format!(
-        "[mesh] compacted {} events; {} retained, {} sealed",
-        pruned.len(),
-        dag.events.len(),
-        dag.sealed.len()
-    ));
+    if !pruned.is_empty() {
+        log(format!(
+            "[mesh] compacted {} events; {} retained, {} sealed",
+            pruned.len(),
+            dag.events.len(),
+            dag.sealed.len()
+        ));
+    }
+
+    // A bootstrap member that just got its app subscribed becomes "ready" here.
+    let ready_sent = maybe_emit_ready(&state.app_id, &dag, &self_pk, state.ready_sent);
+
+    // Eviction: vote out members we haven't heard a new event from in
+    // EVICT_TIMEOUT_MS. If a quorum to do so is unreachable (e.g. N=2), our
+    // lifecycle ends — shut down (return Err) and let the supervisor restart us
+    // fresh; that's out of our spec.
+    let mut last_heard = last_heard_from_json(&state.last_heard_json);
+    let now = now_ms();
+    if members.contains(&self_pk) {
+        // Grace: a member we've not yet heard from starts its clock now.
+        for m in &members {
+            last_heard.entry(*m).or_insert(now);
+        }
+        let stale: Vec<PubKey> = members
+            .iter()
+            .filter(|m| **m != self_pk)
+            .filter(|m| now.saturating_sub(*last_heard.get(*m).unwrap_or(&now)) > state.evict_timeout_ms)
+            .copied()
+            .collect();
+        if !stale.is_empty() {
+            let majority = members.len() / 2 + 1;
+            let live = members.len() - stale.len();
+            if live >= majority {
+                for s in &stale {
+                    let already_voted = dag.events.values().any(|e| {
+                        e.author == self_pk && e.system == Some(SystemOp::Evict { node: *s })
+                    });
+                    if !already_voted {
+                        let (nh, _) = run_command(
+                            &mut dag,
+                            &conns,
+                            &signing_key,
+                            self_head,
+                            Vec::new(),
+                            Some(SystemOp::Evict { node: *s }),
+                        );
+                        self_head = nh;
+                        log(format!("[mesh] voting to evict stale member {}", hex(s)));
+                    }
+                }
+            } else {
+                log(format!(
+                    "[mesh] {} stale member(s), no quorum to evict — shutting down",
+                    stale.len()
+                ));
+                return Err(format!(
+                    "stalled: no quorum to evict {} unreachable member(s)",
+                    stale.len()
+                ));
+            }
+        }
+    }
 
     let delivered_vec: Vec<Hash> = delivered.iter().copied().collect();
     Ok((
@@ -471,6 +618,9 @@ fn handle_tick(state: ActorState, _timer_name: String) -> Result<(ActorState, ()
             dag_json: dag_to_json(&dag),
             pending_json: events_to_json(&dag.pending_events()),
             delivered_json: hashes_to_json(&delivered_vec),
+            self_head_hex: self_head.map(|h| hex(&h)).unwrap_or_default(),
+            ready_sent,
+            last_heard_json: last_heard_to_json(&last_heard),
             ..state
         },
         (),
@@ -582,7 +732,12 @@ enum Step {
     Close,
 }
 
-fn step_hello(conn_id: &str, frame: &ParsedFrame, dag: &Dag) -> Step {
+fn step_hello(
+    conn_id: &str,
+    frame: &ParsedFrame,
+    dag: &Dag,
+    join_allow: &BTreeSet<PubKey>,
+) -> Step {
     if frame.kind != FRAME_HELLO || frame.payload.len() != 32 {
         let _ = tcp_send(conn_id.to_string(), encode_rejected("expected HELLO(pubkey)"));
         let _ = tcp_close(conn_id.to_string());
@@ -590,7 +745,9 @@ fn step_hello(conn_id: &str, frame: &ParsedFrame, dag: &Dag) -> Step {
     }
     let mut pk = [0u8; 32];
     pk.copy_from_slice(&frame.payload);
-    if !dag.consensus_members().contains(&pk) {
+    // Admit a current member OR a join-allowed pubkey (which the AUTH step then
+    // auto-introduces). The CHALLENGE/AUTH signature still proves key ownership.
+    if !dag.consensus_members().contains(&pk) && !join_allow.contains(&pk) {
         let _ = tcp_send(conn_id.to_string(), encode_rejected("not a member"));
         let _ = tcp_close(conn_id.to_string());
         return Step::Close;
@@ -668,26 +825,35 @@ fn handle_authed_frame(
             author_and_broadcast(dag, conns, conn_id, signing_key, self_head, Vec::new(), op)
         }
         FRAME_WANT => {
+            // Answer each WANT with the event if we hold it, or a SEALED marker if
+            // we've pruned it (so the requester can seal the boundary and move on).
+            let mut sealed = Vec::new();
             for h in decode_hashes(&frame.payload) {
                 if let Some(ev) = dag.events.get(&h) {
                     let _ = tcp_send(conn_id.to_string(), encode_deliver(&ev.encode()));
+                } else if dag.sealed.contains(&h) {
+                    sealed.push(h);
                 }
+            }
+            if !sealed.is_empty() {
+                let _ = tcp_send(conn_id.to_string(), encode_hashes(FRAME_SEALED, &sealed));
             }
             self_head
         }
         FRAME_FRONTIER => {
-            let missing: Vec<Hash> =
-                decode_hashes(&frame.payload).into_iter().filter(|h| !dag.has(h)).collect();
+            let missing: Vec<Hash> = decode_hashes(&frame.payload)
+                .into_iter()
+                .filter(|h| !dag.has(h) && !dag.sealed.contains(h))
+                .collect();
             if !missing.is_empty() {
                 let _ = tcp_send(conn_id.to_string(), encode_hashes(FRAME_WANT, &missing));
             }
             self_head
         }
-        FRAME_CHECKPOINT => {
-            // Adopt if we're behind this peer's pruned watermark (a no-op
-            // otherwise), then any events buffered on now-sealed deps re-drive.
-            let (members, sealed) = decode_checkpoint(&frame.payload);
-            dag.install_checkpoint(members.into_iter().collect(), sealed.into_iter().collect());
+        FRAME_SEALED => {
+            // A peer vouches these WANTed hashes are pruned/settled; seal them and
+            // re-drive anything buffered on them. No trusted bulk checkpoint.
+            dag.mark_sealed(&decode_hashes(&frame.payload));
             self_head
         }
         // ACK / NOTIFY are responses meant for app clients; a node ignores them.
@@ -763,7 +929,7 @@ fn ingest_and_propagate(
 // ---- authoring + helpers ----
 
 fn author_genesis(dag: &mut Dag, signing_key: &SigningKey) -> Event {
-    let ev = Event::sign(signing_key, None, Vec::new(), Vec::new(), None);
+    let ev = Event::sign(signing_key, now_ms(), None, Vec::new(), Vec::new(), None);
     let _ = dag.ingest(ev.clone());
     ev
 }
@@ -781,7 +947,7 @@ fn author_event(
 ) -> Result<Event, String> {
     let author = signing_key.verifying_key().to_bytes();
     let refs = foreign_heads(dag, &author);
-    let ev = Event::sign(signing_key, self_head, refs, payload, system);
+    let ev = Event::sign(signing_key, now_ms(), self_head, refs, payload, system);
     match dag.ingest(ev.clone())? {
         true => Ok(ev),
         false => Err("authored event buffered (missing dep)".to_string()),
@@ -847,14 +1013,6 @@ fn foreign_heads(dag: &Dag, me: &PubKey) -> Vec<Hash> {
     out
 }
 
-/// Encode this node's checkpoint (membership base + sealed anchors) so a peer
-/// catching up past our pruned watermark can bootstrap.
-fn checkpoint_frame(dag: &Dag) -> Vec<u8> {
-    let members: Vec<PubKey> = dag.base_members.iter().copied().collect();
-    let sealed: Vec<Hash> = dag.sealed.iter().copied().collect();
-    encode_checkpoint(&members, &sealed)
-}
-
 /// All current heads across all members — our advertised frontier.
 fn all_heads(dag: &Dag) -> Vec<Hash> {
     let mut out = Vec::new();
@@ -896,6 +1054,35 @@ fn broadcast(conns: &BTreeMap<String, ConnState>, exclude: &str, frame: &[u8]) {
 /// every payload-bearing event not yet delivered (tracked in `delivered`). The
 /// substrate is payload-agnostic: addressing / message-type / routing all live
 /// in the payload bytes and are the application's concern.
+fn last_heard_from_json(s: &str) -> BTreeMap<PubKey, u64> {
+    let mut out = BTreeMap::new();
+    if let Ok(m) = serde_json::from_str::<BTreeMap<String, u64>>(s) {
+        for (h, ts) in m {
+            if let Ok(pk) = from_hex32(&h) {
+                out.insert(pk, ts);
+            }
+        }
+    }
+    out
+}
+
+fn last_heard_to_json(m: &BTreeMap<PubKey, u64>) -> String {
+    let obj: BTreeMap<String, u64> = m.iter().map(|(pk, ts)| (hex(pk), *ts)).collect();
+    serde_json::to_string(&obj).unwrap_or_else(|_| "{}".to_string())
+}
+
+/// Emit the one-shot Ready signal to the subscribed app the first time we're an
+/// admitted, finalized member — so a joining app can act on a signal instead of a
+/// timer. Returns the updated `ready_sent`.
+fn maybe_emit_ready(app_id: &str, dag: &Dag, self_pk: &PubKey, ready_sent: bool) -> bool {
+    if ready_sent || app_id.is_empty() || !dag.consensus_members().contains(self_pk) {
+        return ready_sent;
+    }
+    let _ = message_server_send(app_id.to_string(), api::encode_ready());
+    log(format!("[mesh] signalled READY to app {}", app_id));
+    true
+}
+
 fn deliver_committed(
     dag: &Dag,
     conns: &BTreeMap<String, ConnState>,
