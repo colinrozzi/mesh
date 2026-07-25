@@ -99,6 +99,22 @@ Every client sees every committed payload — the whole log is replicated on eve
 node, so this is redundancy, not waste. Addressing, message-types, and routing
 all live *in the payload*, interpreted by the application.
 
+## Using mesh from an actor (composition)
+
+An actor talks to a mesh node through the **mesh-client package**
+(`mesh-client-pkg`) — a composable packr component that exports the `mesh`
+interface (`submit`/`introduce`/`depart`/`register`/`delivery`/`node-config`) and
+owns the `message-server-host` I/O, plus an opt-in `mesh-control` interface (the
+Command/Response/Lifecycle envelope carried *inside* a Submit payload). Rather
+than vendoring the protocol, an actor `packr compose`s the prebuilt
+`mesh_client_pkg.wasm` into itself; client↔consumer version skew is caught at
+compose time by hash-checked links. Consumer guide: `mesh-client-pkg/CONSUMER.md`.
+
+**Distribution:** one GitHub release ships a compatible set built from the same
+source — `mesh.wasm` (the node), `mesh_client_pkg.wasm` (the client), and the
+`mesh.pact` / `mesh-control.pact` interface specs. One version pin = a compatible
+node+client pair.
+
 ## Wire protocol
 
 All TCP. Length-prefixed binary frames: `LEN(u32 BE) || KIND(u8) || PAYLOAD`.
@@ -228,6 +244,11 @@ mesh/
 │   ├── conn.rs         # per-connection handshake state
 │   ├── codec.rs        # ActorState persistence + hex helpers
 │   └── wire.rs         # frame protocol
+├── mesh-api/           # envelope + control codecs (shared by node + client)
+├── mesh-client/        # host-agnostic client library (source-dep form)
+├── mesh-client-pkg/    # the composable mesh-client PACKAGE (mesh + mesh-control)
+├── example-app/        # example actor that supervises a node + uses mesh-client
+├── compose-smoke/      # local runtime proof: compose sentinel-stub + mesh-client
 ├── testkit/            # shared integration-test client + spawn harness
 ├── smoke/              # single-node end-to-end test
 ├── multi-node-test/    # two-node integration test
@@ -248,6 +269,11 @@ its own node over theater's `message-server` — `request` commands + a
 + verified; `mesh-example-app` + `app-test` are the app half. End-to-end is gated
 on two theater primitives (`runtime.get-self`; parent→spawned-child
 message-server addressability).
+
+**Composition** (`mesh-client-pkg/`): mesh-client ships as a composable packr
+0.12 component — an actor `packr compose`s it in instead of vendoring the
+protocol (see *Using mesh from an actor*). Built + proven end-to-end
+(`compose-smoke`); the mesh interface + the opt-in `mesh-control` envelope.
 
 **Near-term** (see `DESIGN.md`): incremental finality/delivery (currently
 re-scans the retained DAG each callback), batched emission (currently

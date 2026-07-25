@@ -31,11 +31,15 @@ jobs:
         run: |
           cargo clippy --target wasm32-unknown-unknown -- -D warnings
           cargo clippy --target wasm32-unknown-unknown --manifest-path example-app/Cargo.toml -- -D warnings
+          cargo clippy --target wasm32-unknown-unknown --manifest-path mesh-client-pkg/Cargo.toml -- -D warnings
 
       - name: Build (wasm release)
         run: |
           cargo build --release --target wasm32-unknown-unknown
           cargo build --release --target wasm32-unknown-unknown --manifest-path example-app/Cargo.toml
+          # The composable client package + the compose-smoke entry fixture.
+          cargo build --release --target wasm32-unknown-unknown --manifest-path mesh-client-pkg/Cargo.toml
+          cargo build --release --target wasm32-unknown-unknown --manifest-path compose-smoke/sentinel-stub/Cargo.toml
 
       - name: Unit tests
         run: |

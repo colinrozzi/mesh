@@ -1,0 +1,59 @@
+name: Release
+
+# One versioned mesh release carries a compatible set built from the same source:
+#   - mesh.wasm             the node (the substrate actor consumers supervise)
+#   - mesh_client_pkg.wasm  the client component (consumers `packr compose` it in)
+#   - mesh.pact             the `mesh` interface signature (consumers declare it)
+# Consumers pin ONE version and get a matched node+client pair. See
+# mesh-client-pkg/CONSUMER.md.
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: build artifacts · publish release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable + wasm target)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - uses: Swatinem/rust-cache@v2
+
+      # The root .cargo/config.toml applies --export-memory/--no-entry to both
+      # builds (invoked from the repo root). The node is a plain 0.11 cdylib; the
+      # client component is a 0.12 composable package — both are directly loadable.
+      - name: Build node (mesh.wasm)
+        run: cargo build --release --target wasm32-unknown-unknown
+
+      - name: Build client component (mesh_client_pkg.wasm)
+        run: cargo build --release --target wasm32-unknown-unknown --manifest-path mesh-client-pkg/Cargo.toml
+
+      - name: Stage artifacts
+        run: |
+          mkdir -p dist
+          cp target/wasm32-unknown-unknown/release/mesh.wasm dist/
+          cp mesh-client-pkg/target/wasm32-unknown-unknown/release/mesh_client_pkg.wasm dist/
+          cp mesh-client-pkg/mesh.pact dist/
+          cp mesh-client-pkg/mesh-control.pact dist/
+          cp mesh-client-pkg/CONSUMER.md dist/
+          ls -la dist/
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/mesh.wasm
+            dist/mesh_client_pkg.wasm
+            dist/mesh.pact
+            dist/mesh-control.pact
+            dist/CONSUMER.md
+          generate_release_notes: true

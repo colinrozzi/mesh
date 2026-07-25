@@ -1,0 +1,14 @@
+[package]
+name = "compose-smoke"
+version = "0.1.0"
+edition = "2021"
+description = "LOCAL-ONLY runtime proof for the mesh-client composition pilot: composes the sentinel-stub entry with the mesh-client package and drives submit through the async residual host call. Needs a pack checkout at ../../../pack and the two component wasms prebuilt (see README)."
+
+# Deliberately no [lib]/[bin] source — this crate exists for its integration
+# test. packr is a heavy path dep (wasmtime/cranelift); this crate is never built
+# by CI or a normal `cargo build` of mesh (it isn't in any workspace).
+
+[dev-dependencies]
+packr = { path = "../../../pack" }
+mesh-api = { path = "../mesh-api" }
+tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread"] }

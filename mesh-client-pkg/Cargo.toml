@@ -1,0 +1,21 @@
+[package]
+name = "mesh-client-pkg"
+version = "0.1.0"
+edition = "2021"
+description = "The mesh client as a composable packr package. Exports the `mesh` interface (submit / introduce / depart / register / delivery / node-config) and OWNS the message-server host I/O, so any actor composes it via `packr compose` instead of vendoring the protocol. Thin packr glue over the `mesh-client` library."
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+# The proven host-agnostic client logic — the component just binds the residual
+# host `request` import into it.
+mesh-client = { path = "../mesh-client" }
+# The control-envelope codec (Control::encode/decode) surfaced by the
+# `mesh-control` interface.
+mesh-api = { path = "../mesh-api" }
+packr-guest = "0.12.0"
+
+[profile.release]
+opt-level = "s"
+lto = true
