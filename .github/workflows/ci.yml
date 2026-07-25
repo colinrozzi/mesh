@@ -59,3 +59,4 @@ jobs:
           cargo build --manifest-path join-test/Cargo.toml
           cargo build --manifest-path evict-test/Cargo.toml
           cargo build --manifest-path app-test/Cargo.toml
+          cargo build --manifest-path join-app-test/Cargo.toml

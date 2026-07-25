@@ -102,6 +102,10 @@ struct AppConfig {
     #[serde(default)]
     members: Vec<String>,
     #[serde(default)]
+    join_allow: Vec<String>,
+    #[serde(default)]
+    heartbeat_ms: Option<u64>,
+    #[serde(default)]
     dial: Vec<PeerEntry>,
     greeting: String,
 }
@@ -193,7 +197,29 @@ fn build_node_init(cfg: &AppConfig) -> String {
     let members: Vec<&str> = cfg.members.iter().map(String::as_str).collect();
     let dial: Vec<(&str, &str)> =
         cfg.dial.iter().map(|p| (p.pubkey.as_str(), p.address.as_str())).collect();
-    mesh_client::node_config(&cfg.node_seed, &cfg.node_listen, &members, &dial)
+    let base = mesh_client::node_config(&cfg.node_seed, &cfg.node_listen, &members, &dial);
+    if cfg.join_allow.is_empty() && cfg.heartbeat_ms.is_none() {
+        return base;
+    }
+    // `node_config` exposes only seed/listen/members/dial; splice in the extra
+    // InitConfig fields an admitting node (join_allow) or a test (heartbeat_ms)
+    // needs.
+    let mut inner = base.trim_end().to_string();
+    inner.truncate(inner.len() - 1); // drop closing brace
+    if !cfg.join_allow.is_empty() {
+        let allow = cfg
+            .join_allow
+            .iter()
+            .map(|k| format!("\"{}\"", k))
+            .collect::<Vec<_>>()
+            .join(",");
+        inner.push_str(&format!(",\"join_allow\":[{}]", allow));
+    }
+    if let Some(hb) = cfg.heartbeat_ms {
+        inner.push_str(&format!(",\"heartbeat_ms\":{}", hb));
+    }
+    inner.push('}');
+    inner
 }
 
 fn short_hex(bytes: &[u8]) -> String {

@@ -840,6 +840,17 @@ fn handle_authed_frame(
             }
             if !sealed.is_empty() {
                 let _ = tcp_send(conn_id.to_string(), encode_hashes(FRAME_SEALED, &sealed));
+                // Defense in depth: a sealed boundary must never HIDE a retained
+                // membership event from a catching-up peer (else it can't derive
+                // the member set — the second-order effect behind the v0.3.0 join
+                // starvation). Membership events are retained forever and few, so
+                // ship them alongside the seal; the peer dedups any it holds and
+                // admits the rest against the sealed boundary.
+                for h in dag.system_events_topo() {
+                    if let Some(ev) = dag.events.get(&h) {
+                        let _ = tcp_send(conn_id.to_string(), encode_deliver(&ev.encode()));
+                    }
+                }
             }
             self_head
         }
@@ -944,13 +955,23 @@ fn author_genesis(dag: &mut Dag, signing_key: &SigningKey) -> Event {
 fn author_event(
     dag: &mut Dag,
     signing_key: &SigningKey,
-    self_head: Option<Hash>,
+    _self_head: Option<Hash>,
     payload: Vec<u8>,
     system: Option<SystemOp>,
 ) -> Result<Event, String> {
     let author = signing_key.verifying_key().to_bytes();
-    let refs = foreign_heads(dag, &author);
-    let ev = Event::sign(signing_key, now_ms(), self_head, refs, payload, system);
+    // Self-parent from our CURRENT own head *in the DAG* — never a separately
+    // threaded/persisted `self_head`, which can lag the DAG across handler
+    // invocations. (v0.3.0 bug: a timer heartbeat authored off a self_head
+    // captured *before* the TCP on-data handler authored an auto-Introduce forks
+    // our own chain and orphans the Introduce, so a joiner never learns of its
+    // admission.) Deriving from the DAG makes authoring immune to that staleness;
+    // grafting any *other* own heads also heals a chain that already forked.
+    let mut own: Vec<Hash> = dag.heads_of(&author).into_iter().collect();
+    let self_parent = own.pop(); // BTreeSet order is deterministic; None until our genesis exists
+    let mut refs = foreign_heads(dag, &author);
+    refs.extend(own); // merge any residual self-fork so it converges
+    let ev = Event::sign(signing_key, now_ms(), self_parent, refs, payload, system);
     match dag.ingest(ev.clone())? {
         true => Ok(ev),
         false => Err("authored event buffered (missing dep)".to_string()),

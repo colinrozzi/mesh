@@ -149,8 +149,17 @@ impl Dag {
         }
 
         // Members live *at this event's position* — folded from its ancestry.
+        // Fallback to the current finalized member set: compaction seals interior
+        // (non-system) events, and `ancestors_of` stops at a sealed boundary, so
+        // the position-based fold can fail to *reach* a retained Introduce that
+        // sits behind the seal — even though the author is a bona-fide member.
+        // `consensus_members` folds the finalized system events directly (no
+        // ancestry walk), so it still sees the admission. Accepting a current
+        // member is always sound; this only widens acceptance, never admits a
+        // non-member. (Without it, an admitting node whose compaction fires during
+        // a join rejects the joiner's events as "not a member" until eviction.)
         let members = self.members_at_frontier(&deps);
-        if !members.contains(&event.author) {
+        if !members.contains(&event.author) && !self.consensus_members().contains(&event.author) {
             return Err(format!("author {} is not a member", hex(&event.author)));
         }
 
@@ -355,6 +364,21 @@ impl Dag {
             required.remove(node);
         }
         required.is_subset(&self.witnessing_authors(target))
+    }
+
+    /// Retained membership (system) events in canonical (topo) order. Membership
+    /// events are retained forever and are few; a node ships them to a catching-up
+    /// peer alongside a SEALED reply so a sealed boundary can never *hide* a
+    /// retained membership event — the peer can always re-derive the member set
+    /// even when the intervening heartbeats are pruned.
+    pub fn system_events_topo(&self) -> Vec<Hash> {
+        let sys: BTreeSet<Hash> = self
+            .events
+            .iter()
+            .filter(|(_, e)| e.system.is_some())
+            .map(|(h, _)| *h)
+            .collect();
+        self.topo_sort(&sys)
     }
 
     /// Finalized events in canonical order (topo-sort, hash tiebreak) — the
@@ -958,5 +982,26 @@ mod tests {
         }
         assert!(joiner.has(&a2h), "retained events reconstructed past the watermark");
         assert!(joiner.consensus_members().contains(&pk(&n)), "N derived from the retained Introduce");
+    }
+
+    #[test]
+    fn system_events_topo_returns_only_membership_events() {
+        // The WANT handler ships these alongside a SEALED reply so a sealed
+        // boundary can never hide a retained membership event.
+        let a = key(1);
+        let n = key(7);
+        let mut d = Dag::new(members(&[&a]));
+        let ga = ev(&a, None, Vec::new(), Vec::new());
+        let gah = ga.event_hash();
+        d.ingest(ga).unwrap();
+        let intro = sys(&a, Some(gah), Vec::new(), SystemOp::Introduce { node: pk(&n) });
+        let ih = intro.event_hash();
+        d.ingest(intro).unwrap();
+        // A heartbeat (non-system, empty payload) extends the chain.
+        let hb = ev(&a, Some(ih), Vec::new(), Vec::new());
+        d.ingest(hb).unwrap();
+
+        // Only the Introduce is a system event; genesis + heartbeat are excluded.
+        assert_eq!(d.system_events_topo(), alloc::vec![ih]);
     }
 }
