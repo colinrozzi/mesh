@@ -288,15 +288,15 @@ impl Dag {
                     members.remove(node);
                     votes.remove(node);
                 }
-                Some(SystemOp::Evict { node }) => {
-                    // A vote counts only from a current member other than the evictee.
+                // A vote counts only from a current member other than the evictee.
+                Some(SystemOp::Evict { node })
                     if ev.author != *node
                         && members.contains(node)
-                        && members.contains(&ev.author)
-                    {
-                        votes.entry(*node).or_default().insert(ev.author);
-                    }
+                        && members.contains(&ev.author) =>
+                {
+                    votes.entry(*node).or_default().insert(ev.author);
                 }
+                Some(SystemOp::Evict { .. }) => {}
                 None => {}
             }
             apply_evictions(&mut members, &mut votes);
@@ -982,6 +982,106 @@ mod tests {
         }
         assert!(joiner.has(&a2h), "retained events reconstructed past the watermark");
         assert!(joiner.consensus_members().contains(&pk(&n)), "N derived from the retained Introduce");
+    }
+
+    #[test]
+    fn membership_survives_a_sealed_introduce_path() {
+        // Build an A+B chain that admits B, run it long enough that compaction
+        // seals the interior events between the (retained) Introduce and the
+        // frontier, then confirm the member set at the frontier STILL includes B
+        // even though ancestors_of() can no longer walk back to the Introduce.
+        let a = key(1);
+        let b = key(2);
+        let mut d = Dag::new(members(&[&a]));
+        let ga = ev(&a, None, Vec::new(), Vec::new());
+        let gah = ga.event_hash();
+        d.ingest(ga).unwrap();
+        let intro = sys(&a, Some(gah), Vec::new(), SystemOp::Introduce { node: pk(&b) });
+        let ih = intro.event_hash();
+        d.ingest(intro).unwrap();
+        // B grafts its admission, then A and B alternate, each witnessing the
+        // other, so the interior finalizes and becomes prunable.
+        let gb = ev(&b, None, alloc::vec![ih], Vec::new());
+        let mut ah = ih;
+        let mut bh = gb.event_hash();
+        d.ingest(gb).unwrap();
+        for _ in 0..6 {
+            let na = ev(&a, Some(ah), alloc::vec![bh], Vec::new());
+            ah = na.event_hash();
+            d.ingest(na).unwrap();
+            let nb = ev(&b, Some(bh), alloc::vec![ah], Vec::new());
+            bh = nb.event_hash();
+            d.ingest(nb).unwrap();
+        }
+        // Sanity: B is a member before compaction (full ancestry present).
+        assert!(d.consensus_members().contains(&pk(&b)));
+
+        d.compact(&BTreeSet::new());
+        assert!(d.has(&ih), "the Introduce (system event) is retained");
+        // The interior between the Introduce and the frontier is sealed, so the
+        // path back to the Introduce is broken for ancestors_of().
+        assert!(!d.sealed.is_empty(), "interior events sealed");
+
+        // THE INVARIANT: membership at the current frontier still includes B,
+        // even though the Introduce now sits behind a sealed boundary.
+        let heads: alloc::vec::Vec<Hash> =
+            d.consensus_members().iter().flat_map(|m| d.heads_of(m)).collect();
+        assert!(
+            d.members_at_frontier(&heads).contains(&pk(&b)),
+            "member survives a sealed Introduce path"
+        );
+        assert!(d.consensus_members().contains(&pk(&b)), "and stays in consensus");
+    }
+
+    // KNOWN GAP (tracked, non-blocking): `members_at_frontier` folds `ancestors_of`,
+    // which stops at a sealed boundary — so a retained Introduce that sits behind a
+    // `mark_sealed` boundary is present but unreachable, and the member set at the
+    // head under-counts (while `consensus_members`, which folds finalized events
+    // directly, still sees it). This only affects finality PRECISION (is_finalized
+    // may under-count required witnesses under an unusual sealing pattern — never
+    // stuck), and normal compaction does NOT strand membership (see the passing
+    // `membership_survives_a_sealed_introduce_path`). A correct fix has to stay
+    // finality-aware: a naive structural fold breaks is_finalized's exclude-own-
+    // effect when an event's own deps are sealed. Left as a design pass.
+    #[test]
+    #[ignore = "tracked: members_at_frontier under-counts across a mark_sealed boundary; needs a finality-aware fix"]
+    fn membership_under_a_mark_sealed_boundary() {
+        // The joiner path: a catching-up node receives a retained Introduce and a
+        // later head, but SEALS the interior events between them (it got SEALED
+        // markers, never the events). The Introduce is present but unreachable via
+        // ancestors_of — does the member set at the head still include the member?
+        let a = key(1);
+        let b = key(2);
+        // Author A's chain on a source so the hashes are real + consistent:
+        // G -> I(introduce B) -> M1 -> M2 -> H
+        let src_a = key(1);
+        let g = ev(&src_a, None, Vec::new(), Vec::new());
+        let gh = g.event_hash();
+        let i = sys(&src_a, Some(gh), Vec::new(), SystemOp::Introduce { node: pk(&b) });
+        let ih = i.event_hash();
+        let m1 = ev(&src_a, Some(ih), Vec::new(), Vec::new());
+        let m1h = m1.event_hash();
+        let m2 = ev(&src_a, Some(m1h), Vec::new(), Vec::new());
+        let m2h = m2.event_hash();
+        let h = ev(&src_a, Some(m2h), Vec::new(), Vec::new());
+        let hh = h.event_hash();
+
+        // Joiner: base [A]. It holds the Introduce + the head, but the interior
+        // (G, M1, M2) is sealed — received as SEALED boundary markers.
+        let mut d = Dag::new(members(&[&a]));
+        d.mark_sealed(&[gh, m1h, m2h]);
+        d.ingest(i).unwrap(); // self_parent G is sealed -> admits
+        d.ingest(h).unwrap(); // self_parent M2 is sealed -> admits
+        assert!(d.has(&ih) && d.has(&hh), "holds Introduce + head");
+
+        // consensus_members folds finalized events directly -> sees B.
+        assert!(d.consensus_members().contains(&pk(&b)), "B in consensus");
+        // THE INVARIANT (currently the gap): members at the head still includes B,
+        // even though the Introduce sits behind the sealed interior boundary.
+        assert!(
+            d.members_at_frontier(&[hh]).contains(&pk(&b)),
+            "member survives a mark_sealed boundary to its Introduce"
+        );
     }
 
     #[test]
