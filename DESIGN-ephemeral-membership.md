@@ -29,9 +29,9 @@ exists today:
   genesis config is a "joining node" (authors no genesis, dormant until admitted).
   An **existing member** authors an `Introduce(pk)`; once it *finalizes*, the new
   node can connect (handshake now passes), sync, and act.
-- **Sync via catch-up.** On connect: `WANT`/`FRONTIER` backfill + `CHECKPOINT`
-  adoption if behind a pruned watermark. There is **no explicit "synced" signal** —
-  apps currently just wait on a timer (`membership-test` sleeps ~1.5s).
+- **Sync via catch-up.** On connect: `WANT`/`FRONTIER` backfill of the full
+  retained history (as of v0.4 nothing is pruned, so a `WANT` is always answerable
+  with the real event — there is no checkpoint/sealed-boundary path).
 - **Depart is self-authored.** A node authors its own `Depart`; once finalized,
   survivors finalize independently again. **Third-party depart is rejected.**
 - **Finality is all-members.** An event finalizes when every member *at that

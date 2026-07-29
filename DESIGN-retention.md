@@ -1,8 +1,11 @@
 # Design: finality-anchored retention (sliding-window state root)
 
-**Status:** draft / working design. Not yet implemented. Sibling to
-[`DESIGN-ephemeral-membership.md`](./DESIGN-ephemeral-membership.md) — they share
-the finality machinery.
+**Status: SUPERSEDED / ABANDONED.** An earlier seal-and-prune form of this was
+briefly implemented (v0.3), then removed in v0.4 in favor of **full retention**
+(the mesh keeps its complete history; no trimming). Both this sliding-window
+model and its successor ([`DESIGN-compaction.md`](./DESIGN-compaction.md)) are
+deferred until real usage shows the need and we can compact the graph cleanly.
+Kept for the record only.
 
 ## The idea in one line
 

@@ -63,16 +63,12 @@ fn dep_set(ev: &Event) -> BTreeSet<Hash> {
 
 #[derive(Clone, Debug)]
 pub struct Dag {
-    /// The derivation base for membership: the configured genesis set, advanced
-    /// by `compact` to the member set as of the pruned watermark. `members_at`
-    /// folds onto this. Every node's `members_at(E)` agrees regardless of how far
-    /// it has pruned (pruned ops here + retained ops in the fold = all ops).
+    /// The derivation base for membership: the configured genesis set that
+    /// `fold_membership` folds `Introduce`/`Depart`/`Evict` onto. The mesh
+    /// retains full history, so this stays the genesis set for the life of the
+    /// DAG (nothing advances it) — it is simply the fold's starting point.
     pub base_members: BTreeSet<PubKey>,
     pub events: BTreeMap<Hash, Event>,
-    /// Boundary anchors: hashes of *pruned* events still referenced by retained
-    /// events. Bare (no bodies) — they exist only so those refs resolve and so a
-    /// catching-up node can accept retained events past the pruned watermark.
-    pub sealed: BTreeSet<Hash>,
     /// Reverse adjacency: for each event hash, the events that directly
     /// reference it (via `self_parent` or `refs`) — "who observes me."
     observed_by: BTreeMap<Hash, BTreeSet<Hash>>,
@@ -86,16 +82,14 @@ impl Dag {
         Dag {
             base_members,
             events: BTreeMap::new(),
-            sealed: BTreeSet::new(),
             observed_by: BTreeMap::new(),
             pending: BTreeMap::new(),
         }
     }
 
-    /// Rebuild from persisted, already-validated events + boundary anchors.
-    pub fn rehydrate(base_members: BTreeSet<PubKey>, sealed: BTreeSet<Hash>, events: Vec<Event>) -> Self {
+    /// Rebuild from persisted, already-validated events.
+    pub fn rehydrate(base_members: BTreeSet<PubKey>, events: Vec<Event>) -> Self {
         let mut dag = Self::new(base_members);
-        dag.sealed = sealed;
         for ev in events {
             let h = ev.event_hash();
             dag.insert(h, ev);
@@ -103,10 +97,10 @@ impl Dag {
         dag
     }
 
-    /// A dependency is available if we hold its body, or it's a sealed anchor
-    /// (pruned but known-valid).
+    /// A dependency is available once we hold its body. The mesh retains full
+    /// history, so every honest dependency eventually arrives as a real event.
     fn dep_present(&self, h: &Hash) -> bool {
-        self.events.contains_key(h) || self.sealed.contains(h)
+        self.events.contains_key(h)
     }
 
     /// Ingest one event. `Ok(true)` on accept (or already-present),
@@ -140,8 +134,7 @@ impl Dag {
             return Ok(true); // dedup — idempotent
         }
 
-        // Buffer until every dependency (self_parent + refs) is present (held or
-        // sealed).
+        // Buffer until every dependency (self_parent + refs) is present.
         let deps: Vec<Hash> = dep_set(&event).into_iter().collect();
         if let Some(missing) = deps.iter().find(|d| !self.dep_present(d)) {
             self.pending.entry(*missing).or_default().push(event);
@@ -149,23 +142,20 @@ impl Dag {
         }
 
         // Members live *at this event's position* — folded from its ancestry.
-        // Fallback to the current finalized member set: compaction seals interior
-        // (non-system) events, and `ancestors_of` stops at a sealed boundary, so
-        // the position-based fold can fail to *reach* a retained Introduce that
-        // sits behind the seal — even though the author is a bona-fide member.
-        // `consensus_members` folds the finalized system events directly (no
-        // ancestry walk), so it still sees the admission. Accepting a current
-        // member is always sound; this only widens acceptance, never admits a
-        // non-member. (Without it, an admitting node whose compaction fires during
-        // a join rejects the joiner's events as "not a member" until eviction.)
+        // Belt-and-suspenders: also accept any author in the current finalized set
+        // (`consensus_members`, which folds finalized system events directly). The
+        // two views agree under full ancestry, but this guarantees a bona-fide
+        // member's event is never rejected by a benign ancestry-walk under-count
+        // during a join. Accepting a current member is always sound — it only
+        // widens acceptance, never admits a non-member.
         let members = self.members_at_frontier(&deps);
         if !members.contains(&event.author) && !self.consensus_members().contains(&event.author) {
             return Err(format!("author {} is not a member", hex(&event.author)));
         }
 
-        // self_parent must be one of the author's own events. Skip when it's a
-        // sealed anchor — we can't check a bodyless dep, and it was validated
-        // before pruning.
+        // self_parent must be one of the author's own events. It is guaranteed
+        // present here (the dependency check above admitted it), but we guard with
+        // `if let` rather than index to avoid a panic on any future code path.
         if let Some(sp) = event.self_parent {
             if let Some(parent) = self.events.get(&sp) {
                 if parent.author != event.author {
@@ -366,21 +356,6 @@ impl Dag {
         required.is_subset(&self.witnessing_authors(target))
     }
 
-    /// Retained membership (system) events in canonical (topo) order. Membership
-    /// events are retained forever and are few; a node ships them to a catching-up
-    /// peer alongside a SEALED reply so a sealed boundary can never *hide* a
-    /// retained membership event — the peer can always re-derive the member set
-    /// even when the intervening heartbeats are pruned.
-    pub fn system_events_topo(&self) -> Vec<Hash> {
-        let sys: BTreeSet<Hash> = self
-            .events
-            .iter()
-            .filter(|(_, e)| e.system.is_some())
-            .map(|(h, _)| *h)
-            .collect();
-        self.topo_sort(&sys)
-    }
-
     /// Finalized events in canonical order (topo-sort, hash tiebreak) — the
     /// reducer's input. Ancestry-closed. Re-folds each call; incremental
     /// application is a near-term optimization (DESIGN.md).
@@ -392,124 +367,6 @@ impl Dag {
             .filter(|h| self.is_finalized(h))
             .collect();
         self.topo_sort(&finalized)
-    }
-
-    // ===== Pruning =============================================================
-    //
-    // Anything below the finalized frontier is safe to drop: all-members finality
-    // means every member has witnessed the frontier, so every member already
-    // holds everyone's events up to it and no future event will reference below
-    // it. `compact` drops the strict common ancestors of all current heads
-    // (finalized, and — for payloads — already delivered), folding their
-    // membership ops into `base_members`. The member set derived at any event is
-    // invariant to how far a node has pruned, so nodes stay in agreement.
-
-    /// Compact the DAG, dropping sealed events below the frontier. `delivered` is
-    /// the set of payload events already delivered (we only prune a payload once
-    /// it's been delivered). Returns the pruned event hashes.
-    ///
-    /// A catching-up node reconstructs the pruned region from an
-    /// `install_checkpoint` (base members + sealed anchors) rather than the
-    /// dropped bodies.
-    pub fn compact(&mut self, delivered: &BTreeSet<Hash>) -> Vec<Hash> {
-        // Heads of every current member — new events extend from these, so their
-        // strict common ancestors will never be referenced again.
-        let mut heads: Vec<Hash> = Vec::new();
-        for m in self.consensus_members() {
-            heads.extend(self.heads_of(&m));
-        }
-        if heads.is_empty() {
-            return Vec::new();
-        }
-
-        let prunable: BTreeSet<Hash> = self
-            .common_ancestors(&heads)
-            .into_iter()
-            .filter(|h| self.is_finalized(h))
-            .filter(|h| {
-                // Retain membership (system) events forever so the member set is
-                // always derivable from signed history; prune only heartbeats and
-                // already-delivered payloads.
-                self.events.get(h).is_some_and(|e| {
-                    e.system.is_none() && (e.payload.is_empty() || delivered.contains(h))
-                })
-            })
-            .collect();
-        if prunable.is_empty() {
-            return Vec::new();
-        }
-
-        // Membership (system) events are NOT pruned (see the filter above), so
-        // `base_members` stays the genesis set and the full membership history —
-        // including Evict votes — remains derivable from retained signed events.
-        // No fold-into-base is needed.
-
-        // Drop the events; clean their entries out of the reverse index.
-        for h in &prunable {
-            if let Some(deps) = self.events.get(h).map(dep_set) {
-                for d in deps {
-                    if let Some(obs) = self.observed_by.get_mut(&d) {
-                        obs.remove(h);
-                    }
-                }
-            }
-            self.events.remove(h);
-            self.observed_by.remove(h);
-        }
-        self.recompute_sealed();
-        prunable.into_iter().collect()
-    }
-
-    /// Recompute the boundary: pruned events still referenced by a retained
-    /// event's `self_parent`/`refs`. Kept as bare anchors; the rest are gone.
-    fn recompute_sealed(&mut self) {
-        let mut sealed = BTreeSet::new();
-        for ev in self.events.values() {
-            for d in dep_set(ev) {
-                if !self.events.contains_key(&d) {
-                    sealed.insert(d);
-                }
-            }
-        }
-        self.sealed = sealed;
-    }
-
-
-    /// Mark WANTed-but-pruned hashes as sealed anchors — a peer vouches (from its
-    /// own pruning) that they're pruned-and-settled — then re-drive buffered
-    /// events waiting on them. Replaces bulk checkpoint adoption: sealed info flows
-    /// on-demand, per hash, derived from each peer's own history. Safe because a
-    /// pruned event is never a membership op (those are retained), so sealing it
-    /// can't change the member set.
-    pub fn mark_sealed(&mut self, hashes: &[Hash]) {
-        let mut redrive = Vec::new();
-        for h in hashes {
-            if !self.events.contains_key(h) && self.sealed.insert(*h) {
-                if let Some(waiters) = self.pending.remove(h) {
-                    redrive.extend(waiters);
-                }
-            }
-        }
-        for ev in redrive {
-            let _ = self.ingest(ev);
-        }
-    }
-
-    /// Events that are ancestors of *every* head (strict — heads excluded).
-    fn common_ancestors(&self, heads: &[Hash]) -> BTreeSet<Hash> {
-        let mut iter = heads.iter();
-        let Some(&first) = iter.next() else {
-            return BTreeSet::new();
-        };
-        let mut common = self.ancestors_of(&[first]);
-        for &h in iter {
-            let anc = self.ancestors_of(&[h]);
-            common.retain(|x| anc.contains(x));
-        }
-        for h in heads {
-            common.remove(h);
-        }
-        common
     }
 
     fn topo_sort(&self, set: &BTreeSet<Hash>) -> Vec<Hash> {
@@ -859,249 +716,5 @@ mod tests {
         let m = dag.consensus_members();
         assert!(!m.contains(&pk(&c)), "c evicted by majority (2 of 3)");
         assert!(m.contains(&pk(&a)) && m.contains(&pk(&b)));
-    }
-
-    // ----- pruning -----
-
-    #[test]
-    fn compact_prunes_sealed_history_and_preserves_finality() {
-        let a = key(1);
-        let b = key(2);
-        let mut dag = Dag::new(members(&[&a, &b]));
-        let ga = ev(&a, None, Vec::new(), Vec::new());
-        let gb = ev(&b, None, Vec::new(), Vec::new());
-        let (gah, gbh) = (ga.event_hash(), gb.event_hash());
-        dag.ingest(ga).unwrap();
-        dag.ingest(gb).unwrap();
-
-        let m1 = ev(&a, Some(gah), alloc::vec![gbh], b"one".to_vec());
-        let m1h = m1.event_hash();
-        dag.ingest(m1).unwrap();
-        let b1 = ev(&b, Some(gbh), alloc::vec![m1h], Vec::new());
-        let b1h = b1.event_hash();
-        dag.ingest(b1).unwrap();
-
-        let m2 = ev(&a, Some(m1h), alloc::vec![b1h], b"two".to_vec());
-        let m2h = m2.event_hash();
-        dag.ingest(m2).unwrap();
-        let b2 = ev(&b, Some(b1h), alloc::vec![m2h], Vec::new());
-        dag.ingest(b2).unwrap();
-
-        assert_eq!(dag.events.len(), 6);
-        assert!(dag.is_finalized(&m2h));
-
-        // m1 has been delivered; ga/gb/b1 are empty grafts → all droppable.
-        let pruned = dag.compact(&BTreeSet::from([m1h]));
-        assert!(pruned.contains(&gah) && pruned.contains(&m1h) && pruned.contains(&b1h));
-        assert!(!dag.has(&m1h));
-        assert!(dag.events.len() < 6);
-
-        // Derivation survives: membership unchanged, m2 still finalized.
-        assert_eq!(dag.consensus_members(), members(&[&a, &b]));
-        assert!(dag.is_finalized(&m2h));
-    }
-
-    #[test]
-    fn compact_retains_membership_events() {
-        let a = key(1);
-        let b = key(2);
-        let n = key(7);
-        let mut dag = Dag::new(members(&[&a, &b]));
-        let ga = ev(&a, None, Vec::new(), Vec::new());
-        let gb = ev(&b, None, Vec::new(), Vec::new());
-        let (gah, gbh) = (ga.event_hash(), gb.event_hash());
-        dag.ingest(ga).unwrap();
-        dag.ingest(gb).unwrap();
-
-        let intro = sys(&a, Some(gah), alloc::vec![gbh], SystemOp::Introduce { node: pk(&n) });
-        let ih = intro.event_hash();
-        dag.ingest(intro).unwrap();
-        let b1 = ev(&b, Some(gbh), alloc::vec![ih], Vec::new());
-        let b1h = b1.event_hash();
-        dag.ingest(b1).unwrap();
-        assert!(dag.consensus_members().contains(&pk(&n)));
-
-        // Advance both members past the introduce so it becomes a common ancestor.
-        let a2 = ev(&a, Some(ih), alloc::vec![b1h], Vec::new());
-        let a2h = a2.event_hash();
-        dag.ingest(a2).unwrap();
-        let b2 = ev(&b, Some(b1h), alloc::vec![a2h], Vec::new());
-        dag.ingest(b2).unwrap();
-
-        let pruned = dag.compact(&BTreeSet::new());
-        // Membership events are RETAINED (not pruned or folded) — the member set
-        // stays derivable from signed history; base_members stays the genesis set.
-        assert!(!pruned.contains(&ih), "the Introduce is retained");
-        assert!(dag.has(&ih));
-        assert!(!dag.base_members.contains(&pk(&n)), "base_members stays the genesis set");
-        assert!(dag.consensus_members().contains(&pk(&n)), "N still derived as a member");
-        assert!(!pruned.is_empty(), "non-system events below the frontier are pruned");
-    }
-
-    #[test]
-    fn mark_sealed_lets_a_behind_node_bootstrap_past_the_watermark() {
-        // A builds history admitting N, then prunes it into a checkpoint.
-        let a = key(1);
-        let b = key(2);
-        let n = key(7);
-        let mut src = Dag::new(members(&[&a, &b]));
-        let ga = ev(&a, None, Vec::new(), Vec::new());
-        let gb = ev(&b, None, Vec::new(), Vec::new());
-        let (gah, gbh) = (ga.event_hash(), gb.event_hash());
-        src.ingest(ga).unwrap();
-        src.ingest(gb).unwrap();
-        let intro = sys(&a, Some(gah), alloc::vec![gbh], SystemOp::Introduce { node: pk(&n) });
-        let ih = intro.event_hash();
-        src.ingest(intro).unwrap();
-        let b1 = ev(&b, Some(gbh), alloc::vec![ih], Vec::new());
-        let b1h = b1.event_hash();
-        src.ingest(b1).unwrap();
-        let a2 = ev(&a, Some(ih), alloc::vec![b1h], Vec::new());
-        let a2h = a2.event_hash();
-        src.ingest(a2.clone()).unwrap();
-        let b2 = ev(&b, Some(b1h), alloc::vec![a2h], Vec::new());
-        src.ingest(b2.clone()).unwrap();
-
-        src.compact(&BTreeSet::new());
-        // The Introduce is retained; pruned non-system deps become sealed anchors.
-        assert!(src.has(&ih), "membership events survive compaction");
-        assert!(!src.sealed.is_empty(), "pruned non-system deps become sealed anchors");
-
-        // A fresh node (genesis members from config) syncs the retained events; for
-        // the pruned boundary deps a peer answers its WANT with a SEALED marker →
-        // mark_sealed. No bulk checkpoint, no transferred base_members.
-        let retained: Vec<Event> = src.events.values().cloned().collect();
-        let sealed: Vec<Hash> = src.sealed.iter().copied().collect();
-        let mut joiner = Dag::new(members(&[&a, &b]));
-        for ev in &retained {
-            let _ = joiner.ingest(ev.clone()); // some buffer on the pruned boundary
-        }
-        joiner.mark_sealed(&sealed); // peer vouches the boundary deps are pruned
-        for ev in &retained {
-            let _ = joiner.ingest(ev.clone()); // re-drive now that the boundary is sealed
-        }
-        assert!(joiner.has(&a2h), "retained events reconstructed past the watermark");
-        assert!(joiner.consensus_members().contains(&pk(&n)), "N derived from the retained Introduce");
-    }
-
-    #[test]
-    fn membership_survives_a_sealed_introduce_path() {
-        // Build an A+B chain that admits B, run it long enough that compaction
-        // seals the interior events between the (retained) Introduce and the
-        // frontier, then confirm the member set at the frontier STILL includes B
-        // even though ancestors_of() can no longer walk back to the Introduce.
-        let a = key(1);
-        let b = key(2);
-        let mut d = Dag::new(members(&[&a]));
-        let ga = ev(&a, None, Vec::new(), Vec::new());
-        let gah = ga.event_hash();
-        d.ingest(ga).unwrap();
-        let intro = sys(&a, Some(gah), Vec::new(), SystemOp::Introduce { node: pk(&b) });
-        let ih = intro.event_hash();
-        d.ingest(intro).unwrap();
-        // B grafts its admission, then A and B alternate, each witnessing the
-        // other, so the interior finalizes and becomes prunable.
-        let gb = ev(&b, None, alloc::vec![ih], Vec::new());
-        let mut ah = ih;
-        let mut bh = gb.event_hash();
-        d.ingest(gb).unwrap();
-        for _ in 0..6 {
-            let na = ev(&a, Some(ah), alloc::vec![bh], Vec::new());
-            ah = na.event_hash();
-            d.ingest(na).unwrap();
-            let nb = ev(&b, Some(bh), alloc::vec![ah], Vec::new());
-            bh = nb.event_hash();
-            d.ingest(nb).unwrap();
-        }
-        // Sanity: B is a member before compaction (full ancestry present).
-        assert!(d.consensus_members().contains(&pk(&b)));
-
-        d.compact(&BTreeSet::new());
-        assert!(d.has(&ih), "the Introduce (system event) is retained");
-        // The interior between the Introduce and the frontier is sealed, so the
-        // path back to the Introduce is broken for ancestors_of().
-        assert!(!d.sealed.is_empty(), "interior events sealed");
-
-        // THE INVARIANT: membership at the current frontier still includes B,
-        // even though the Introduce now sits behind a sealed boundary.
-        let heads: alloc::vec::Vec<Hash> =
-            d.consensus_members().iter().flat_map(|m| d.heads_of(m)).collect();
-        assert!(
-            d.members_at_frontier(&heads).contains(&pk(&b)),
-            "member survives a sealed Introduce path"
-        );
-        assert!(d.consensus_members().contains(&pk(&b)), "and stays in consensus");
-    }
-
-    // KNOWN GAP (tracked, non-blocking): `members_at_frontier` folds `ancestors_of`,
-    // which stops at a sealed boundary — so a retained Introduce that sits behind a
-    // `mark_sealed` boundary is present but unreachable, and the member set at the
-    // head under-counts (while `consensus_members`, which folds finalized events
-    // directly, still sees it). This only affects finality PRECISION (is_finalized
-    // may under-count required witnesses under an unusual sealing pattern — never
-    // stuck), and normal compaction does NOT strand membership (see the passing
-    // `membership_survives_a_sealed_introduce_path`). A correct fix has to stay
-    // finality-aware: a naive structural fold breaks is_finalized's exclude-own-
-    // effect when an event's own deps are sealed. Left as a design pass.
-    #[test]
-    #[ignore = "tracked: members_at_frontier under-counts across a mark_sealed boundary; needs a finality-aware fix"]
-    fn membership_under_a_mark_sealed_boundary() {
-        // The joiner path: a catching-up node receives a retained Introduce and a
-        // later head, but SEALS the interior events between them (it got SEALED
-        // markers, never the events). The Introduce is present but unreachable via
-        // ancestors_of — does the member set at the head still include the member?
-        let a = key(1);
-        let b = key(2);
-        // Author A's chain on a source so the hashes are real + consistent:
-        // G -> I(introduce B) -> M1 -> M2 -> H
-        let src_a = key(1);
-        let g = ev(&src_a, None, Vec::new(), Vec::new());
-        let gh = g.event_hash();
-        let i = sys(&src_a, Some(gh), Vec::new(), SystemOp::Introduce { node: pk(&b) });
-        let ih = i.event_hash();
-        let m1 = ev(&src_a, Some(ih), Vec::new(), Vec::new());
-        let m1h = m1.event_hash();
-        let m2 = ev(&src_a, Some(m1h), Vec::new(), Vec::new());
-        let m2h = m2.event_hash();
-        let h = ev(&src_a, Some(m2h), Vec::new(), Vec::new());
-        let hh = h.event_hash();
-
-        // Joiner: base [A]. It holds the Introduce + the head, but the interior
-        // (G, M1, M2) is sealed — received as SEALED boundary markers.
-        let mut d = Dag::new(members(&[&a]));
-        d.mark_sealed(&[gh, m1h, m2h]);
-        d.ingest(i).unwrap(); // self_parent G is sealed -> admits
-        d.ingest(h).unwrap(); // self_parent M2 is sealed -> admits
-        assert!(d.has(&ih) && d.has(&hh), "holds Introduce + head");
-
-        // consensus_members folds finalized events directly -> sees B.
-        assert!(d.consensus_members().contains(&pk(&b)), "B in consensus");
-        // THE INVARIANT (currently the gap): members at the head still includes B,
-        // even though the Introduce sits behind the sealed interior boundary.
-        assert!(
-            d.members_at_frontier(&[hh]).contains(&pk(&b)),
-            "member survives a mark_sealed boundary to its Introduce"
-        );
-    }
-
-    #[test]
-    fn system_events_topo_returns_only_membership_events() {
-        // The WANT handler ships these alongside a SEALED reply so a sealed
-        // boundary can never hide a retained membership event.
-        let a = key(1);
-        let n = key(7);
-        let mut d = Dag::new(members(&[&a]));
-        let ga = ev(&a, None, Vec::new(), Vec::new());
-        let gah = ga.event_hash();
-        d.ingest(ga).unwrap();
-        let intro = sys(&a, Some(gah), Vec::new(), SystemOp::Introduce { node: pk(&n) });
-        let ih = intro.event_hash();
-        d.ingest(intro).unwrap();
-        // A heartbeat (non-system, empty payload) extends the chain.
-        let hb = ev(&a, Some(ih), Vec::new(), Vec::new());
-        d.ingest(hb).unwrap();
-
-        // Only the Introduce is a system event; genesis + heartbeat are excluded.
-        assert_eq!(d.system_events_topo(), alloc::vec![ih]);
     }
 }

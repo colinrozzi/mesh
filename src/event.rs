@@ -15,7 +15,7 @@
 //!   self_parent:  1 tag byte (0 = none, 1 = present) + 32 bytes iff present
 //!   refs:         u16 count (BE) + count * 32 bytes
 //!   payload:      u32 len (BE) + len bytes
-//!   system:       1 tag byte (0 = none, 1 = Introduce, 2 = Depart) + node[32] iff 1|2
+//!   system:       1 tag byte (0 = none, 1 = Introduce, 2 = Depart, 3 = Evict) + node[32] iff 1|2|3
 //!   signature:    64 bytes — ed25519 over sha256(all of the above, sans sig)
 
 use alloc::format;
@@ -274,6 +274,7 @@ mod tests {
             Event::sign(sk, 1003, Some([1u8; 32]), alloc::vec![[2u8; 32]], b"hi".to_vec(), None), // graft+payload
             Event::sign(sk, 1004, Some([1u8; 32]), Vec::new(), Vec::new(), Some(SystemOp::Introduce { node: [7u8; 32] })),
             Event::sign(sk, 1005, Some([1u8; 32]), Vec::new(), Vec::new(), Some(SystemOp::Depart { node: [8u8; 32] })),
+            Event::sign(sk, 1006, Some([1u8; 32]), Vec::new(), Vec::new(), Some(SystemOp::Evict { node: [9u8; 32] })),
         ]
     }
 

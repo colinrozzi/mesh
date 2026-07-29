@@ -103,13 +103,10 @@ pub fn events_from_json(s: &str) -> Vec<Event> {
 
 #[derive(serde::Serialize, serde::Deserialize, Default)]
 struct DagBlob {
-    /// Membership derivation base (hex pubkeys) — the member set as of the pruned
-    /// watermark. Advances as `compact` folds pruned Introduce/Depart ops in.
+    /// Membership derivation base (hex pubkeys) — the configured genesis set the
+    /// fold starts from. The mesh retains full history, so it never advances.
     #[serde(default)]
     base_members: Vec<String>,
-    /// Sealed boundary anchors (hex hashes): pruned events still referenced.
-    #[serde(default)]
-    sealed: Vec<String>,
     /// event_hash_hex -> event_bytes_hex (the canonical Event::encode()).
     events_hex: BTreeMap<String, String>,
 }
@@ -120,19 +117,17 @@ pub fn dag_to_json(dag: &Dag) -> String {
         events_hex.insert(hex(h), hex(&ev.encode()));
     }
     let base_members = dag.base_members.iter().map(|pk| hex(pk)).collect();
-    let sealed = dag.sealed.iter().map(|h| hex(h)).collect();
-    serde_json::to_string(&DagBlob { base_members, sealed, events_hex })
+    serde_json::to_string(&DagBlob { base_members, events_hex })
         .unwrap_or_else(|_| "{}".to_string())
 }
 
-/// Rebuild a Dag from persisted state, including its checkpoint (base members +
-/// sealed anchors). These events were already validated when first ingested, so
-/// we `rehydrate` (rebuild indices) instead of re-running signature + rule checks.
+/// Rebuild a Dag from persisted state. These events were already validated when
+/// first ingested, so we `rehydrate` (rebuild indices) instead of re-running
+/// signature + rule checks.
 pub fn dag_from_json(s: &str) -> Result<Dag, String> {
     let blob: DagBlob = serde_json::from_str(s).unwrap_or_default();
     let base_members: BTreeSet<PubKey> =
         blob.base_members.iter().filter_map(|h| from_hex32(h).ok()).collect();
-    let sealed: BTreeSet<Hash> = blob.sealed.iter().filter_map(|h| from_hex32(h).ok()).collect();
     let mut events = Vec::with_capacity(blob.events_hex.len());
     for ev_hex in blob.events_hex.values() {
         let bytes = from_hex(ev_hex)?;
@@ -140,7 +135,7 @@ pub fn dag_from_json(s: &str) -> Result<Dag, String> {
             events.push(ev);
         }
     }
-    Ok(Dag::rehydrate(base_members, sealed, events))
+    Ok(Dag::rehydrate(base_members, events))
 }
 
 #[cfg(test)]

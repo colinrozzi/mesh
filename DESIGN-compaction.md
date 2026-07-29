@@ -1,7 +1,17 @@
 # Compaction: quorum-certified state checkpoints
 
-**Status:** design / not yet built. Supersedes the seal-and-prune retention model
-(`DESIGN-retention.md`) as the intended long-term shape.
+**Status: DEFERRED — design retained, not built (and the earlier trimming code
+was removed).** As of v0.4 the mesh keeps its **full event history** — there is
+no compaction, no seal-and-prune, no checkpoints. This was a deliberate step
+back: the checkpoint driver had grown a pile of node-level mechanisms (generous
+sealing, two-watermark anchor-pruning, depth-quantized proposals) bolted *around*
+a graph that doesn't compact cleanly on its own — the hack smell — and we have no
+real workload yet to tell us the true shape of the storage problem. The elegant
+version is compaction *intrinsic* to the graph (the "Future elegance" ladder
+below); approximating it with driver heuristics is worse than waiting. Revisit
+under real load, when we can do it as a clean graph primitive. This doc is kept
+as the design record and the rung ladder; the mechanism below is sound, just
+early.
 
 This doc describes how a mesh trims its history without losing the ability to
 *verify* the state that history produced — by treating retention as **compaction**
@@ -109,6 +119,36 @@ from the **checkpointed member set** (the new base), not from genesis. The settl
 membership is *in* the base, so there is nothing behind a seal to strand. The
 reachability gap disappears — not as a patch, but as a consequence of doing
 retention correctly.
+
+## Slice-3 findings (empirical — a first node-integration cut)
+
+A first node driver (propose the finalized frontier every tick + co-sign valid
+proposals + `rebase_to_best_canon_checkpoint`) was wired into `handle_tick` and
+run on a live 2-member theater mesh. It **worked mechanically** — checkpoints
+formed, reached canon, and rebased repeatedly, with correct membership — but a
+70s run surfaced two hazards that must be solved before the driver is safe. The
+wiring was reverted; the dag primitives (op, canon, rebase) are kept + tested.
+
+1. **Safe-drop vs. peer in-flight refs (the sharp one).** Rebase drops everything
+   ≤ the cut. A peer that hasn't *yet* advanced to that cut may still have
+   *in-flight* events referencing dropped events; those arrive, find their deps
+   missing (dropped, and not sealed because none of *our* retained events
+   reference them), buffer forever, never admit — so `last_heard` for that peer
+   goes stale and it gets spuriously evicted → N=2 shutdown (observed at ~45s).
+   Canon proves every member *reached* W; it does **not** prove their in-flight
+   sends are drained. The drop must therefore seal a **generous boundary** (seal
+   *all* dropped hashes, or those a lagging peer could still reference), or defer
+   the drop until peers have provably advanced. This is the crux of correct
+   distributed compaction.
+2. **Proposal churn.** Proposing the finalized frontier *every tick* mints
+   checkpoints faster than rebase reclaims them (retained count climbed). The
+   proposal cadence needs rate-limiting — e.g. propose only when the finalized
+   frontier has advanced by ≥ K, or every K ticks — while co-signing stays
+   always-responsive so convergence isn't slowed.
+
+Both are node-driver concerns, not flaws in the dag primitives. The primitives
+(`Checkpoint` op, `checkpoint_canon`, `rebase_to_checkpoint`) are correct and
+tested; the driver is the remaining, careful work.
 
 ## Open questions (none fatal)
 

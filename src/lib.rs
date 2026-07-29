@@ -48,7 +48,7 @@ use wire::{
     decode_hashes, encode_ack, encode_auth, encode_challenge, encode_deliver, encode_hashes,
     encode_hello, encode_notify, encode_rejected, try_parse_frame, ParsedFrame, FRAME_ACCEPTED,
     FRAME_AUTH, FRAME_CHALLENGE, FRAME_DELIVER, FRAME_DEPART, FRAME_FRONTIER, FRAME_HELLO,
-    FRAME_INTRODUCE, FRAME_SEALED, FRAME_SUBMIT, FRAME_WANT,
+    FRAME_INTRODUCE, FRAME_SUBMIT, FRAME_WANT,
 };
 
 #[derive(Clone, GraphValue)]
@@ -449,8 +449,8 @@ fn on_data(state: ActorState, conn_id: String, data: Vec<u8>) -> Result<(ActorSt
                             }
                         }
                         // Announce our frontier; a behind peer WANTs what it lacks
-                        // and we answer with the event, or a SEALED marker if we've
-                        // pruned it. No bulk checkpoint is sent.
+                        // and we answer with the event (full history is retained,
+                        // so every event we've admitted is still here to serve).
                         let _ = tcp_send(
                             conn_id.clone(),
                             encode_hashes(FRAME_FRONTIER, &all_heads(&dag)),
@@ -530,11 +530,12 @@ fn handle_tick(state: ActorState, _timer_name: String) -> Result<(ActorState, ()
     } else {
         Some(from_hex32(&state.self_head_hex)?)
     };
-    let mut delivered: BTreeSet<Hash> = hashes_from_json(&state.delivered_json).into_iter().collect();
+    // Carried through unchanged (client NOTIFY dedup); the tick no longer mutates it.
+    let delivered: BTreeSet<Hash> = hashes_from_json(&state.delivered_json).into_iter().collect();
 
     // Heartbeat pump: if we're a member WITH peers, author a noop event each tick
-    // so the frontier keeps advancing — a per-member liveness signal that also lets
-    // compaction trim even on an otherwise-idle mesh. A sole member skips (its
+    // so the frontier keeps advancing — a per-member liveness signal that keeps
+    // finality moving even on an otherwise-idle mesh. A sole member skips (its
     // events auto-finalize; no one to prove liveness to), as does a not-yet-admitted
     // joining node. Each heartbeat grafts peers' recent heads, so heartbeats
     // mutually finalize; receiving one begets no graft, so there's no witness storm.
@@ -545,21 +546,12 @@ fn handle_tick(state: ActorState, _timer_name: String) -> Result<(ActorState, ()
         self_head = nh;
     }
 
-    // Periodic compaction: drop sealed history below the finalized frontier. Safe
-    // because catch-up carries a checkpoint (base members + sealed anchors), so a
-    // behind node can bootstrap past the watermark.
-    let pruned = dag.compact(&delivered);
-    for h in &pruned {
-        delivered.remove(h);
-    }
-    if !pruned.is_empty() {
-        log(format!(
-            "[mesh] compacted {} events; {} retained, {} sealed",
-            pruned.len(),
-            dag.events.len(),
-            dag.sealed.len()
-        ));
-    }
+    // History retention: the mesh keeps its full event graph. There is no
+    // compaction or sealing — every node holds every event, so all dependencies
+    // resolve to real bodies and membership is always derivable by folding the
+    // complete ancestry. (Bounded-storage compaction is deferred until real usage
+    // shows the need and we can do it as a clean graph primitive; see
+    // DESIGN-compaction.md.)
 
     // A bootstrap member that just got its app subscribed becomes "ready" here.
     let ready_sent = maybe_emit_ready(&state.app_id, &dag, &self_pk, state.ready_sent);
@@ -828,28 +820,12 @@ fn handle_authed_frame(
             author_and_broadcast(dag, conns, conn_id, signing_key, self_head, Vec::new(), op)
         }
         FRAME_WANT => {
-            // Answer each WANT with the event if we hold it, or a SEALED marker if
-            // we've pruned it (so the requester can seal the boundary and move on).
-            let mut sealed = Vec::new();
+            // Answer each WANT with the event if we hold it. The mesh retains full
+            // history, so anything we've admitted is still here to serve; a hash we
+            // don't hold yet we simply skip and the requester re-asks.
             for h in decode_hashes(&frame.payload) {
                 if let Some(ev) = dag.events.get(&h) {
                     let _ = tcp_send(conn_id.to_string(), encode_deliver(&ev.encode()));
-                } else if dag.sealed.contains(&h) {
-                    sealed.push(h);
-                }
-            }
-            if !sealed.is_empty() {
-                let _ = tcp_send(conn_id.to_string(), encode_hashes(FRAME_SEALED, &sealed));
-                // Defense in depth: a sealed boundary must never HIDE a retained
-                // membership event from a catching-up peer (else it can't derive
-                // the member set — the second-order effect behind the v0.3.0 join
-                // starvation). Membership events are retained forever and few, so
-                // ship them alongside the seal; the peer dedups any it holds and
-                // admits the rest against the sealed boundary.
-                for h in dag.system_events_topo() {
-                    if let Some(ev) = dag.events.get(&h) {
-                        let _ = tcp_send(conn_id.to_string(), encode_deliver(&ev.encode()));
-                    }
                 }
             }
             self_head
@@ -857,17 +833,11 @@ fn handle_authed_frame(
         FRAME_FRONTIER => {
             let missing: Vec<Hash> = decode_hashes(&frame.payload)
                 .into_iter()
-                .filter(|h| !dag.has(h) && !dag.sealed.contains(h))
+                .filter(|h| !dag.has(h))
                 .collect();
             if !missing.is_empty() {
                 let _ = tcp_send(conn_id.to_string(), encode_hashes(FRAME_WANT, &missing));
             }
-            self_head
-        }
-        FRAME_SEALED => {
-            // A peer vouches these WANTed hashes are pruned/settled; seal them and
-            // re-drive anything buffered on them. No trusted bulk checkpoint.
-            dag.mark_sealed(&decode_hashes(&frame.payload));
             self_head
         }
         // ACK / NOTIFY are responses meant for app clients; a node ignores them.

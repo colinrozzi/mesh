@@ -34,7 +34,6 @@ pub const FRAME_INTRODUCE: u8 = 0x12; // author Introduce{pubkey} — admit a me
 pub const FRAME_DEPART: u8 = 0x13; // author Depart{self} — leave the network
 pub const FRAME_FRONTIER: u8 = 0x20;
 pub const FRAME_WANT: u8 = 0x21;
-pub const FRAME_SEALED: u8 = 0x23; // hash-list — "these WANTed hashes are pruned/sealed"
 
 // node → client/dialer
 pub const FRAME_CHALLENGE: u8 = 0x80;

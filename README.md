@@ -262,8 +262,9 @@ mesh/
 **Working:** self-rooted logs; multi-parent DAG with forks admitted; **dynamic
 membership** (runtime introduce/depart); grafting as unified dissemination /
 witnessing / catch-up; all-members finality; broadcast delivery of committed
-payloads; **pruning/compaction with snapshot transfer** (bounded storage, and a
-behind node bootstraps from a checkpoint); single- and multi-node operation.
+payloads; **full history retention** (the mesh keeps its complete event graph —
+no pruning; bounded-storage compaction is deferred, see `DESIGN-compaction.md`);
+single- and multi-node operation.
 
 **App interface** (`DESIGN.md` → *App interface*): a co-located app actor drives
 its own node over theater's `message-server` — `request` commands + a
@@ -277,17 +278,22 @@ message-server addressability).
 protocol (see *Using mesh from an actor*). Built + proven end-to-end
 (`compose-smoke`); the mesh interface + the opt-in `mesh-control` envelope.
 
-**Released — v0.3 (ephemeral membership; see `DESIGN-ephemeral-membership.md`
-+ `DESIGN-retention.md`):** signed event timestamps; **self-serve join**
+**Released — v0.3 (ephemeral membership; see `DESIGN-ephemeral-membership.md`):**
+signed event timestamps; **self-serve join**
 (`join_allow` + auto-introduce, so a node joins without an out-of-band introduce —
 `join-test`); a **heartbeat pump** (members author noop events so the frontier keeps
-advancing → per-member liveness + continuous compaction); a **sync-ready** signal
+advancing → per-member liveness); a **sync-ready** signal
 (the node tells the app when it's admitted+synced); **quorum eviction** (a stale
 member is voted out by a majority — 2f+1 — and at N=2 the node shuts down instead;
-`evict-test`); and **retention** that retains net membership history + trims
-payloads, with no checkpoint on the wire (a peer answers a `WANT` for a pruned hash
-with a `SEALED` marker derived from its own history). A breaking event/delivery
+`evict-test`). A breaking event/delivery
 format change (signed timestamps) → a v0.3 node interoperates only with v0.3 peers.
+
+**v0.4 (full retention):** the seal-and-prune retention shipped in v0.3 was
+**removed** — the mesh now keeps its complete event history. This dropped all
+compaction/sealing/checkpoint machinery (and the `SEALED` wire frame), pending a
+clean graph-native compaction under real load (`DESIGN-compaction.md`). Wire
+format is otherwise unchanged, but a v0.4 node no longer sends or understands
+`SEALED`.
 
 **Near-term** (see `DESIGN.md`): incremental finality/delivery (currently
 re-scans the retained DAG each callback), batched emission (currently
