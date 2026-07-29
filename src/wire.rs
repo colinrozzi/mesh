@@ -2,7 +2,8 @@
 //!
 //! Frame = LEN(u32 BE) + KIND(u8) + PAYLOAD(bytes).
 //!
-//! Handshake (membership checked against static config):
+//! Handshake (identity proof only — transport is membership-permissive; the SM
+//! gates membership, see DESIGN-rsm.md):
 //!   0x01 HELLO       pubkey[32]
 //!   0x02 AUTH        signature[64]                 (signs the challenge nonce)
 //!   0x80 CHALLENGE   nonce[32]
@@ -30,8 +31,6 @@ pub const FRAME_HELLO: u8 = 0x01;
 pub const FRAME_AUTH: u8 = 0x02;
 pub const FRAME_DELIVER: u8 = 0x10;
 pub const FRAME_SUBMIT: u8 = 0x11;
-pub const FRAME_INTRODUCE: u8 = 0x12; // author Introduce{pubkey} — admit a member
-pub const FRAME_DEPART: u8 = 0x13; // author Depart{self} — leave the network
 pub const FRAME_FRONTIER: u8 = 0x20;
 pub const FRAME_WANT: u8 = 0x21;
 

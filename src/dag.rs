@@ -1,55 +1,23 @@
-//! DAG storage + finality, over a multi-parent event graph with dynamic
-//! membership.
+//! DAG storage over a multi-parent event graph — the **dumb core** (DESIGN-rsm.md).
 //!
-//! Each event has back-edges `self_parent ∪ refs` (see event.rs). Membership is
-//! **derived**: it starts from a configured genesis set and evolves as
-//! `Introduce`/`Depart` system events finalize. The substrate interprets those
-//! ops directly (it must — finality depends on the member set). See DESIGN.md.
-//!
-//! Two member-set views:
-//!   - `members_at_frontier(deps)` — members *live at a point*, folded from the
-//!     ancestry reachable from `deps`. Used to validate an event and to decide
-//!     which members must witness it for finality.
-//!   - `consensus_members()` — members folded over the *finalized* order. The
-//!     agreed current set; used for the membership-gated handshake.
+//! Each event has back-edges `self_parent ∪ refs` (see event.rs). This module owns
+//! only the *structure*: it stores events, buffers them until their dependencies
+//! arrive, records the reverse adjacency ("who observes me"), and answers the
+//! witness / ancestry / topological queries the node needs to drive the consumer
+//! state machine's fold. It has **no notion of membership, finality, or ordering
+//! as a contract** — validity is the SM's job (the node folds each event through
+//! `validate`/`apply` against its ancestry-relative state; see lib.rs). `topo_sort`
+//! survives only as a *local* convenience for building that fold order, never as a
+//! total order the contract depends on.
 
 use alloc::collections::{BTreeMap, BTreeSet};
-use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use crate::codec::hex;
-use crate::event::{Event, Hash, PubKey, SystemOp};
+use crate::event::{Event, Hash, PubKey};
 
 /// The back-edges of an event: its `self_parent` (if any) and its `refs`,
 /// de-duplicated (an honest event won't repeat, but decode permits it).
-/// Remove every node a majority of the current member set has voted to evict.
-/// Loops because removing one member changes `n` and voter validity; sorted
-/// (`BTreeMap`) iteration keeps the choice deterministic across nodes.
-fn apply_evictions(members: &mut BTreeSet<PubKey>, votes: &mut BTreeMap<PubKey, BTreeSet<PubKey>>) {
-    loop {
-        let majority = members.len() / 2 + 1;
-        let mut evict = None;
-        for (node, voters) in votes.iter() {
-            if !members.contains(node) {
-                continue;
-            }
-            let valid = voters.iter().filter(|v| members.contains(*v)).count();
-            if valid >= majority {
-                evict = Some(*node);
-                break;
-            }
-        }
-        match evict {
-            Some(node) => {
-                members.remove(&node);
-                votes.remove(&node);
-            }
-            None => break,
-        }
-    }
-}
-
 fn dep_set(ev: &Event) -> BTreeSet<Hash> {
     let mut deps = BTreeSet::new();
     if let Some(sp) = ev.self_parent {
@@ -61,13 +29,8 @@ fn dep_set(ev: &Event) -> BTreeSet<Hash> {
     deps
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct Dag {
-    /// The derivation base for membership: the configured genesis set that
-    /// `fold_membership` folds `Introduce`/`Depart`/`Evict` onto. The mesh
-    /// retains full history, so this stays the genesis set for the life of the
-    /// DAG (nothing advances it) — it is simply the fold's starting point.
-    pub base_members: BTreeSet<PubKey>,
     pub events: BTreeMap<Hash, Event>,
     /// Reverse adjacency: for each event hash, the events that directly
     /// reference it (via `self_parent` or `refs`) — "who observes me."
@@ -78,18 +41,13 @@ pub struct Dag {
 }
 
 impl Dag {
-    pub fn new(base_members: BTreeSet<PubKey>) -> Self {
-        Dag {
-            base_members,
-            events: BTreeMap::new(),
-            observed_by: BTreeMap::new(),
-            pending: BTreeMap::new(),
-        }
+    pub fn new() -> Self {
+        Dag::default()
     }
 
     /// Rebuild from persisted, already-validated events.
-    pub fn rehydrate(base_members: BTreeSet<PubKey>, events: Vec<Event>) -> Self {
-        let mut dag = Self::new(base_members);
+    pub fn rehydrate(events: Vec<Event>) -> Self {
+        let mut dag = Self::new();
         for ev in events {
             let h = ev.event_hash();
             dag.insert(h, ev);
@@ -105,7 +63,7 @@ impl Dag {
 
     /// Ingest one event. `Ok(true)` on accept (or already-present),
     /// `Ok(false)` when buffered pending a missing dependency, `Err` on hard
-    /// validation failure.
+    /// (structural) failure — a bad signature or a mis-authored self_parent.
     pub fn ingest(&mut self, event: Event) -> Result<bool, String> {
         let mut admitted = Vec::new();
         self.ingest_into(event, &mut admitted)
@@ -115,9 +73,9 @@ impl Dag {
     /// as a result — the event itself plus any buffered waiters that resolved
     /// because it landed. Empty when the event was buffered or already present.
     ///
-    /// The distinction matters for witnessing: during catch-up, a payload event
-    /// often arrives before its dependencies and is admitted later as a *waiter*.
-    /// The caller must witness those too, or they never reach finality.
+    /// The distinction matters for witnessing: during catch-up, an event often
+    /// arrives before its dependencies and is admitted later as a *waiter*. The
+    /// caller must fold those too, or they never enter the state.
     pub fn ingest_admitted(&mut self, event: Event) -> Result<Vec<Hash>, String> {
         let mut admitted = Vec::new();
         self.ingest_into(event, &mut admitted)?;
@@ -127,6 +85,12 @@ impl Dag {
     /// Core ingest, pushing each newly-admitted hash (event + resolved waiters,
     /// transitively) into `admitted`. Returns `true` if `event` was admitted (or
     /// already present), `false` if buffered.
+    ///
+    /// **Structural only** — no membership gate: a non-member's event is admitted
+    /// here (permissive transport) and cleared or stranded by the SM's `validate`
+    /// during the fold. The only checks are the ones intrinsic to the graph: the
+    /// signature must verify, and a `self_parent` must be one of the same author's
+    /// own events.
     fn ingest_into(&mut self, event: Event, admitted: &mut Vec<Hash>) -> Result<bool, String> {
         event.verify_signature()?;
         let h = event.event_hash();
@@ -141,18 +105,6 @@ impl Dag {
             return Ok(false);
         }
 
-        // Members live *at this event's position* — folded from its ancestry.
-        // Belt-and-suspenders: also accept any author in the current finalized set
-        // (`consensus_members`, which folds finalized system events directly). The
-        // two views agree under full ancestry, but this guarantees a bona-fide
-        // member's event is never rejected by a benign ancestry-walk under-count
-        // during a join. Accepting a current member is always sound — it only
-        // widens acceptance, never admits a non-member.
-        let members = self.members_at_frontier(&deps);
-        if !members.contains(&event.author) && !self.consensus_members().contains(&event.author) {
-            return Err(format!("author {} is not a member", hex(&event.author)));
-        }
-
         // self_parent must be one of the author's own events. It is guaranteed
         // present here (the dependency check above admitted it), but we guard with
         // `if let` rather than index to avoid a panic on any future code path.
@@ -160,35 +112,6 @@ impl Dag {
             if let Some(parent) = self.events.get(&sp) {
                 if parent.author != event.author {
                     return Err("self_parent must be authored by the same node".into());
-                }
-            }
-        }
-
-        // Membership-op rules.
-        if let Some(op) = &event.system {
-            match op {
-                SystemOp::Introduce { node } => {
-                    if members.contains(node) {
-                        return Err(format!("Introduce: {} already a member", hex(node)));
-                    }
-                }
-                SystemOp::Depart { node } => {
-                    if !members.contains(node) {
-                        return Err(format!("Depart: {} not a member", hex(node)));
-                    }
-                    if *node != event.author {
-                        return Err("Depart must be self-authored".into());
-                    }
-                }
-                SystemOp::Evict { node } => {
-                    // The author is already verified a member above. A vote is for
-                    // a current member, and never for oneself.
-                    if !members.contains(node) {
-                        return Err(format!("Evict: {} not a member", hex(node)));
-                    }
-                    if *node == event.author {
-                        return Err("Evict must not be self-authored".into());
-                    }
                 }
             }
         }
@@ -242,10 +165,21 @@ impl Dag {
         heads
     }
 
-    // ===== Membership derivation ===============================================
+    // ===== Structural queries (drive the SM fold + gossip) =====================
+
+    /// Every distinct author with an event in the DAG. Replaces the old
+    /// `consensus_members` for frontier/gossip: membership is the SM's concern, so
+    /// the transport just tracks whose chains it holds.
+    pub fn authors(&self) -> BTreeSet<PubKey> {
+        self.events.values().map(|e| e.author).collect()
+    }
 
     /// All events reachable from `frontier` via back-edges (frontier included).
-    fn ancestors_of(&self, frontier: &[Hash]) -> BTreeSet<Hash> {
+    /// The node folds this — an event's causal past — to build the ancestry-
+    /// relative state its `validate` is judged against.
+    // Wired in with ancestry-relative validation + Interface 2 `ancestry` (step 3).
+    #[allow(dead_code)]
+    pub fn ancestors_of(&self, frontier: &[Hash]) -> BTreeSet<Hash> {
         let mut seen = BTreeSet::new();
         let mut stack: Vec<Hash> = frontier.to_vec();
         while let Some(cur) = stack.pop() {
@@ -259,63 +193,10 @@ impl Dag {
         seen
     }
 
-    /// Fold an ordered event sequence into the live member set: `Introduce` adds,
-    /// `Depart` removes, and `Evict` is a *vote* — a node leaves once a majority of
-    /// the current member set (2f+1) has voted to evict it. A fresh
-    /// `Introduce`/`Depart` for a node voids its accumulated votes (a re-joined
-    /// node starts clean). Deterministic given the order, so every node agrees.
-    fn fold_membership(&self, ordered: &[Hash]) -> BTreeSet<PubKey> {
-        let mut members = self.base_members.clone();
-        let mut votes: BTreeMap<PubKey, BTreeSet<PubKey>> = BTreeMap::new();
-        for h in ordered {
-            let Some(ev) = self.events.get(h) else { continue };
-            match ev.system.as_ref() {
-                Some(SystemOp::Introduce { node }) => {
-                    members.insert(*node);
-                    votes.remove(node);
-                }
-                Some(SystemOp::Depart { node }) => {
-                    members.remove(node);
-                    votes.remove(node);
-                }
-                // A vote counts only from a current member other than the evictee.
-                Some(SystemOp::Evict { node })
-                    if ev.author != *node
-                        && members.contains(node)
-                        && members.contains(&ev.author) =>
-                {
-                    votes.entry(*node).or_default().insert(ev.author);
-                }
-                Some(SystemOp::Evict { .. }) => {}
-                None => {}
-            }
-            apply_evictions(&mut members, &mut votes);
-        }
-        members
-    }
-
-    /// Members live at a point whose causal past is `frontier`. Structural (not
-    /// finality-gated): a pure function of the DAG, so every node agrees.
-    fn members_at_frontier(&self, frontier: &[Hash]) -> BTreeSet<PubKey> {
-        let ordered = self.topo_sort(&self.ancestors_of(frontier));
-        self.fold_membership(&ordered)
-    }
-
-    /// The agreed current member set — genesis members with every *finalized*
-    /// membership op folded in canonical order. Used for the handshake.
-    pub fn consensus_members(&self) -> BTreeSet<PubKey> {
-        self.fold_membership(&self.ordered_finalized())
-    }
-
-    // ===== Finality ============================================================
-    //
-    // E is finalized iff every member *live at E's position* has authored an
-    // event that sees E. `members_at_frontier(E's deps)` gives that set; note it
-    // excludes E's own membership effect, so an Introduce doesn't require the new
-    // node to witness its own admission, while a Depart still requires the
-    // departing node (which supplies its own witness by authoring it).
-
-    /// All events that transitively see `target` (target included).
+    /// All events that transitively see `target` (target included). The witness
+    /// structure — feeds `witnesses(E)` (Interface 2) and, when the deferred
+    /// conflict-prone bundle lands, witness-based finality.
+    #[allow(dead_code)]
     pub fn events_that_see(&self, target: &Hash) -> BTreeSet<Hash> {
         let mut seen = BTreeSet::from([*target]);
         let mut frontier = alloc::vec![*target];
@@ -331,48 +212,32 @@ impl Dag {
         seen
     }
 
-    /// Authors of events that see `target`.
-    fn witnessing_authors(&self, target: &Hash) -> BTreeSet<PubKey> {
+    /// Authors of events that see `target` — `witnesses(E)` (DESIGN-rsm Interface 2).
+    // Exposed via the `mesh` interface's `witnesses` request (step 3).
+    #[allow(dead_code)]
+    pub fn witnesses(&self, target: &Hash) -> BTreeSet<PubKey> {
         self.events_that_see(target)
             .iter()
             .filter_map(|h| self.events.get(h).map(|e| e.author))
             .collect()
     }
 
-    /// True iff every member live at `target`'s position has witnessed it.
-    pub fn is_finalized(&self, target: &Hash) -> bool {
-        let Some(ev) = self.events.get(target) else {
-            return false;
-        };
-        let deps: Vec<Hash> = dep_set(ev).into_iter().collect();
-        let mut required = self.members_at_frontier(&deps);
-        // An Evict vote doesn't require the (presumed-dead) evictee to witness its
-        // own removal — mirrors how an Introduce excludes the new node. Without
-        // this, an Evict could never finalize (the evictee never witnesses), so
-        // the handshake set would never drop it.
-        if let Some(SystemOp::Evict { node }) = ev.system.as_ref() {
-            required.remove(node);
-        }
-        required.is_subset(&self.witnessing_authors(target))
+    /// Every admitted event in one topological (hash-tiebroken) order. In
+    /// admission-final v0 this is the whole fold input: the node walks it,
+    /// folding each event through the SM's `validate`/`apply`. A *local*
+    /// convenience — under confluence any linearization yields the same state, so
+    /// the tiebreak is swappable and never part of the contract (DESIGN-rsm §4).
+    pub fn ordered(&self) -> Vec<Hash> {
+        self.topo_sort(&self.events.keys().copied().collect())
     }
 
-    /// Finalized events in canonical order (topo-sort, hash tiebreak) — the
-    /// reducer's input. Ancestry-closed. Re-folds each call; incremental
-    /// application is a near-term optimization (DESIGN.md).
-    pub fn ordered_finalized(&self) -> Vec<Hash> {
-        let finalized: BTreeSet<Hash> = self
-            .events
-            .keys()
-            .copied()
-            .filter(|h| self.is_finalized(h))
-            .collect();
-        self.topo_sort(&finalized)
-    }
-
-    fn topo_sort(&self, set: &BTreeSet<Hash>) -> Vec<Hash> {
+    /// Topologically sort `set` (deps before dependents), hash tiebreak among
+    /// ready nodes. `set` need not be ancestry-closed; edges to events outside it
+    /// are ignored.
+    pub fn topo_sort(&self, set: &BTreeSet<Hash>) -> Vec<Hash> {
         let mut indeg: BTreeMap<Hash, usize> = BTreeMap::new();
         for h in set {
-            let ev = &self.events[h];
+            let Some(ev) = self.events.get(h) else { continue };
             let d = dep_set(ev).iter().filter(|x| set.contains(*x)).count();
             indeg.insert(*h, d);
         }
@@ -410,62 +275,33 @@ mod tests {
         sk.verifying_key().to_bytes()
     }
 
-    fn members(sks: &[&SigningKey]) -> BTreeSet<PubKey> {
-        sks.iter().map(|sk| pk(sk)).collect()
-    }
-
     fn ev(sk: &SigningKey, sp: Option<Hash>, refs: Vec<Hash>, payload: Vec<u8>) -> Event {
-        Event::sign(sk, 0, sp, refs, payload, None)
-    }
-
-    fn sys(sk: &SigningKey, sp: Option<Hash>, refs: Vec<Hash>, op: SystemOp) -> Event {
-        Event::sign(sk, 0, sp, refs, Vec::new(), Some(op))
+        Event::sign(sk, 0, sp, refs, payload)
     }
 
     #[test]
-    fn single_member_finalizes_its_own_genesis() {
-        let a = key(1);
-        let mut dag = Dag::new(members(&[&a]));
-        let g = ev(&a, None, Vec::new(), Vec::new());
-        let gh = g.event_hash();
-        assert!(dag.ingest(g).unwrap());
-        assert!(dag.is_finalized(&gh));
-        assert_eq!(dag.ordered_finalized(), alloc::vec![gh]);
-    }
-
-    #[test]
-    fn two_members_finalize_via_mutual_grafting() {
-        let a = key(1);
-        let b = key(2);
-        let mut dag = Dag::new(members(&[&a, &b]));
-        let ga = ev(&a, None, Vec::new(), Vec::new());
-        let gb = ev(&b, None, Vec::new(), Vec::new());
-        let (gah, gbh) = (ga.event_hash(), gb.event_hash());
-        dag.ingest(ga).unwrap();
-        dag.ingest(gb).unwrap();
-        assert!(!dag.is_finalized(&gah));
-
-        let a1 = ev(&a, Some(gah), alloc::vec![gbh], Vec::new());
-        let b1 = ev(&b, Some(gbh), alloc::vec![gah], Vec::new());
-        dag.ingest(a1).unwrap();
-        dag.ingest(b1).unwrap();
-        assert!(dag.is_finalized(&gah));
-        assert!(dag.is_finalized(&gbh));
-    }
-
-    #[test]
-    fn rejects_non_member_author() {
-        let a = key(1);
+    fn admits_any_signed_author() {
+        // No membership gate in the dumb core: a "stranger" is admitted
+        // structurally (the SM's validate is what would strand a non-member).
         let stranger = key(9);
-        let mut dag = Dag::new(members(&[&a]));
-        assert!(dag.ingest(ev(&stranger, None, Vec::new(), Vec::new())).is_err());
+        let mut dag = Dag::new();
+        assert!(dag.ingest(ev(&stranger, None, Vec::new(), Vec::new())).unwrap());
+    }
+
+    #[test]
+    fn rejects_bad_signature() {
+        let a = key(1);
+        let mut bad = ev(&a, None, Vec::new(), b"x".to_vec());
+        bad.payload[0] ^= 0xff; // invalidates the signature
+        let mut dag = Dag::new();
+        assert!(dag.ingest(bad).is_err());
     }
 
     #[test]
     fn rejects_self_parent_from_another_author() {
         let a = key(1);
         let b = key(2);
-        let mut dag = Dag::new(members(&[&a, &b]));
+        let mut dag = Dag::new();
         let ga = ev(&a, None, Vec::new(), Vec::new());
         let gah = ga.event_hash();
         dag.ingest(ga).unwrap();
@@ -476,7 +312,7 @@ mod tests {
     fn buffers_then_admits_when_dependency_arrives() {
         let a = key(1);
         let b = key(2);
-        let mut dag = Dag::new(members(&[&a, &b]));
+        let mut dag = Dag::new();
         let ga = ev(&a, None, Vec::new(), Vec::new());
         let gah = ga.event_hash();
         dag.ingest(ga).unwrap();
@@ -492,12 +328,12 @@ mod tests {
 
     #[test]
     fn ingest_admitted_reports_resolved_waiters() {
-        // A payload event that arrives before its dep is buffered, then admitted
-        // as a *waiter* when the dep lands. `ingest_admitted` must report it so
-        // the caller witnesses it — otherwise a caught-up payload never finalizes.
+        // An event that arrives before its dep is buffered, then admitted as a
+        // *waiter* when the dep lands. `ingest_admitted` must report it so the
+        // caller folds it — otherwise a caught-up event never enters the state.
         let a = key(1);
         let b = key(2);
-        let mut dag = Dag::new(members(&[&a, &b]));
+        let mut dag = Dag::new();
         let ga = ev(&a, None, Vec::new(), Vec::new());
         let gah = ga.event_hash();
         dag.ingest(ga).unwrap();
@@ -509,212 +345,53 @@ mod tests {
         let b1h = b1.event_hash();
         assert!(dag.ingest_admitted(b1).unwrap().is_empty(), "buffered, nothing admitted yet");
 
-        // gb lands → it and the buffered payload waiter b1 are both admitted, and
-        // both must be reported.
+        // gb lands → it and the buffered waiter b1 are both admitted and reported.
         let admitted = dag.ingest_admitted(gb).unwrap();
         assert!(admitted.contains(&gbh));
-        assert!(admitted.contains(&b1h), "the resolved payload waiter must be reported");
+        assert!(admitted.contains(&b1h), "the resolved waiter must be reported");
     }
 
     #[test]
     fn forks_are_admitted_not_rejected() {
         let a = key(1);
-        let mut dag = Dag::new(members(&[&a]));
+        let mut dag = Dag::new();
         let ga = ev(&a, None, Vec::new(), Vec::new());
         let gah = ga.event_hash();
         dag.ingest(ga).unwrap();
         let f1 = ev(&a, Some(gah), Vec::new(), b"one".to_vec());
         let f2 = ev(&a, Some(gah), Vec::new(), b"two".to_vec());
-        assert!(dag.ingest(f1.clone()).unwrap());
-        assert!(dag.ingest(f2.clone()).unwrap());
+        assert!(dag.ingest(f1).unwrap());
+        assert!(dag.ingest(f2).unwrap());
         assert_eq!(dag.heads_of(&pk(&a)).len(), 2);
     }
 
     #[test]
-    fn finality_requires_all_members() {
+    fn ordered_is_ancestry_respecting() {
+        // deps come before dependents in the fold order.
         let a = key(1);
-        let b = key(2);
-        let c = key(3);
-        let mut dag = Dag::new(members(&[&a, &b, &c]));
-        let ga = ev(&a, None, Vec::new(), Vec::new());
-        let gb = ev(&b, None, Vec::new(), Vec::new());
-        let gc = ev(&c, None, Vec::new(), Vec::new());
-        let (gah, gbh, gch) = (ga.event_hash(), gb.event_hash(), gc.event_hash());
-        dag.ingest(ga).unwrap();
-        dag.ingest(gb).unwrap();
-        dag.ingest(gc).unwrap();
-        let m = ev(&a, Some(gah), alloc::vec![gbh, gch], b"x".to_vec());
-        let mh = m.event_hash();
-        dag.ingest(m).unwrap();
-        assert!(!dag.is_finalized(&mh));
-        dag.ingest(ev(&b, Some(gbh), alloc::vec![mh], Vec::new())).unwrap();
-        assert!(!dag.is_finalized(&mh));
-        dag.ingest(ev(&c, Some(gch), alloc::vec![mh], Vec::new())).unwrap();
-        assert!(dag.is_finalized(&mh));
-    }
-
-    // ----- dynamic membership -----
-
-    /// Everyone in `current` grafts `target` so it finalizes. `heads` maps each
-    /// signer to its current head. Returns nothing; mutates the dag.
-    fn all_witness(dag: &mut Dag, target: Hash, signers: &[(&SigningKey, Hash)]) {
-        for (sk, head) in signers {
-            let g = ev(sk, Some(*head), alloc::vec![target], Vec::new());
-            dag.ingest(g).unwrap();
-        }
+        let mut dag = Dag::new();
+        let g = ev(&a, None, Vec::new(), Vec::new());
+        let gh = g.event_hash();
+        dag.ingest(g).unwrap();
+        let e1 = ev(&a, Some(gh), Vec::new(), b"1".to_vec());
+        let e1h = e1.event_hash();
+        dag.ingest(e1).unwrap();
+        let ordered = dag.ordered();
+        let pos = |h: &Hash| ordered.iter().position(|x| x == h).unwrap();
+        assert!(pos(&gh) < pos(&e1h));
     }
 
     #[test]
-    fn introduce_admits_a_new_member() {
+    fn witnesses_are_authors_that_see_target() {
         let a = key(1);
         let b = key(2);
-        let n = key(7);
-        let mut dag = Dag::new(members(&[&a, &b]));
-        let ga = ev(&a, None, Vec::new(), Vec::new());
-        let gb = ev(&b, None, Vec::new(), Vec::new());
-        let (gah, gbh) = (ga.event_hash(), gb.event_hash());
-        dag.ingest(ga).unwrap();
-        dag.ingest(gb).unwrap();
-
-        // A introduces N (grafting B's genesis so it can finalize among {A,B}).
-        let intro = sys(&a, Some(gah), alloc::vec![gbh], SystemOp::Introduce { node: pk(&n) });
-        let ih = intro.event_hash();
-        dag.ingest(intro).unwrap();
-        // B must witness the introduction for it to finalize.
-        all_witness(&mut dag, ih, &[(&b, gbh)]);
-        assert!(dag.is_finalized(&ih));
-        assert!(dag.consensus_members().contains(&pk(&n)));
-
-        // N can now author its first event by grafting the introduction.
-        let n1 = ev(&n, None, alloc::vec![ih], b"hello".to_vec());
-        assert!(dag.ingest(n1).is_ok());
-    }
-
-    #[test]
-    fn depart_removes_a_member() {
-        let a = key(1);
-        let b = key(2);
-        let mut dag = Dag::new(members(&[&a, &b]));
-        let ga = ev(&a, None, Vec::new(), Vec::new());
-        let gb = ev(&b, None, Vec::new(), Vec::new());
-        let (gah, gbh) = (ga.event_hash(), gb.event_hash());
-        dag.ingest(ga).unwrap();
-        dag.ingest(gb).unwrap();
-
-        // B departs itself (grafting A's genesis).
-        let dep = sys(&b, Some(gbh), alloc::vec![gah], SystemOp::Depart { node: pk(&b) });
-        let dh = dep.event_hash();
-        dag.ingest(dep).unwrap();
-        // A must witness; B already witnessed by authoring it.
-        all_witness(&mut dag, dh, &[(&a, gah)]);
-        assert!(dag.is_finalized(&dh));
-        assert!(!dag.consensus_members().contains(&pk(&b)));
-        assert!(dag.consensus_members().contains(&pk(&a)));
-    }
-
-    #[test]
-    fn introduce_of_existing_member_is_rejected() {
-        let a = key(1);
-        let mut dag = Dag::new(members(&[&a]));
+        let mut dag = Dag::new();
         let ga = ev(&a, None, Vec::new(), Vec::new());
         let gah = ga.event_hash();
         dag.ingest(ga).unwrap();
-        let bad = sys(&a, Some(gah), Vec::new(), SystemOp::Introduce { node: pk(&a) });
-        assert!(dag.ingest(bad).is_err());
-    }
-
-    #[test]
-    fn depart_must_be_self_authored() {
-        let a = key(1);
-        let b = key(2);
-        let mut dag = Dag::new(members(&[&a, &b]));
-        let ga = ev(&a, None, Vec::new(), Vec::new());
-        let gb = ev(&b, None, Vec::new(), Vec::new());
-        let (gah, gbh) = (ga.event_hash(), gb.event_hash());
-        dag.ingest(ga).unwrap();
+        let gb = ev(&b, None, alloc::vec![gah], Vec::new()); // b grafts a's genesis
         dag.ingest(gb).unwrap();
-        // A tries to depart B — illegal (no third-party eviction).
-        let bad = sys(&a, Some(gah), alloc::vec![gbh], SystemOp::Depart { node: pk(&b) });
-        assert!(dag.ingest(bad).is_err());
-    }
-
-    #[test]
-    fn evict_rejects_self_authored() {
-        let a = key(1);
-        let b = key(2);
-        let mut dag = Dag::new(members(&[&a, &b]));
-        let ga = ev(&a, None, Vec::new(), Vec::new());
-        let gb = ev(&b, None, Vec::new(), Vec::new());
-        let (gah, gbh) = (ga.event_hash(), gb.event_hash());
-        dag.ingest(ga).unwrap();
-        dag.ingest(gb).unwrap();
-        // A can't vote to evict itself.
-        let bad = sys(&a, Some(gah), alloc::vec![gbh], SystemOp::Evict { node: pk(&a) });
-        assert!(dag.ingest(bad).is_err());
-    }
-
-    #[test]
-    fn evict_impossible_at_two_members() {
-        // A 2-member mesh can't evict: a majority (2) is unreachable when one is the
-        // evictee, so the sole survivor's vote never removes it (the N=2 case).
-        let a = key(1);
-        let b = key(2);
-        let mut dag = Dag::new(members(&[&a, &b]));
-        let ga = ev(&a, None, Vec::new(), Vec::new());
-        let gb = ev(&b, None, Vec::new(), Vec::new());
-        let (gah, gbh) = (ga.event_hash(), gb.event_hash());
-        dag.ingest(ga).unwrap();
-        dag.ingest(gb).unwrap();
-        let ea = sys(&a, Some(gah), alloc::vec![gbh], SystemOp::Evict { node: pk(&b) });
-        dag.ingest(ea).unwrap();
-        assert!(dag.consensus_members().contains(&pk(&b)), "no majority at N=2 — b stays");
-    }
-
-    #[test]
-    fn evict_below_majority_keeps_member() {
-        // 3 members, one vote (< majority of 2) — the target stays.
-        let (a, b, c) = (key(1), key(2), key(3));
-        let mut dag = Dag::new(members(&[&a, &b, &c]));
-        let ga = ev(&a, None, Vec::new(), Vec::new());
-        let gb = ev(&b, None, Vec::new(), Vec::new());
-        let gc = ev(&c, None, Vec::new(), Vec::new());
-        let (gah, gbh, gch) = (ga.event_hash(), gb.event_hash(), gc.event_hash());
-        dag.ingest(ga).unwrap();
-        dag.ingest(gb).unwrap();
-        dag.ingest(gc).unwrap();
-        let ea = sys(&a, Some(gah), alloc::vec![gbh, gch], SystemOp::Evict { node: pk(&c) });
-        dag.ingest(ea).unwrap();
-        assert!(dag.consensus_members().contains(&pk(&c)), "one vote < majority — c stays");
-    }
-
-    #[test]
-    fn evict_by_majority_removes_member() {
-        // 3 members: a + b vote to evict c (majority of 3 = 2). The votes finalize
-        // among {a, b} (c needn't witness its own removal), and c is dropped.
-        let (a, b, c) = (key(1), key(2), key(3));
-        let mut dag = Dag::new(members(&[&a, &b, &c]));
-        let ga = ev(&a, None, Vec::new(), Vec::new());
-        let gb = ev(&b, None, Vec::new(), Vec::new());
-        let gc = ev(&c, None, Vec::new(), Vec::new());
-        let (gah, gbh, gch) = (ga.event_hash(), gb.event_hash(), gc.event_hash());
-        dag.ingest(ga).unwrap();
-        dag.ingest(gb).unwrap();
-        dag.ingest(gc).unwrap();
-
-        let ea = sys(&a, Some(gah), alloc::vec![gbh, gch], SystemOp::Evict { node: pk(&c) });
-        let eah = ea.event_hash();
-        dag.ingest(ea).unwrap();
-        let eb = sys(&b, Some(gbh), alloc::vec![eah, gch], SystemOp::Evict { node: pk(&c) });
-        let ebh = eb.event_hash();
-        dag.ingest(eb).unwrap();
-        // a witnesses b's vote so both evicts finalize among {a, b}.
-        let a2 = ev(&a, Some(eah), alloc::vec![ebh], Vec::new());
-        dag.ingest(a2).unwrap();
-
-        assert!(dag.is_finalized(&eah), "a's evict finalizes without c");
-        assert!(dag.is_finalized(&ebh), "b's evict finalizes without c");
-        let m = dag.consensus_members();
-        assert!(!m.contains(&pk(&c)), "c evicted by majority (2 of 3)");
-        assert!(m.contains(&pk(&a)) && m.contains(&pk(&b)));
+        let w = dag.witnesses(&gah);
+        assert!(w.contains(&pk(&a)) && w.contains(&pk(&b)));
     }
 }

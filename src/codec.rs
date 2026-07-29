@@ -7,14 +7,14 @@
 //! store, so it uses serde_json freely — nothing here is signed or
 //! language-portable.
 
-use alloc::collections::{BTreeMap, BTreeSet};
+use alloc::collections::BTreeMap;
 use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
 use crate::conn::ConnState;
 use crate::dag::Dag;
-use crate::event::{Event, Hash, PubKey};
+use crate::event::{Event, Hash};
 
 // ---- hex ----
 
@@ -59,19 +59,7 @@ pub fn connections_from_json(s: &str) -> BTreeMap<String, ConnState> {
     serde_json::from_str(s).unwrap_or_default()
 }
 
-// ---- members (the static configured set) ----
-
-pub fn members_to_json(members: &BTreeSet<PubKey>) -> String {
-    let hexed: Vec<String> = members.iter().map(|pk| hex(pk)).collect();
-    serde_json::to_string(&hexed).unwrap_or_else(|_| "[]".to_string())
-}
-
-pub fn members_from_json(s: &str) -> BTreeSet<PubKey> {
-    let hexed: Vec<String> = serde_json::from_str(s).unwrap_or_default();
-    hexed.into_iter().filter_map(|h| from_hex32(&h).ok()).collect()
-}
-
-// ---- hash lists (orphan buffer / frontier persistence — wired in Step 4) ----
+// ---- hash lists (orphan buffer / frontier persistence) ----
 
 pub fn hashes_to_json(hashes: &[Hash]) -> String {
     let hexed: Vec<String> = hashes.iter().map(|h| hex(h)).collect();
@@ -103,10 +91,6 @@ pub fn events_from_json(s: &str) -> Vec<Event> {
 
 #[derive(serde::Serialize, serde::Deserialize, Default)]
 struct DagBlob {
-    /// Membership derivation base (hex pubkeys) — the configured genesis set the
-    /// fold starts from. The mesh retains full history, so it never advances.
-    #[serde(default)]
-    base_members: Vec<String>,
     /// event_hash_hex -> event_bytes_hex (the canonical Event::encode()).
     events_hex: BTreeMap<String, String>,
 }
@@ -116,18 +100,14 @@ pub fn dag_to_json(dag: &Dag) -> String {
     for (h, ev) in &dag.events {
         events_hex.insert(hex(h), hex(&ev.encode()));
     }
-    let base_members = dag.base_members.iter().map(|pk| hex(pk)).collect();
-    serde_json::to_string(&DagBlob { base_members, events_hex })
-        .unwrap_or_else(|_| "{}".to_string())
+    serde_json::to_string(&DagBlob { events_hex }).unwrap_or_else(|_| "{}".to_string())
 }
 
 /// Rebuild a Dag from persisted state. These events were already validated when
 /// first ingested, so we `rehydrate` (rebuild indices) instead of re-running
-/// signature + rule checks.
+/// signature + structural checks.
 pub fn dag_from_json(s: &str) -> Result<Dag, String> {
     let blob: DagBlob = serde_json::from_str(s).unwrap_or_default();
-    let base_members: BTreeSet<PubKey> =
-        blob.base_members.iter().filter_map(|h| from_hex32(h).ok()).collect();
     let mut events = Vec::with_capacity(blob.events_hex.len());
     for ev_hex in blob.events_hex.values() {
         let bytes = from_hex(ev_hex)?;
@@ -135,7 +115,7 @@ pub fn dag_from_json(s: &str) -> Result<Dag, String> {
             events.push(ev);
         }
     }
-    Ok(Dag::rehydrate(base_members, events))
+    Ok(Dag::rehydrate(events))
 }
 
 #[cfg(test)]
@@ -163,19 +143,11 @@ mod tests {
     }
 
     #[test]
-    fn members_round_trip() {
-        let m: BTreeSet<PubKey> = BTreeSet::from([[3u8; 32], [4u8; 32]]);
-        assert_eq!(members_from_json(&members_to_json(&m)), m);
-    }
-
-    #[test]
     fn dag_persists_and_rehydrates() {
         let a = SigningKey::from_bytes(&[1u8; 32]);
-        let apk = a.verifying_key().to_bytes();
-        let members = BTreeSet::from([apk]);
-        let mut dag = Dag::new(members.clone());
+        let mut dag = Dag::new();
 
-        let g = Event::sign(&a, 0, None, Vec::new(), b"hi".to_vec(), None);
+        let g = Event::sign(&a, 0, None, Vec::new(), b"hi".to_vec());
         let h = g.event_hash();
         dag.ingest(g).unwrap();
 
@@ -183,21 +155,18 @@ mod tests {
         let restored = dag_from_json(&json).unwrap();
         assert!(restored.has(&h));
         assert_eq!(restored.events.len(), dag.events.len());
-        // A single-member network finalizes its own event.
-        assert!(restored.is_finalized(&h));
     }
 
     #[test]
     fn persisted_orphan_resolves_after_reload() {
         let a = SigningKey::from_bytes(&[1u8; 32]);
         let b = SigningKey::from_bytes(&[2u8; 32]);
-        let members = BTreeSet::from([a.verifying_key().to_bytes(), b.verifying_key().to_bytes()]);
 
         let sign = |sk: &SigningKey, sp: Option<Hash>, refs: Vec<Hash>| {
-            Event::sign(sk, 0, sp, refs, Vec::new(), None)
+            Event::sign(sk, 0, sp, refs, Vec::new())
         };
 
-        let mut dag = Dag::new(members.clone());
+        let mut dag = Dag::new();
         let ga = sign(&a, None, Vec::new());
         let gah = ga.event_hash();
         dag.ingest(ga).unwrap();

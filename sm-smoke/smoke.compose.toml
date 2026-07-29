@@ -1,0 +1,36 @@
+# Step-1 compose smoke: link the smoke consumer (imports state-machine) with the
+# trivial SM (exports it). Proves the state-machine importer<->exporter link + the
+# interface-hash match. Paths are relative to THIS manifest's directory.
+
+[[component]]
+name  = "sm-smoke"
+wasm  = "target/wasm32-unknown-unknown/release/sm_smoke.wasm"
+entry = true
+
+[[component]]
+name = "sm-trivial"
+wasm = "../sm-trivial/target/wasm32-unknown-unknown/release/sm_trivial.wasm"
+
+[[link]]
+consumer = "sm-smoke"
+import   = "state-machine.initial-state"
+provider = "sm-trivial"
+export   = "initial-state"
+
+[[link]]
+consumer = "sm-smoke"
+import   = "state-machine.validate"
+provider = "sm-trivial"
+export   = "validate"
+
+[[link]]
+consumer = "sm-smoke"
+import   = "state-machine.apply"
+provider = "sm-trivial"
+export   = "apply"
+
+[[link]]
+consumer = "sm-smoke"
+import   = "state-machine.members"
+provider = "sm-trivial"
+export   = "members"
