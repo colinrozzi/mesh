@@ -1,0 +1,17 @@
+[package]
+name = "control-sm"
+version = "0.1.0"
+edition = "2021"
+description = "The sentinel control-plane state machine as an RSM `state-machine` component (DESIGN-rsm.md Interface 1, /tmp/CONTROL-SM-design.md). Membership + a command/response journal; admission-final under the no-kick invariant. Pure/confluent/structure-blind."
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+packr-guest = "0.12.1"
+serde = { version = "1", default-features = false, features = ["alloc", "derive"] }
+serde_json = { version = "1", default-features = false, features = ["alloc"] }
+
+[profile.release]
+opt-level = "s"
+lto = true
