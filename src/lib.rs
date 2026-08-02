@@ -841,29 +841,68 @@ fn maybe_emit_ready(app_id: &str, ready_sent: bool) -> bool {
     true
 }
 
-/// Fold the admitted DAG through the composed SM and deliver each newly-admitted
-/// payload event to the app. This is the v0 fold hot path: every event is checked
-/// by the SM's `validate` against the running state and, on success, folded in via
-/// `apply`. Admission-final — a validating event's payload is delivered
-/// immediately. (Ancestry-relative validation + explicit conflict/stranded
-/// surfacing on a `validate` error land with steps 3–4; here a non-validating
-/// event is simply skipped, not delivered.)
+/// The back-edges (self_parent ∪ refs) of an event — its causal parents.
+fn deps_of(ev: &Event) -> Vec<Hash> {
+    let mut d = Vec::new();
+    if let Some(sp) = ev.self_parent {
+        d.push(sp);
+    }
+    d.extend_from_slice(&ev.refs);
+    d
+}
+
+/// Fold the SM over the causal past of `frontier` (its ancestry, frontier
+/// included) and return the resulting state — the **ancestry-relative** state an
+/// event at that frontier is validated against (DESIGN-rsm.md principle 3).
+///
+/// This is what makes the conflict-free story actually hold. The chat-SM's
+/// `validate` is "author is a member *of the ancestry state*"; folding only the
+/// event's own causal past means a *concurrent* `member-remove` (not in the past)
+/// isn't seen, so a message whose author was concurrently removed still validates
+/// and stands — chat is conflict-free *because* validation is ancestry-relative.
+/// Folding the whole global set instead (as the step-2 draft did) would strand it.
+///
+/// NOTE (perf): O(ancestry) SM calls per invocation, and `deliver_committed` calls
+/// it once per event → O(events²) cross-component calls per pass. Correct but
+/// unoptimized — memoize a per-event state cache before any real load (the design
+/// signs off on "re-fold now, optimize later").
+fn fold_state_at(dag: &Dag, frontier: &[Hash]) -> Vec<u8> {
+    let ancestry = dag.ancestors_of(frontier);
+    let mut state = sm_initial_state();
+    for h in dag.topo_sort(&ancestry) {
+        let Some(ev) = dag.events.get(&h) else { continue };
+        if sm_validate(h.to_vec(), ev.author.to_vec(), ev.timestamp, ev.payload.clone(), state.clone())
+            .is_ok()
+        {
+            state = sm_apply(h.to_vec(), ev.author.to_vec(), ev.timestamp, ev.payload.clone(), state);
+        }
+    }
+    state
+}
+
+/// Fold the admitted DAG through the composed SM and deliver each newly-final
+/// payload event to the app. v0 is admission-final: an event is final (deliverable)
+/// the moment its `validate` passes against **its own ancestry state** (via
+/// `fold_state_at`), never the global fold — so concurrent events can't strand it.
+/// A non-validating event is skipped here; explicit conflict/stranded *surfacing*
+/// to the app is step 4.
 fn deliver_committed(
     dag: &Dag,
     conns: &BTreeMap<String, ConnState>,
     app_id: &str,
     delivered: &mut BTreeSet<Hash>,
 ) {
-    let mut state = sm_initial_state();
+    // `ordered()` (topo) only sets a stable *delivery* order; validity for each
+    // event is judged against its own ancestry, not this running position.
     for h in dag.ordered() {
         let Some(ev) = dag.events.get(&h) else {
             continue;
         };
-        match sm_validate(h.to_vec(), ev.author.to_vec(), ev.timestamp, ev.payload.clone(), state.clone()) {
-            Ok(_) => {
-                state = sm_apply(h.to_vec(), ev.author.to_vec(), ev.timestamp, ev.payload.clone(), state);
-            }
-            Err(_) => continue, // stranded — step 4 will surface the conflict
+        let state_at = fold_state_at(dag, &deps_of(ev));
+        if sm_validate(h.to_vec(), ev.author.to_vec(), ev.timestamp, ev.payload.clone(), state_at)
+            .is_err()
+        {
+            continue; // stranded — step 4 will surface the conflict
         }
         if ev.payload.is_empty() || !delivered.insert(h) {
             continue;

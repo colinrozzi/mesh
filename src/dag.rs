@@ -176,9 +176,7 @@ impl Dag {
 
     /// All events reachable from `frontier` via back-edges (frontier included).
     /// The node folds this — an event's causal past — to build the ancestry-
-    /// relative state its `validate` is judged against.
-    // Wired in with ancestry-relative validation + Interface 2 `ancestry` (step 3).
-    #[allow(dead_code)]
+    /// relative state its `validate` is judged against (lib.rs `fold_state_at`).
     pub fn ancestors_of(&self, frontier: &[Hash]) -> BTreeSet<Hash> {
         let mut seen = BTreeSet::new();
         let mut stack: Vec<Hash> = frontier.to_vec();
