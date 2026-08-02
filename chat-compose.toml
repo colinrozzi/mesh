@@ -1,0 +1,32 @@
+# Compose the reshaped node (entry) with the chat-SM (provider) — the second
+# consumer, proving the dumb core generalizes. Same three `state-machine` links as
+# control-compose.toml, different SM. Paths relative to this manifest's directory.
+# Compose with the FIXED packr (/home/colin/work/pack/target/release/packr … --output …);
+# the 0.12.2 nix binary produces an artifact that fails to load (LTO import-strip bug).
+
+[[component]]
+name  = "mesh"
+wasm  = "target/wasm32-unknown-unknown/release/mesh.wasm"
+entry = true
+
+[[component]]
+name = "chat-sm"
+wasm = "chat-sm/target/wasm32-unknown-unknown/release/chat_sm.wasm"
+
+[[link]]
+consumer = "mesh"
+import   = "state-machine.initial-state"
+provider = "chat-sm"
+export   = "initial-state"
+
+[[link]]
+consumer = "mesh"
+import   = "state-machine.validate"
+provider = "chat-sm"
+export   = "validate"
+
+[[link]]
+consumer = "mesh"
+import   = "state-machine.apply"
+provider = "chat-sm"
+export   = "apply"

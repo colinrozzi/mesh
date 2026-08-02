@@ -1,0 +1,17 @@
+[package]
+name = "chat-sm"
+version = "0.1.0"
+edition = "2021"
+description = "The messaging chat plane as an RSM `state-machine` component (DESIGN-rsm.md Interface 1, manager's chat-sm-design.md). OR-Set membership + an append-only text log; fully conflict-free (every kind admission-final). Pure/confluent/structure-blind."
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+packr-guest = "0.12.1"
+serde = { version = "1", default-features = false, features = ["alloc", "derive"] }
+serde_json = { version = "1", default-features = false, features = ["alloc"] }
+
+[profile.release]
+opt-level = "s"
+lto = true

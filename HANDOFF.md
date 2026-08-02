@@ -6,7 +6,19 @@ Not a committed artifact; delete when v0 lands.
 ## Where we are
 Reshaping mesh into a **replicated state machine** (dumb core + consumer state
 machine). Design is LOCKED and shared with the fleet. Building **v0 directly**
-(admission-final; see below). **Steps 1–2 are done; step 3 is next.**
+(admission-final; see below). **Steps 1–2 + step 3a (ancestry-relative fold) +
+BOTH oracles are done:** the real control-SM + step 5 (two-node control
+round-trip, `control-roundtrip-test/`, GREEN) AND the chat-SM + step 6 (two-node
+chat smoke, `chat-smoke-test/`, GREEN — including the rejection path: a
+non-member's post is not delivered until `member-add`). Both consumers now run
+end-to-end across two composed nodes, so the dumb core is proven to generalize.
+**Remaining to land v0:** conflict/stranded surfacing (step 4 — SM-validation
+rejection is currently a silent skip; make it emit `conflict`/`stranded`);
+Interface 2/3 polish (the `mesh` request iface + emitted `dag-node` stream +
+`event-status`, still on the old mesh-api NOTIFY/delivery). See the
+`mesh-rsm-reshape` memory for the current REMAINING list + the fixed-packr caveat
+(composed artifacts only *run* when composed with `/home/colin/work/pack/target/
+release/packr … --output …`, not the 0.12.2 nix binary).
 
 ## Read first (the durable sources)
 - **`DESIGN-rsm.md`** — the pinned contract (5 principles, 3 interfaces, admission-final

@@ -712,9 +712,20 @@ fn author_genesis(dag: &mut Dag, signing_key: &SigningKey) -> Event {
     ev
 }
 
+/// The FINALIZED fold over our whole current frontier — Interface 2's
+/// `current-state`. v0 is admission-final, so every admitted event is finalized and
+/// this is the fold of the entire held DAG. (Same routine `deliver_committed` uses
+/// per-event, here over all heads.)
+fn current_state(dag: &Dag) -> Vec<u8> {
+    fold_state_at(dag, &all_heads(dag))
+}
+
 /// Author an event on this node's chain: self_parent = current head (`None` for
-/// the node's first event), refs = foreign heads we've seen. Ingests and returns
-/// it.
+/// the node's first event), refs = foreign heads we've seen. **Pre-validated**
+/// (Interface 2 `author`): the built event is checked against `current-state`
+/// before it is ingested/gossiped, and an inadmissible one is rejected with the
+/// SM's own reason rather than authored into a never-finalizing limbo. Ingests and
+/// returns it on success.
 fn author_event(
     dag: &mut Dag,
     signing_key: &SigningKey,
@@ -731,6 +742,13 @@ fn author_event(
     let mut refs = foreign_heads(dag, &author);
     refs.extend(own); // merge any residual self-fork so it converges
     let ev = Event::sign(signing_key, now_ms(), self_parent, refs, payload);
+    // Pre-validate against the state at this event's ancestry (= our current
+    // frontier, since its deps ARE the current heads). An empty payload is the
+    // node's own inert graft (genesis/witness) — never SM-gated.
+    if !ev.payload.is_empty() {
+        let state = current_state(dag);
+        sm_validate(ev.event_hash().to_vec(), author.to_vec(), ev.timestamp, ev.payload.clone(), state)?;
+    }
     match dag.ingest(ev.clone())? {
         true => Ok(ev),
         false => Err("authored event buffered (missing dep)".to_string()),
