@@ -5,20 +5,35 @@ Not a committed artifact; delete when v0 lands.
 
 ## Where we are
 Reshaping mesh into a **replicated state machine** (dumb core + consumer state
-machine). Design is LOCKED and shared with the fleet. Building **v0 directly**
-(admission-final; see below). **Steps 1–2 + step 3a (ancestry-relative fold) +
-BOTH oracles are done:** the real control-SM + step 5 (two-node control
-round-trip, `control-roundtrip-test/`, GREEN) AND the chat-SM + step 6 (two-node
-chat smoke, `chat-smoke-test/`, GREEN — including the rejection path: a
-non-member's post is not delivered until `member-add`). Both consumers now run
-end-to-end across two composed nodes, so the dumb core is proven to generalize.
-**Remaining to land v0:** conflict/stranded surfacing (step 4 — SM-validation
-rejection is currently a silent skip; make it emit `conflict`/`stranded`);
-Interface 2/3 polish (the `mesh` request iface + emitted `dag-node` stream +
-`event-status`, still on the old mesh-api NOTIFY/delivery). See the
-`mesh-rsm-reshape` memory for the current REMAINING list + the fixed-packr caveat
-(composed artifacts only *run* when composed with `/home/colin/work/pack/target/
-release/packr … --output …`, not the 0.12.2 nix binary).
+machine). Design is LOCKED and shared with the fleet. Built **v0 directly**
+(admission-final). **v0 IS LANDED — the full DESIGN-rsm.md contract runs, proven
+end-to-end by two oracles.** All six build steps done:
+- **Interface 1** (state-machine, composed) — proven against TWO real, unrelated
+  SMs: `control-sm/` (membership + command/response journal) and `chat-sm/`
+  (OR-Set membership + text log). So the dumb core is proven to generalize.
+- **Interface 2** (`mesh`, node answers requests): `author` is PRE-VALIDATED
+  (Err = the SM's reason); `current-state` / `event-status` / `witnesses` /
+  `ancestry` are the QUERY verbs. Bound over the TCP app protocol (src/wire.rs).
+- **Interface 3** (node emits): `finalized` dag-node stream (FRAME_FINALIZED) +
+  fail-loud `conflict` (never fires for honest conflict-free v0 peers — the
+  checked safety net); `stranded` frame defined for the deferred bundle.
+- **Oracles GREEN:** `control-roundtrip-test/` (genesis→join→command→response
+  over bidirectional gossip; asserts finalized dag-node deps, event-status,
+  ancestry/witnesses, and byte-identical current-state CONVERGENCE across both
+  nodes) + `chat-smoke-test/` (2 nodes, delivery both ways + author-time
+  rejection of a non-member post until `member-add`).
+
+**Deferred (not v0-blocking):** (1) the **message-server binding** of Interface
+2/3 — the co-located-app transport still carries the old (author,payload)
+delivery + Submit/Register; upgrading it to the query verbs + dag-node stream is
+mechanical transport-mirroring with NO new semantics, and needs a theater
+executor actor to test (the TCP binding is fully proven). (2) The conflict-prone
+bundle (witness-finality-as-gate, kick, rebase/convergence helpers, compaction) —
+arrives with the first conflict-prone consumer. See the `mesh-rsm-reshape` memory.
+
+**Fixed-packr caveat:** composed artifacts only *run* when composed with
+`/home/colin/work/pack/target/release/packr … --output …` (== published 0.12.7),
+not the 0.12.2 nix binary. Every oracle recomposes with it.
 
 ## Read first (the durable sources)
 - **`DESIGN-rsm.md`** — the pinned contract (5 principles, 3 interfaces, admission-final
