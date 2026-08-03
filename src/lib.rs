@@ -39,7 +39,8 @@ use mesh_api as api;
 
 use codec::{
     connections_from_json, connections_to_json, dag_from_json, dag_to_json, events_from_json,
-    events_to_json, from_hex32, hashes_from_json, hashes_to_json, hex,
+    events_to_json, finality_from_json, finality_to_json, from_hex32, hashes_from_json,
+    hashes_to_json, hex,
 };
 use conn::{ConnState, Phase};
 use dag::Dag;
@@ -68,6 +69,9 @@ pub struct ActorState {
     pub pending_json: String,
     /// Event hashes of payloads already delivered to clients (delivery dedup).
     pub delivered_json: String,
+    /// Memoized per-event finality (hex hash → final?), persisted so each tick only
+    /// decides newly-admitted events instead of re-folding the whole DAG.
+    pub final_json: String,
     pub connections_json: String,
     /// The co-located app actor's id (theater actor-id) to `send` delivered
     /// payloads to, set by a Register command. Empty = no app subscribed.
@@ -254,6 +258,7 @@ fn init(state: Value) -> Result<(ActorState, ()), String> {
             dag_json: dag_to_json(&dag),
             pending_json: "[]".to_string(),
             delivered_json: "[]".to_string(),
+            final_json: "{}".to_string(),
             connections_json: connections_to_json(&conns),
             app_id: String::new(),
             ready_sent: false,
@@ -357,6 +362,7 @@ fn on_data(state: ActorState, conn_id: String, data: Vec<u8>) -> Result<(ActorSt
     };
     let mut delivered: BTreeSet<Hash> =
         hashes_from_json(&state.delivered_json).into_iter().collect();
+    let mut finality: BTreeMap<Hash, bool> = finality_from_json(&state.final_json);
 
     let mut conn_state = match conns.remove(&conn_id) {
         Some(c) => c,
@@ -418,6 +424,7 @@ fn on_data(state: ActorState, conn_id: String, data: Vec<u8>) -> Result<(ActorSt
                     &signing_key,
                     self_head,
                     &frame,
+                    &mut finality,
                 );
             }
         }
@@ -427,7 +434,7 @@ fn on_data(state: ActorState, conn_id: String, data: Vec<u8>) -> Result<(ActorSt
         conns.insert(conn_id.clone(), conn_state);
     }
     // Deliver any newly-admitted messages to TCP clients and the co-located app.
-    deliver_committed(&dag, &conns, &state.app_id, &mut delivered);
+    deliver_committed(&dag, &conns, &state.app_id, &mut delivered, &mut finality);
     let ready_sent = maybe_emit_ready(&state.app_id, state.ready_sent);
 
     let delivered_vec: Vec<Hash> = delivered.iter().copied().collect();
@@ -436,6 +443,7 @@ fn on_data(state: ActorState, conn_id: String, data: Vec<u8>) -> Result<(ActorSt
             dag_json: dag_to_json(&dag),
             pending_json: events_to_json(&dag.pending_events()),
             delivered_json: hashes_to_json(&delivered_vec),
+            final_json: finality_to_json(&finality),
             connections_json: connections_to_json(&conns),
             self_head_hex: self_head.map(|h| hex(&h)).unwrap_or_default(),
             ready_sent,
@@ -466,8 +474,9 @@ fn handle_tick(state: ActorState, _timer_name: String) -> Result<(ActorState, ()
     let conns = connections_from_json(&state.connections_json);
     let mut delivered: BTreeSet<Hash> =
         hashes_from_json(&state.delivered_json).into_iter().collect();
+    let mut finality: BTreeMap<Hash, bool> = finality_from_json(&state.final_json);
 
-    deliver_committed(&dag, &conns, &state.app_id, &mut delivered);
+    deliver_committed(&dag, &conns, &state.app_id, &mut delivered, &mut finality);
 
     // Anti-entropy: re-advertise our frontier to every authed peer. A peer missing
     // any of these heads answers with WANT, so a one-shot-at-dial gossip miss (or a
@@ -488,6 +497,7 @@ fn handle_tick(state: ActorState, _timer_name: String) -> Result<(ActorState, ()
             dag_json: dag_to_json(&dag),
             pending_json: events_to_json(&dag.pending_events()),
             delivered_json: hashes_to_json(&delivered_vec),
+            final_json: finality_to_json(&finality),
             ready_sent,
             ..state
         },
@@ -525,11 +535,12 @@ fn handle_request(
     };
     let mut delivered: BTreeSet<Hash> =
         hashes_from_json(&state.delivered_json).into_iter().collect();
+    let mut finality: BTreeMap<Hash, bool> = finality_from_json(&state.final_json);
     let mut app_id = state.app_id.clone();
 
     let ack = match api::decode_command(&body) {
         Some(api::Command::Submit(payload)) => {
-            let (h, result) = run_command(&mut dag, &conns, &signing_key, self_head, payload);
+            let (h, result) = run_command(&mut dag, &conns, &signing_key, self_head, payload, &mut finality);
             self_head = h;
             ack_bytes(result)
         }
@@ -559,7 +570,7 @@ fn handle_request(
         None => api::encode_ack(false, &[0u8; 32], "unrecognized command"),
     };
 
-    deliver_committed(&dag, &conns, &app_id, &mut delivered);
+    deliver_committed(&dag, &conns, &app_id, &mut delivered, &mut finality);
 
     let delivered_vec: Vec<Hash> = delivered.iter().copied().collect();
     Ok((
@@ -567,6 +578,7 @@ fn handle_request(
             dag_json: dag_to_json(&dag),
             pending_json: events_to_json(&dag.pending_events()),
             delivered_json: hashes_to_json(&delivered_vec),
+            final_json: finality_to_json(&finality),
             self_head_hex: self_head.map(|h| hex(&h)).unwrap_or_default(),
             app_id,
             ..state
@@ -644,6 +656,7 @@ fn handle_authed_frame(
     signing_key: &SigningKey,
     self_head: Option<Hash>,
     frame: &ParsedFrame,
+    finality: &mut BTreeMap<Hash, bool>,
 ) -> Option<Hash> {
     match frame.kind {
         FRAME_DELIVER => match Event::decode(&frame.payload) {
@@ -655,11 +668,11 @@ fn handle_authed_frame(
         },
         // App client asks us to author a payload event on our own chain.
         FRAME_SUBMIT => {
-            author_and_broadcast(dag, conns, conn_id, signing_key, self_head, frame.payload.clone())
+            author_and_broadcast(dag, conns, conn_id, signing_key, self_head, frame.payload.clone(), finality)
         }
         // Interface 2 read verbs (current-state / event-status / witnesses / ancestry).
         FRAME_QUERY => {
-            answer_query(dag, conn_id, &frame.payload);
+            answer_query(dag, conn_id, &frame.payload, finality);
             self_head
         }
         FRAME_WANT => {
@@ -692,12 +705,10 @@ fn handle_authed_frame(
 /// `pending` (held but still buffering on a missing dep), `finalized` (admitted +
 /// valid against its ancestry — v0 is admission-final), or `stranded` (admitted but
 /// invalid against its ancestry — inert).
-fn event_status(dag: &Dag, h: &Hash) -> u8 {
-    if let Some(ev) = dag.events.get(h) {
-        let state_at = fold_state_at(dag, &deps_of(ev));
-        if sm_validate(h.to_vec(), ev.author.to_vec(), ev.timestamp, ev.payload.clone(), state_at)
-            .is_ok()
-        {
+fn event_status(dag: &Dag, h: &Hash, finality: &mut BTreeMap<Hash, bool>) -> u8 {
+    if dag.events.contains_key(h) {
+        ensure_finality(dag, finality);
+        if finality.get(h).copied().unwrap_or(false) {
             STATUS_FINALIZED
         } else {
             STATUS_STRANDED
@@ -720,14 +731,15 @@ fn query_arg_hash(arg: &[u8]) -> Option<Hash> {
 }
 
 /// Answer an Interface 2 read verb and send the reply on `conn_id`.
-fn answer_query(dag: &Dag, conn_id: &str, body: &[u8]) {
+fn answer_query(dag: &Dag, conn_id: &str, body: &[u8], finality: &mut BTreeMap<Hash, bool>) {
     let Some((&qkind, arg)) = body.split_first() else {
         return;
     };
     let reply = match qkind {
-        Q_STATE => encode_query_reply(Q_STATE, &current_state(dag)),
+        Q_STATE => encode_query_reply(Q_STATE, &current_state(dag, finality)),
         Q_STATUS => {
-            let status = query_arg_hash(arg).map(|h| event_status(dag, &h)).unwrap_or(STATUS_UNKNOWN);
+            let status =
+                query_arg_hash(arg).map(|h| event_status(dag, &h, finality)).unwrap_or(STATUS_UNKNOWN);
             encode_query_reply(Q_STATUS, &[status])
         }
         Q_WITNESSES => {
@@ -802,8 +814,8 @@ fn author_genesis(dag: &mut Dag, signing_key: &SigningKey) -> Event {
 /// `current-state`. v0 is admission-final, so every admitted event is finalized and
 /// this is the fold of the entire held DAG. (Same routine `deliver_committed` uses
 /// per-event, here over all heads.)
-fn current_state(dag: &Dag) -> Vec<u8> {
-    fold_state_at(dag, &all_heads(dag))
+fn current_state(dag: &Dag, finality: &mut BTreeMap<Hash, bool>) -> Vec<u8> {
+    fold_state_at(dag, &all_heads(dag), finality)
 }
 
 /// Author an event on this node's chain: self_parent = current head (`None` for
@@ -817,6 +829,7 @@ fn author_event(
     signing_key: &SigningKey,
     _self_head: Option<Hash>,
     payload: Vec<u8>,
+    finality: &mut BTreeMap<Hash, bool>,
 ) -> Result<Event, String> {
     let author = signing_key.verifying_key().to_bytes();
     // Self-parent from our CURRENT own head *in the DAG* — never a separately
@@ -832,7 +845,7 @@ fn author_event(
     // frontier, since its deps ARE the current heads). An empty payload is the
     // node's own inert graft (genesis/witness) — never SM-gated.
     if !ev.payload.is_empty() {
-        let state = current_state(dag);
+        let state = current_state(dag, finality);
         sm_validate(ev.event_hash().to_vec(), author.to_vec(), ev.timestamp, ev.payload.clone(), state)?;
     }
     match dag.ingest(ev.clone())? {
@@ -850,8 +863,9 @@ fn author_and_broadcast(
     signing_key: &SigningKey,
     self_head: Option<Hash>,
     payload: Vec<u8>,
+    finality: &mut BTreeMap<Hash, bool>,
 ) -> Option<Hash> {
-    match author_event(dag, signing_key, self_head, payload) {
+    match author_event(dag, signing_key, self_head, payload, finality) {
         Ok(ev) => {
             let h = ev.event_hash();
             let _ = tcp_send(conn_id.to_string(), encode_ack(&h, true, ""));
@@ -874,8 +888,9 @@ fn run_command(
     signing_key: &SigningKey,
     self_head: Option<Hash>,
     payload: Vec<u8>,
+    finality: &mut BTreeMap<Hash, bool>,
 ) -> (Option<Hash>, Result<Hash, String>) {
-    match author_event(dag, signing_key, self_head, payload) {
+    match author_event(dag, signing_key, self_head, payload, finality) {
         Ok(ev) => {
             let h = ev.event_hash();
             broadcast(conns, "", &encode_deliver(&ev.encode()));
@@ -971,23 +986,34 @@ fn deps_of(ev: &Event) -> Vec<Hash> {
 /// state (chat's add-wins / message-stands), and makes every node compute the same
 /// bytes from the same event set.
 ///
-/// NOTE (perf): recomputes finality over the whole scope per call → O(events²) SM
-/// calls, and `deliver_committed` invokes it per event → higher still. Correct but
-/// unoptimized — memoize per-event finality + state before any real load.
-fn fold_state_at(dag: &Dag, frontier: &[Hash]) -> Vec<u8> {
-    let order = dag.topo_sort(&dag.ancestors_of(frontier));
-    // Pass 1: finality per event. Topo order guarantees every event's ancestry is
-    // already decided when we reach it, so `apply_final(deps)` sees settled finality.
-    let mut is_final: BTreeMap<Hash, bool> = BTreeMap::new();
-    for h in &order {
-        let Some(ev) = dag.events.get(h) else { continue };
-        let ancestry_state = apply_final(dag, &deps_of(ev), &is_final);
+/// **Memoized (principle 1: finality is immutable).** Finality is decided ONCE per
+/// event and persisted in `finality` across handler calls (`ensure_finality`), so a
+/// fold is an incremental O(new events × ancestry) rather than the O(events²) rescan
+/// the naive two-pass did (and `deliver_committed`, which called this per event, was
+/// O(events³) — that was the wall the N-node scale test measured). Application still
+/// re-folds the frontier's ancestry each call (Pass 2), which is O(events); only the
+/// expensive *finality* judgement is cached.
+fn fold_state_at(dag: &Dag, frontier: &[Hash], finality: &mut BTreeMap<Hash, bool>) -> Vec<u8> {
+    ensure_finality(dag, finality);
+    apply_final(dag, frontier, finality)
+}
+
+/// Decide finality for every admitted event not already in `finality`, walking the
+/// whole DAG in topo order so each event's ancestry is settled when we reach it. An
+/// event is FINAL iff it validates against *its own* ancestry state (judged once,
+/// independent of any linearization — principle 4) or is an inert graft (empty
+/// payload). Immutable once decided, so cached entries are never revisited.
+fn ensure_finality(dag: &Dag, finality: &mut BTreeMap<Hash, bool>) {
+    for h in dag.ordered() {
+        if finality.contains_key(&h) {
+            continue;
+        }
+        let Some(ev) = dag.events.get(&h) else { continue };
+        let ancestry_state = apply_final(dag, &deps_of(ev), finality);
         let final_here = ev.payload.is_empty() // inert graft: always "final", contributes nothing
             || sm_validate(h.to_vec(), ev.author.to_vec(), ev.timestamp, ev.payload.clone(), ancestry_state).is_ok();
-        is_final.insert(*h, final_here);
+        finality.insert(h, final_here);
     }
-    // Pass 2: apply every final event in the scope, unconditionally, in topo order.
-    apply_final(dag, frontier, &is_final)
 }
 
 /// Fold only the events in `ancestors_of(frontier)` marked final in `is_final`,
@@ -1007,29 +1033,37 @@ fn apply_final(dag: &Dag, frontier: &[Hash], is_final: &BTreeMap<Hash, bool>) ->
 /// Fold the admitted DAG through the composed SM and emit the Interface 3 stream:
 /// a `finalized` `dag-node` for each newly-final payload event, or a fail-loud
 /// `conflict` for an admitted event that is invalid against **its own ancestry
-/// state** (via `fold_state_at`, never the global fold — so concurrent events can't
-/// strand each other). v0 is admission-final and our own `author` pre-validates, so
-/// in an honest v0 mesh the conflict branch never fires; it is the safety net that
-/// makes "conflict-free" a CHECKED runtime invariant against a buggy/dishonest peer.
+/// state** (per the memoized `finality` map, so concurrent events can't strand each
+/// other). v0 is admission-final and our own `author` pre-validates, so in an honest
+/// v0 mesh the conflict branch never fires; it is the safety net that makes
+/// "conflict-free" a CHECKED runtime invariant against a buggy/dishonest peer.
+///
+/// Reads finality from the shared cache (one `ensure_finality` pass, not a per-event
+/// fold) — the O(events³)→amortized-O(events) fix the scale test motivated.
 fn deliver_committed(
     dag: &Dag,
     conns: &BTreeMap<String, ConnState>,
     app_id: &str,
     delivered: &mut BTreeSet<Hash>,
+    finality: &mut BTreeMap<Hash, bool>,
 ) {
+    ensure_finality(dag, finality);
     // `ordered()` (topo) only sets a stable *delivery* order; validity for each
-    // event is judged against its own ancestry, not this running position.
+    // event was judged against its own ancestry (the cached finality), not position.
     for h in dag.ordered() {
         let Some(ev) = dag.events.get(&h) else {
             continue;
         };
         let deps = deps_of(ev);
-        let state_at = fold_state_at(dag, &deps);
-        if let Err(reason) =
-            sm_validate(h.to_vec(), ev.author.to_vec(), ev.timestamp, ev.payload.clone(), state_at)
-        {
-            // Genuine conflict (loser inert). Surface it ONCE to every app client.
+        if !finality.get(&h).copied().unwrap_or(false) {
+            // Genuine conflict (loser inert). Surface it ONCE to every app client;
+            // recompute the SM's reason lazily on this rare path.
             if delivered.insert(h) {
+                let state_at = apply_final(dag, &deps, finality);
+                let reason =
+                    sm_validate(h.to_vec(), ev.author.to_vec(), ev.timestamp, ev.payload.clone(), state_at)
+                        .err()
+                        .unwrap_or_else(|| "invalid against ancestry".to_string());
                 log(format!("[mesh] CONFLICT {}: {}", hex(&h), reason));
                 let frame = encode_conflict(&h, &reason);
                 for (cid, cs) in conns {

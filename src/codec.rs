@@ -71,6 +71,24 @@ pub fn hashes_from_json(s: &str) -> Vec<Hash> {
     hexed.into_iter().filter_map(|h| from_hex32(&h).ok()).collect()
 }
 
+// ---- finality cache (memoized per-event finality) ----
+//
+// Finality is immutable (an event's validity against its own ancestry never
+// changes), so we persist the decided map across handler invocations and only
+// compute finality for newly-admitted events — turning the fold from O(events^3)
+// per tick into an amortized incremental cost. `true` = final, `false` = stranded;
+// an event absent from the map is simply not yet decided.
+
+pub fn finality_to_json(map: &BTreeMap<Hash, bool>) -> String {
+    let m: BTreeMap<String, bool> = map.iter().map(|(h, f)| (hex(h), *f)).collect();
+    serde_json::to_string(&m).unwrap_or_else(|_| "{}".to_string())
+}
+
+pub fn finality_from_json(s: &str) -> BTreeMap<Hash, bool> {
+    let m: BTreeMap<String, bool> = serde_json::from_str(s).unwrap_or_default();
+    m.into_iter().filter_map(|(h, f)| from_hex32(&h).ok().map(|k| (k, f))).collect()
+}
+
 // ---- event lists (the persisted orphan buffer) ----
 
 pub fn events_to_json(events: &[Event]) -> String {
