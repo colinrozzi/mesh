@@ -122,6 +122,15 @@ pack_types! {
         theater:simple/tcp-client.on-close: func(state: actor-state, connection-id: string, reason: string) -> result<actor-state, string>,
         theater:simple/timer.handle-tick: func(state: actor-state, timer-name: string) -> result<actor-state, string>,
         theater:simple/message-server-client.handle-request: func(state: actor-state, params: tuple<string, list<u8>>) -> result<tuple<actor-state, tuple<option<list<u8>>>>, string>,
+        // RPC action surface (theater:simple/rpc): the executor drives the node
+        // here — take-an-action / ask-a-question. Dynamic `value` in/out; the call
+        // convention is input = tuple<state, params>, return = result<tuple<state,
+        // ret>, string> (theater persists the returned state). Live events are NOT
+        // here — those push over the message-server stream.
+        my:mesh.author: func(input: value) -> value,
+        my:mesh.current-state: func(input: value) -> value,
+        my:mesh.event-status: func(input: value) -> value,
+        my:mesh.subscribe: func(input: value) -> value,
     }
 }
 
@@ -593,6 +602,194 @@ fn ack_bytes(result: Result<Hash, String>) -> Vec<u8> {
         Ok(h) => api::encode_ack(true, &h, ""),
         Err(e) => api::encode_ack(false, &[0u8; 32], &e),
     }
+}
+
+// ============================================================================
+// RPC action surface (theater:simple/rpc)
+//
+// The reference executor↔node surface for TAKING ACTION / ASKING QUESTIONS —
+// synchronous, typed-by-actor-id. Live events are NOT here; those push over the
+// message-server stream (see `subscribe`). Call convention (theater
+// `call_function`): the export receives `input = tuple<state, params>` and returns
+// `result<tuple<state, ret>, string>` — theater persists the returned state. We use
+// dynamic `value` in/out (the proven pattern) and convert `ActorState` via its
+// derived `From`/`TryFrom` (GraphValue).
+// ============================================================================
+
+/// Split an RPC export input `tuple<state, params>` into the typed state + raw params.
+fn rpc_split(input: Value) -> Result<(ActorState, Value), String> {
+    match input {
+        // theater flattens the call to `tuple<state, ...params>`; a no-arg read verb
+        // arrives as just `tuple<state>`, so tolerate a missing params slot.
+        Value::Tuple(mut items) if !items.is_empty() => {
+            let state = ActorState::try_from(items.remove(0))
+                .map_err(|e| format!("rpc: undecodable actor state: {:?}", e))?;
+            let params = if items.is_empty() { Value::Tuple(Vec::new()) } else { items.remove(0) };
+            Ok((state, params))
+        }
+        _ => Err("rpc: expected input tuple<state, ...>".to_string()),
+    }
+}
+
+/// `result::ok((state, ret))` — theater persists `state`, the caller receives `ret`.
+fn rpc_ok(state: ActorState, ret: Value) -> Value {
+    Value::Variant {
+        type_name: "result".to_string(),
+        case_name: "ok".to_string(),
+        tag: 0,
+        payload: alloc::vec![Value::Tuple(alloc::vec![Value::from(state), ret])],
+    }
+}
+
+/// `result::err(msg)`.
+fn rpc_err(msg: &str) -> Value {
+    Value::Variant {
+        type_name: "result".to_string(),
+        case_name: "err".to_string(),
+        tag: 1,
+        payload: alloc::vec![Value::String(msg.to_string())],
+    }
+}
+
+/// Load the DAG (admitted + persisted orphans re-ingested) from the actor state.
+fn load_dag(state: &ActorState) -> Result<Dag, String> {
+    let mut dag = dag_from_json(&state.dag_json)?;
+    for ev in events_from_json(&state.pending_json) {
+        let _ = dag.ingest(ev);
+    }
+    Ok(dag)
+}
+
+/// RPC `author(payload) -> hash`: pre-validated author on this node's chain, then
+/// gossip to peers + emit the finalized stream. The one write verb.
+#[export(name = "my:mesh.author")]
+fn author_rpc(input: Value) -> Value {
+    let (state, params) = match rpc_split(input) {
+        Ok(v) => v,
+        Err(e) => return rpc_err(&e),
+    };
+    let payload = match Vec::<u8>::try_from(params) {
+        Ok(p) => p,
+        Err(e) => return rpc_err(&format!("rpc author: payload not list<u8>: {:?}", e)),
+    };
+    let signing_key = match from_hex32(&state.signing_key_hex) {
+        Ok(b) => SigningKey::from_bytes(&b),
+        Err(e) => return rpc_err(&e),
+    };
+    let mut dag = match load_dag(&state) {
+        Ok(d) => d,
+        Err(e) => return rpc_err(&e),
+    };
+    let conns = connections_from_json(&state.connections_json);
+    let self_head = if state.self_head_hex.is_empty() {
+        None
+    } else {
+        match from_hex32(&state.self_head_hex) {
+            Ok(h) => Some(h),
+            Err(e) => return rpc_err(&e),
+        }
+    };
+    let mut delivered: BTreeSet<Hash> = hashes_from_json(&state.delivered_json).into_iter().collect();
+    let mut finality: BTreeMap<Hash, bool> = finality_from_json(&state.final_json);
+
+    let (new_self_head, result) =
+        run_command(&mut dag, &conns, &signing_key, self_head, payload, &mut finality);
+    // A validation REJECTION is a normal business outcome, not an actor fault — so it
+    // is carried IN-BAND as `tuple<ok: bool, data: list<u8>>` (data = hash on success,
+    // the SM reason on rejection), never as an export-level `result::err` (which
+    // theater treats as a wasm fault and would kill the node). `rpc_err` stays for
+    // genuine faults only (undecodable input / corrupt state).
+    match result {
+        Ok(hash) => {
+            deliver_committed(&dag, &conns, &state.app_id, &mut delivered, &mut finality);
+            let delivered_vec: Vec<Hash> = delivered.iter().copied().collect();
+            let new_state = ActorState {
+                dag_json: dag_to_json(&dag),
+                pending_json: events_to_json(&dag.pending_events()),
+                delivered_json: hashes_to_json(&delivered_vec),
+                final_json: finality_to_json(&finality),
+                self_head_hex: new_self_head.map(|h| hex(&h)).unwrap_or_default(),
+                ..state
+            };
+            rpc_ok(new_state, Value::Tuple(alloc::vec![Value::Bool(true), Value::from(hash.to_vec())]))
+        }
+        Err(reason) => {
+            rpc_ok(state, Value::Tuple(alloc::vec![Value::Bool(false), Value::from(reason.into_bytes())]))
+        }
+    }
+}
+
+/// RPC `current-state() -> bytes`: the folded SM state at the current frontier.
+#[export(name = "my:mesh.current-state")]
+fn current_state_rpc(input: Value) -> Value {
+    let (state, _params) = match rpc_split(input) {
+        Ok(v) => v,
+        Err(e) => return rpc_err(&e),
+    };
+    let dag = match load_dag(&state) {
+        Ok(d) => d,
+        Err(e) => return rpc_err(&e),
+    };
+    let mut finality: BTreeMap<Hash, bool> = finality_from_json(&state.final_json);
+    let bytes = current_state(&dag, &mut finality);
+    rpc_ok(state, Value::from(bytes))
+}
+
+/// RPC `event-status(hash) -> u8`: unknown / pending / finalized / stranded.
+#[export(name = "my:mesh.event-status")]
+fn event_status_rpc(input: Value) -> Value {
+    let (state, params) = match rpc_split(input) {
+        Ok(v) => v,
+        Err(e) => return rpc_err(&e),
+    };
+    let h: Hash = match Vec::<u8>::try_from(params) {
+        Ok(v) if v.len() == 32 => {
+            let mut a = [0u8; 32];
+            a.copy_from_slice(&v);
+            a
+        }
+        _ => return rpc_err("rpc event-status: expected a 32-byte hash"),
+    };
+    let dag = match load_dag(&state) {
+        Ok(d) => d,
+        Err(e) => return rpc_err(&e),
+    };
+    let mut finality: BTreeMap<Hash, bool> = finality_from_json(&state.final_json);
+    let status = event_status(&dag, &h, &mut finality);
+    rpc_ok(state, Value::U8(status))
+}
+
+/// RPC `subscribe(actor-id)`: register an executor for the finalized stream (pushed
+/// via message-server `send`). v0 holds one subscriber in `app_id` and replays the
+/// finalized history so a late subscriber catches up (dedup-safe — the executor
+/// folds by SM state, so replay-all is idempotent).
+#[export(name = "my:mesh.subscribe")]
+fn subscribe_rpc(input: Value) -> Value {
+    let (mut state, params) = match rpc_split(input) {
+        Ok(v) => v,
+        Err(e) => return rpc_err(&e),
+    };
+    let actor_id = match String::try_from(params) {
+        Ok(s) => s,
+        Err(e) => return rpc_err(&format!("rpc subscribe: actor-id not a string: {:?}", e)),
+    };
+    state.app_id = actor_id;
+    let dag = match load_dag(&state) {
+        Ok(d) => d,
+        Err(e) => return rpc_err(&e),
+    };
+    let conns = connections_from_json(&state.connections_json);
+    // Replay the whole finalized history to the fresh subscriber.
+    let mut delivered: BTreeSet<Hash> = BTreeSet::new();
+    let mut finality: BTreeMap<Hash, bool> = finality_from_json(&state.final_json);
+    deliver_committed(&dag, &conns, &state.app_id, &mut delivered, &mut finality);
+    let delivered_vec: Vec<Hash> = delivered.iter().copied().collect();
+    let new_state = ActorState {
+        delivered_json: hashes_to_json(&delivered_vec),
+        final_json: finality_to_json(&finality),
+        ..state
+    };
+    rpc_ok(new_state, Value::Bool(true))
 }
 
 // ---- handshake steps ----
@@ -1085,9 +1282,11 @@ fn deliver_committed(
                 let _ = tcp_send(cid.clone(), frame.clone());
             }
         }
-        // The co-located app actor gets a message-server delivery (payload + author).
+        // A subscribed executor gets the SAME dag-node frame over the message-server
+        // stream (the reference "watch events" surface). Reuses the wire encoding, so
+        // TCP peers and co-located executors see one dag-node format.
         if !app_id.is_empty() {
-            let _ = message_server_send(app_id.to_string(), api::encode_delivery(&ev.author, &ev.payload));
+            let _ = message_server_send(app_id.to_string(), frame.clone());
         }
     }
 }
