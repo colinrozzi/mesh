@@ -453,8 +453,10 @@ fn on_close(state: ActorState, conn_id: String, reason: String) -> Result<(Actor
     Ok((ActorState { connections_json: connections_to_json(&conns), ..state }, ()))
 }
 
-/// Periodic tick: a delivery safety-net + one-shot Ready. No heartbeat, no
-/// eviction — admission-final finality means there is nothing to pump or reap.
+/// Periodic tick: a delivery safety-net + anti-entropy + one-shot Ready. No
+/// heartbeat, no eviction — admission-final finality means there is nothing to pump
+/// or reap, but gossip is best-effort so we re-announce our frontier so any peer
+/// that missed an event pulls it on a later tick (eventual convergence).
 #[export(name = "theater:simple/timer.handle-tick")]
 fn handle_tick(state: ActorState, _timer_name: String) -> Result<(ActorState, ()), String> {
     let mut dag = dag_from_json(&state.dag_json)?;
@@ -466,6 +468,18 @@ fn handle_tick(state: ActorState, _timer_name: String) -> Result<(ActorState, ()
         hashes_from_json(&state.delivered_json).into_iter().collect();
 
     deliver_committed(&dag, &conns, &state.app_id, &mut delivered);
+
+    // Anti-entropy: re-advertise our frontier to every authed peer. A peer missing
+    // any of these heads answers with WANT, so a one-shot-at-dial gossip miss (or a
+    // partition heal) reconciles within a few ticks instead of stranding forever.
+    let frontier = all_heads(&dag);
+    if !frontier.is_empty() {
+        for (cid, cs) in &conns {
+            if matches!(cs.phase, Phase::Authed { .. }) {
+                let _ = tcp_send(cid.clone(), encode_hashes(FRAME_FRONTIER, &frontier));
+            }
+        }
+    }
     let ready_sent = maybe_emit_ready(&state.app_id, state.ready_sent);
 
     let delivered_vec: Vec<Hash> = delivered.iter().copied().collect();
@@ -746,14 +760,20 @@ fn ingest_and_propagate(
     if dag.has(&event.event_hash()) {
         return self_head; // dedup — already have it
     }
-    let encoded = event.encode();
     let missing = missing_deps(dag, &event); // compute before `ingest` consumes it
 
     match dag.ingest_admitted(event) {
         Ok(admitted) if !admitted.is_empty() => {
-            // Forward to every other peer (the source is excluded — it's not in
-            // `conns` right now, having been removed for the duration of on-data).
-            broadcast(conns, from_conn, &encode_deliver(&encoded));
+            // Forward EVERY newly-admitted event (the incoming one AND any buffered
+            // waiters it unblocked) to other peers — the source is excluded (it's not
+            // in `conns` during on-data). Forwarding only the incoming event would
+            // strand transitively-backfilled chains at a relay (e.g. a bridge that
+            // received a chain out of order), breaking multi-hop propagation.
+            for h in &admitted {
+                if let Some(ev) = dag.events.get(h) {
+                    broadcast(conns, from_conn, &encode_deliver(&ev.encode()));
+                }
+            }
             self_head
         }
         Ok(_) => {
@@ -935,30 +955,50 @@ fn deps_of(ev: &Event) -> Vec<Hash> {
     d
 }
 
-/// Fold the SM over the causal past of `frontier` (its ancestry, frontier
-/// included) and return the resulting state — the **ancestry-relative** state an
-/// event at that frontier is validated against (DESIGN-rsm.md principle 3).
+/// Fold the SM over the causal past of `frontier` (its ancestry, frontier included)
+/// and return the resulting state — the state an event at that frontier is validated
+/// against (DESIGN-rsm.md principle 3, ancestry-relative), and the substrate's
+/// `current-state` when `frontier = all_heads`.
 ///
-/// This is what makes the conflict-free story actually hold. The chat-SM's
-/// `validate` is "author is a member *of the ancestry state*"; folding only the
-/// event's own causal past means a *concurrent* `member-remove` (not in the past)
-/// isn't seen, so a message whose author was concurrently removed still validates
-/// and stands — chat is conflict-free *because* validation is ancestry-relative.
-/// Folding the whole global set instead (as the step-2 draft did) would strand it.
+/// **Confluent (principle 4).** Finality and application are SEPARATE: an event is
+/// FINAL iff it validates against *its own* ancestry state (judged once, independent
+/// of any linearization), and the fold then APPLIES every final event unconditionally
+/// in deterministic topo order. Application must NOT re-validate against the running
+/// merged state — that was the bug the confluence test caught: with a `member-remove`
+/// ordered before a concurrent `post`, re-validation dropped the (already-final) post,
+/// so the converged state depended on tiebreak order. Judging only *finality*
+/// ancestry-relative keeps a concurrently-invalidated-but-past-valid event in the
+/// state (chat's add-wins / message-stands), and makes every node compute the same
+/// bytes from the same event set.
 ///
-/// NOTE (perf): O(ancestry) SM calls per invocation, and `deliver_committed` calls
-/// it once per event → O(events²) cross-component calls per pass. Correct but
-/// unoptimized — memoize a per-event state cache before any real load (the design
-/// signs off on "re-fold now, optimize later").
+/// NOTE (perf): recomputes finality over the whole scope per call → O(events²) SM
+/// calls, and `deliver_committed` invokes it per event → higher still. Correct but
+/// unoptimized — memoize per-event finality + state before any real load.
 fn fold_state_at(dag: &Dag, frontier: &[Hash]) -> Vec<u8> {
-    let ancestry = dag.ancestors_of(frontier);
+    let order = dag.topo_sort(&dag.ancestors_of(frontier));
+    // Pass 1: finality per event. Topo order guarantees every event's ancestry is
+    // already decided when we reach it, so `apply_final(deps)` sees settled finality.
+    let mut is_final: BTreeMap<Hash, bool> = BTreeMap::new();
+    for h in &order {
+        let Some(ev) = dag.events.get(h) else { continue };
+        let ancestry_state = apply_final(dag, &deps_of(ev), &is_final);
+        let final_here = ev.payload.is_empty() // inert graft: always "final", contributes nothing
+            || sm_validate(h.to_vec(), ev.author.to_vec(), ev.timestamp, ev.payload.clone(), ancestry_state).is_ok();
+        is_final.insert(*h, final_here);
+    }
+    // Pass 2: apply every final event in the scope, unconditionally, in topo order.
+    apply_final(dag, frontier, &is_final)
+}
+
+/// Fold only the events in `ancestors_of(frontier)` marked final in `is_final`,
+/// applying each (no re-validation) in deterministic topo order.
+fn apply_final(dag: &Dag, frontier: &[Hash], is_final: &BTreeMap<Hash, bool>) -> Vec<u8> {
     let mut state = sm_initial_state();
-    for h in dag.topo_sort(&ancestry) {
-        let Some(ev) = dag.events.get(&h) else { continue };
-        if sm_validate(h.to_vec(), ev.author.to_vec(), ev.timestamp, ev.payload.clone(), state.clone())
-            .is_ok()
-        {
-            state = sm_apply(h.to_vec(), ev.author.to_vec(), ev.timestamp, ev.payload.clone(), state);
+    for h in dag.topo_sort(&dag.ancestors_of(frontier)) {
+        if is_final.get(&h).copied().unwrap_or(false) {
+            if let Some(ev) = dag.events.get(&h) {
+                state = sm_apply(h.to_vec(), ev.author.to_vec(), ev.timestamp, ev.payload.clone(), state);
+            }
         }
     }
     state
