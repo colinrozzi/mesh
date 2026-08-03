@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 
 const HELLO: u8 = 0x01;
 const AUTH: u8 = 0x02;
+const DELIVER: u8 = 0x10; // node↔node gossip frame (a raw encoded Event)
 const SUBMIT: u8 = 0x11;
 const INTRODUCE: u8 = 0x12;
 const DEPART: u8 = 0x13;
@@ -18,6 +19,7 @@ const CHALLENGE: u8 = 0x80;
 const ACCEPTED: u8 = 0x81;
 const ACK: u8 = 0x91;
 const FINALIZED: u8 = 0x93; // Interface 3 `finalized` dag-node delivery
+const CONFLICT: u8 = 0x95; // Interface 3 `conflict` (fail-loud)
 const QUERY_REPLY: u8 = 0xa0;
 
 // Interface 2 query sub-kinds + event-status values (mirror src/wire.rs).
@@ -56,6 +58,61 @@ pub fn pubkey(sk: &SigningKey) -> [u8; 32] {
 
 pub fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{:02x}", x)).collect()
+}
+
+fn sha256(b: &[u8]) -> [u8; 32] {
+    let mut h = Sha256::new();
+    h.update(b);
+    h.finalize().into()
+}
+
+/// The canonical unsigned encoding of an event (mirrors `src/event.rs`):
+/// author ++ ts(u64 BE) ++ self_parent(tag+hash) ++ refs(u16+N*32) ++ payload(u32+bytes).
+fn encode_unsigned(
+    author: &[u8; 32],
+    timestamp: u64,
+    self_parent: &Option<[u8; 32]>,
+    refs: &[[u8; 32]],
+    payload: &[u8],
+) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(author);
+    out.extend_from_slice(&timestamp.to_be_bytes());
+    match self_parent {
+        None => out.push(0),
+        Some(h) => {
+            out.push(1);
+            out.extend_from_slice(h);
+        }
+    }
+    out.extend_from_slice(&(refs.len() as u16).to_be_bytes());
+    for r in refs {
+        out.extend_from_slice(r);
+    }
+    out.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+    out.extend_from_slice(payload);
+    out
+}
+
+/// Forge a properly-SIGNED raw mesh event (for dishonest-peer / adversarial tests).
+/// Returns `(event_hash, wire_bytes)`. The signature is valid — only the *content*
+/// (e.g. a non-member authoring) is adversarial, which is what a dishonest peer can
+/// do that honest pre-validated `author` never would. Structurally admissible iff
+/// its deps are present at the target node.
+pub fn forge_event(
+    signer: &SigningKey,
+    timestamp: u64,
+    self_parent: Option<[u8; 32]>,
+    refs: &[[u8; 32]],
+    payload: &[u8],
+) -> ([u8; 32], Vec<u8>) {
+    let author = pubkey(signer);
+    let unsigned = encode_unsigned(&author, timestamp, &self_parent, refs, payload);
+    let signature = signer.sign(&sha256(&unsigned)).to_bytes();
+    let mut bytes = unsigned;
+    bytes.extend_from_slice(&signature);
+    let event_hash = sha256(&bytes);
+    (event_hash, bytes)
 }
 
 fn encode_frame(kind: u8, payload: &[u8]) -> Vec<u8> {
@@ -137,6 +194,24 @@ impl Client {
         let mut h = [0u8; 32];
         h.copy_from_slice(&ack[..32]);
         Ok(h)
+    }
+
+    /// Inject a raw encoded event as if gossiped from a peer (dishonest-peer path —
+    /// bypasses the node's honest pre-validated `author`). No ack; the node ingests
+    /// it structurally and the SM's `validate` decides its fate on the fold.
+    pub fn gossip_raw(&mut self, event_bytes: &[u8]) -> io::Result<()> {
+        self.stream.write_all(&encode_frame(DELIVER, event_bytes))
+    }
+
+    /// Wait for the next `conflict` (Interface 3): `(offending_event_id, reason)`.
+    pub fn recv_conflict(&mut self) -> io::Result<([u8; 32], String)> {
+        let payload = read_until(&mut self.stream, CONFLICT)?;
+        if payload.len() < 32 {
+            return Err(err("conflict frame too short".to_string()));
+        }
+        let mut id = [0u8; 32];
+        id.copy_from_slice(&payload[..32]);
+        Ok((id, String::from_utf8_lossy(&payload[32..]).to_string()))
     }
 
     /// Wait for the next finalized `dag-node` (Interface 3 `finalized`).
