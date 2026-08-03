@@ -8,7 +8,7 @@ description = "A trivial state-machine component exporting the RSM `state-machin
 crate-type = ["cdylib"]
 
 [dependencies]
-packr-guest = "0.12.1"
+packr-guest = "0.12.7"
 
 [profile.release]
 opt-level = "s"

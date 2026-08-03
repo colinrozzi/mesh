@@ -8,7 +8,7 @@ description = "Throwaway compose-smoke consumer: imports the RSM state-machine i
 crate-type = ["cdylib"]
 
 [dependencies]
-packr-guest = "0.12.1"
+packr-guest = "0.12.7"
 
 [profile.release]
 opt-level = "s"
