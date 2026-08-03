@@ -190,13 +190,14 @@ fn main() {
         cs.submit(&response(1, &pk_m, b"ok")).map_err(|e| format!("response: {e}"))?;
         println!("✓ S authored response(corr=1) → ok");
 
-        // 5. the manager's client must receive that response. Skip any genesis/join/
-        //    command NOTIFYs still queued; the response is the one that matters.
+        // 5. the manager's client must receive that response as a finalized dag-node.
+        //    Skip any genesis/join/command deliveries still queued.
+        let mut response_id = None;
         for _ in 0..8 {
-            let (from, body) = cm.recv_message().map_err(|e| format!("recv on M: {e}"))?;
-            if let Some((corr, cmd_author, res)) = decode_response(&body) {
-                if from != pk_s {
-                    return Err(format!("response from unexpected author {}", hex(&from)));
+            let dn = cm.recv_finalized().map_err(|e| format!("recv on M: {e}"))?;
+            if let Some((corr, cmd_author, res)) = decode_response(&dn.payload) {
+                if dn.author != pk_s {
+                    return Err(format!("response from unexpected author {}", hex(&dn.author)));
                 }
                 if corr != 1 || cmd_author != pk_m {
                     return Err(format!("response keyed to wrong command: corr={corr}"));
@@ -204,11 +205,47 @@ fn main() {
                 if res != b"ok" {
                     return Err(format!("wrong result: {:?}", String::from_utf8_lossy(&res)));
                 }
-                println!("✓ M received response(corr=1) from S: {:?}", String::from_utf8_lossy(&res));
-                return Ok(());
+                if dn.deps.is_empty() {
+                    return Err("finalized dag-node carried no deps".to_string());
+                }
+                println!("✓ M received finalized response(corr=1) from S: {:?} ({} deps)", String::from_utf8_lossy(&res), dn.deps.len());
+                response_id = Some(dn.id);
+                break;
             }
         }
-        Err("manager never received the response after 8 deliveries".to_string())
+        let response_id = response_id.ok_or("manager never received the response after 8 deliveries")?;
+
+        // Interface 2 read verbs, exercised against the just-delivered event.
+        let status = cm.event_status(&response_id).map_err(|e| format!("event-status: {e}"))?;
+        if status != mesh_testkit::STATUS_FINALIZED {
+            return Err(format!("event-status(response) = {status}, want finalized"));
+        }
+        let unknown = cm.event_status(&[0u8; 32]).map_err(|e| format!("event-status: {e}"))?;
+        if unknown != mesh_testkit::STATUS_UNKNOWN {
+            return Err(format!("event-status(nonexistent) = {unknown}, want unknown"));
+        }
+        println!("✓ event-status: response=finalized, unknown-hash=unknown");
+
+        let anc = cm.ancestry(&response_id).map_err(|e| format!("ancestry: {e}"))?;
+        if anc.is_empty() {
+            return Err("ancestry(response) is empty — should include the whole cycle".to_string());
+        }
+        let wit = cm.witnesses(&response_id).map_err(|e| format!("witnesses: {e}"))?;
+        println!("✓ inspection: ancestry(response)={} events, witnesses={}", anc.len(), wit.len());
+
+        // current-state must have CONVERGED byte-for-byte across both nodes — the
+        // clearest proof the finalized fold is identical everywhere.
+        std::thread::sleep(Duration::from_millis(300));
+        let state_s = cs.current_state().map_err(|e| format!("current-state S: {e}"))?;
+        let state_m = cm.current_state().map_err(|e| format!("current-state M: {e}"))?;
+        if state_s.is_empty() {
+            return Err("current-state is empty".to_string());
+        }
+        if state_s != state_m {
+            return Err("current-state DIVERGED between S and M".to_string());
+        }
+        println!("✓ current-state converged on S and M ({} bytes, identical)", state_s.len());
+        Ok(())
     })();
 
     let _ = child_s.kill();

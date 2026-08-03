@@ -13,10 +13,34 @@ const AUTH: u8 = 0x02;
 const SUBMIT: u8 = 0x11;
 const INTRODUCE: u8 = 0x12;
 const DEPART: u8 = 0x13;
+const QUERY: u8 = 0x30;
 const CHALLENGE: u8 = 0x80;
 const ACCEPTED: u8 = 0x81;
 const ACK: u8 = 0x91;
-const NOTIFY: u8 = 0x92;
+const FINALIZED: u8 = 0x93; // Interface 3 `finalized` dag-node delivery
+const QUERY_REPLY: u8 = 0xa0;
+
+// Interface 2 query sub-kinds + event-status values (mirror src/wire.rs).
+const Q_STATE: u8 = 0;
+const Q_STATUS: u8 = 1;
+const Q_WITNESSES: u8 = 2;
+const Q_ANCESTRY: u8 = 3;
+
+/// event-status (DESIGN-rsm.md): 0 unknown · 1 pending · 2 finalized · 3 stranded.
+pub const STATUS_UNKNOWN: u8 = 0;
+pub const STATUS_PENDING: u8 = 1;
+pub const STATUS_FINALIZED: u8 = 2;
+pub const STATUS_STRANDED: u8 = 3;
+
+/// A delivered `dag-node` (Interface 3): the sm-event plus its DAG `deps`.
+#[derive(Debug, Clone)]
+pub struct DagNode {
+    pub id: [u8; 32],
+    pub author: [u8; 32],
+    pub timestamp: u64,
+    pub deps: Vec<[u8; 32]>,
+    pub payload: Vec<u8>,
+}
 
 /// Derive a signing key from a seed string (sha256), matching the mesh's own
 /// key derivation from `node_seed`.
@@ -115,16 +139,107 @@ impl Client {
         Ok(h)
     }
 
-    /// Wait for the next committed message delivery (NOTIFY) → `(from, body)`.
-    pub fn recv_message(&mut self) -> io::Result<([u8; 32], Vec<u8>)> {
-        let payload = read_until(&mut self.stream, NOTIFY)?;
-        if payload.len() < 32 {
-            return Err(err("NOTIFY too short".to_string()));
-        }
-        let mut from = [0u8; 32];
-        from.copy_from_slice(&payload[..32]);
-        Ok((from, payload[32..].to_vec()))
+    /// Wait for the next finalized `dag-node` (Interface 3 `finalized`).
+    pub fn recv_finalized(&mut self) -> io::Result<DagNode> {
+        let payload = read_until(&mut self.stream, FINALIZED)?;
+        decode_dag_node(&payload)
     }
+
+    /// Back-compat: the next delivery as `(author, payload)`.
+    pub fn recv_message(&mut self) -> io::Result<([u8; 32], Vec<u8>)> {
+        let dn = self.recv_finalized()?;
+        Ok((dn.author, dn.payload))
+    }
+
+    // ---- Interface 2 read verbs (each a QUERY → QUERY-REPLY round trip) ----
+
+    /// `current-state` — the finalized SM fold (opaque bytes).
+    pub fn current_state(&mut self) -> io::Result<Vec<u8>> {
+        self.stream.write_all(&encode_frame(QUERY, &[Q_STATE]))?;
+        self.read_query_reply(Q_STATE)
+    }
+
+    /// `event-status` — where `event` sits in its lifecycle (STATUS_*).
+    pub fn event_status(&mut self, event: &[u8; 32]) -> io::Result<u8> {
+        let mut body = Vec::with_capacity(33);
+        body.push(Q_STATUS);
+        body.extend_from_slice(event);
+        self.stream.write_all(&encode_frame(QUERY, &body))?;
+        let r = self.read_query_reply(Q_STATUS)?;
+        Ok(*r.first().unwrap_or(&STATUS_UNKNOWN))
+    }
+
+    /// `witnesses` — the pubkeys whose chains causally see `event`.
+    pub fn witnesses(&mut self, event: &[u8; 32]) -> io::Result<Vec<[u8; 32]>> {
+        let mut body = Vec::with_capacity(33);
+        body.push(Q_WITNESSES);
+        body.extend_from_slice(event);
+        self.stream.write_all(&encode_frame(QUERY, &body))?;
+        Ok(decode_hash_list(&self.read_query_reply(Q_WITNESSES)?))
+    }
+
+    /// `ancestry` — the causal past (ancestor hashes) of `event`.
+    pub fn ancestry(&mut self, event: &[u8; 32]) -> io::Result<Vec<[u8; 32]>> {
+        let mut body = Vec::with_capacity(33);
+        body.push(Q_ANCESTRY);
+        body.extend_from_slice(event);
+        self.stream.write_all(&encode_frame(QUERY, &body))?;
+        Ok(decode_hash_list(&self.read_query_reply(Q_ANCESTRY)?))
+    }
+
+    fn read_query_reply(&mut self, expect: u8) -> io::Result<Vec<u8>> {
+        let payload = read_until(&mut self.stream, QUERY_REPLY)?;
+        let (qkind, rest) = payload.split_first().ok_or_else(|| err("empty query reply".to_string()))?;
+        if *qkind != expect {
+            return Err(err(format!("query reply kind {qkind:#x} != expected {expect:#x}")));
+        }
+        Ok(rest.to_vec())
+    }
+}
+
+/// Decode a FINALIZED frame body into a `DagNode`.
+fn decode_dag_node(p: &[u8]) -> io::Result<DagNode> {
+    if p.len() < 32 + 32 + 8 + 2 {
+        return Err(err("dag-node too short".to_string()));
+    }
+    let mut id = [0u8; 32];
+    id.copy_from_slice(&p[0..32]);
+    let mut author = [0u8; 32];
+    author.copy_from_slice(&p[32..64]);
+    let timestamp = u64::from_be_bytes(p[64..72].try_into().unwrap());
+    let n = u16::from_be_bytes([p[72], p[73]]) as usize;
+    let mut pos = 74;
+    let mut deps = Vec::with_capacity(n);
+    for _ in 0..n {
+        if pos + 32 > p.len() {
+            break;
+        }
+        let mut d = [0u8; 32];
+        d.copy_from_slice(&p[pos..pos + 32]);
+        deps.push(d);
+        pos += 32;
+    }
+    Ok(DagNode { id, author, timestamp, deps, payload: p[pos..].to_vec() })
+}
+
+/// Decode a bare hash-list body (u16 count + N*32) — witnesses / ancestry results.
+fn decode_hash_list(b: &[u8]) -> Vec<[u8; 32]> {
+    if b.len() < 2 {
+        return Vec::new();
+    }
+    let n = u16::from_be_bytes([b[0], b[1]]) as usize;
+    let mut out = Vec::with_capacity(n);
+    let mut pos = 2;
+    for _ in 0..n {
+        if pos + 32 > b.len() {
+            break;
+        }
+        let mut h = [0u8; 32];
+        h.copy_from_slice(&b[pos..pos + 32]);
+        out.push(h);
+        pos += 32;
+    }
+    out
 }
 
 // ---- process harness: spawn mesh nodes via the theater runtime ----

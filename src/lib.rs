@@ -45,10 +45,12 @@ use conn::{ConnState, Phase};
 use dag::Dag;
 use event::{Event, Hash, PubKey};
 use wire::{
-    decode_hashes, encode_ack, encode_auth, encode_challenge, encode_deliver, encode_hashes,
-    encode_hello, encode_notify, encode_rejected, try_parse_frame, ParsedFrame, FRAME_ACCEPTED,
-    FRAME_AUTH, FRAME_CHALLENGE, FRAME_DELIVER, FRAME_FRONTIER, FRAME_HELLO, FRAME_SUBMIT,
-    FRAME_WANT,
+    decode_hashes, encode_ack, encode_auth, encode_challenge, encode_conflict, encode_deliver,
+    encode_finalized, encode_hash_list_body, encode_hashes, encode_hello, encode_query_reply,
+    encode_rejected, try_parse_frame, ParsedFrame, FRAME_ACCEPTED, FRAME_AUTH, FRAME_CHALLENGE,
+    FRAME_DELIVER, FRAME_FRONTIER, FRAME_HELLO, FRAME_QUERY, FRAME_SUBMIT, FRAME_WANT, Q_ANCESTRY,
+    Q_STATE, Q_STATUS, Q_WITNESSES, STATUS_FINALIZED, STATUS_PENDING, STATUS_STRANDED,
+    STATUS_UNKNOWN,
 };
 
 #[derive(Clone, GraphValue)]
@@ -641,6 +643,11 @@ fn handle_authed_frame(
         FRAME_SUBMIT => {
             author_and_broadcast(dag, conns, conn_id, signing_key, self_head, frame.payload.clone())
         }
+        // Interface 2 read verbs (current-state / event-status / witnesses / ancestry).
+        FRAME_QUERY => {
+            answer_query(dag, conn_id, &frame.payload);
+            self_head
+        }
         FRAME_WANT => {
             // Answer each WANT with the event if we hold it. The mesh retains full
             // history, so anything we've admitted is still here to serve; a hash we
@@ -665,6 +672,65 @@ fn handle_authed_frame(
         // ACK / NOTIFY are responses meant for app clients; a node ignores them.
         _ => self_head,
     }
+}
+
+/// Classify an event for Interface 2 `event-status`: `unknown` (not held),
+/// `pending` (held but still buffering on a missing dep), `finalized` (admitted +
+/// valid against its ancestry — v0 is admission-final), or `stranded` (admitted but
+/// invalid against its ancestry — inert).
+fn event_status(dag: &Dag, h: &Hash) -> u8 {
+    if let Some(ev) = dag.events.get(h) {
+        let state_at = fold_state_at(dag, &deps_of(ev));
+        if sm_validate(h.to_vec(), ev.author.to_vec(), ev.timestamp, ev.payload.clone(), state_at)
+            .is_ok()
+        {
+            STATUS_FINALIZED
+        } else {
+            STATUS_STRANDED
+        }
+    } else if dag.pending_events().iter().any(|e| &e.event_hash() == h) {
+        STATUS_PENDING
+    } else {
+        STATUS_UNKNOWN
+    }
+}
+
+/// Read the 32-byte hash argument of a query, if present.
+fn query_arg_hash(arg: &[u8]) -> Option<Hash> {
+    if arg.len() < 32 {
+        return None;
+    }
+    let mut h = [0u8; 32];
+    h.copy_from_slice(&arg[..32]);
+    Some(h)
+}
+
+/// Answer an Interface 2 read verb and send the reply on `conn_id`.
+fn answer_query(dag: &Dag, conn_id: &str, body: &[u8]) {
+    let Some((&qkind, arg)) = body.split_first() else {
+        return;
+    };
+    let reply = match qkind {
+        Q_STATE => encode_query_reply(Q_STATE, &current_state(dag)),
+        Q_STATUS => {
+            let status = query_arg_hash(arg).map(|h| event_status(dag, &h)).unwrap_or(STATUS_UNKNOWN);
+            encode_query_reply(Q_STATUS, &[status])
+        }
+        Q_WITNESSES => {
+            let list: Vec<Hash> = query_arg_hash(arg)
+                .map(|h| dag.witnesses(&h).into_iter().collect())
+                .unwrap_or_default();
+            encode_query_reply(Q_WITNESSES, &encode_hash_list_body(&list))
+        }
+        Q_ANCESTRY => {
+            let list: Vec<Hash> = query_arg_hash(arg)
+                .map(|h| dag.ancestors_of(&[h]).into_iter().collect())
+                .unwrap_or_default();
+            encode_query_reply(Q_ANCESTRY, &encode_hash_list_body(&list))
+        }
+        _ => return,
+    };
+    let _ = tcp_send(conn_id.to_string(), reply);
 }
 
 /// Ingest a gossiped event: dedup, backfill on missing deps, else admit + forward.
@@ -898,12 +964,13 @@ fn fold_state_at(dag: &Dag, frontier: &[Hash]) -> Vec<u8> {
     state
 }
 
-/// Fold the admitted DAG through the composed SM and deliver each newly-final
-/// payload event to the app. v0 is admission-final: an event is final (deliverable)
-/// the moment its `validate` passes against **its own ancestry state** (via
-/// `fold_state_at`), never the global fold — so concurrent events can't strand it.
-/// A non-validating event is skipped here; explicit conflict/stranded *surfacing*
-/// to the app is step 4.
+/// Fold the admitted DAG through the composed SM and emit the Interface 3 stream:
+/// a `finalized` `dag-node` for each newly-final payload event, or a fail-loud
+/// `conflict` for an admitted event that is invalid against **its own ancestry
+/// state** (via `fold_state_at`, never the global fold — so concurrent events can't
+/// strand each other). v0 is admission-final and our own `author` pre-validates, so
+/// in an honest v0 mesh the conflict branch never fires; it is the safety net that
+/// makes "conflict-free" a CHECKED runtime invariant against a buggy/dishonest peer.
 fn deliver_committed(
     dag: &Dag,
     conns: &BTreeMap<String, ConnState>,
@@ -916,23 +983,35 @@ fn deliver_committed(
         let Some(ev) = dag.events.get(&h) else {
             continue;
         };
-        let state_at = fold_state_at(dag, &deps_of(ev));
-        if sm_validate(h.to_vec(), ev.author.to_vec(), ev.timestamp, ev.payload.clone(), state_at)
-            .is_err()
+        let deps = deps_of(ev);
+        let state_at = fold_state_at(dag, &deps);
+        if let Err(reason) =
+            sm_validate(h.to_vec(), ev.author.to_vec(), ev.timestamp, ev.payload.clone(), state_at)
         {
-            continue; // stranded — step 4 will surface the conflict
+            // Genuine conflict (loser inert). Surface it ONCE to every app client.
+            if delivered.insert(h) {
+                log(format!("[mesh] CONFLICT {}: {}", hex(&h), reason));
+                let frame = encode_conflict(&h, &reason);
+                for (cid, cs) in conns {
+                    if matches!(cs.phase, Phase::Authed { .. }) {
+                        let _ = tcp_send(cid.clone(), frame.clone());
+                    }
+                }
+            }
+            continue;
         }
         if ev.payload.is_empty() || !delivered.insert(h) {
             continue;
         }
-        // TCP app clients (test harness) get a NOTIFY frame...
-        let frame = encode_notify(&ev.author, &ev.payload);
+        // Interface 3 `finalized`: hand app clients the whole dag-node (sm-event +
+        // deps), so the executor can linearize the DAG locally.
+        let frame = encode_finalized(&h, &ev.author, ev.timestamp, &deps, &ev.payload);
         for (cid, cs) in conns {
             if matches!(cs.phase, Phase::Authed { .. }) {
                 let _ = tcp_send(cid.clone(), frame.clone());
             }
         }
-        // ...the co-located app actor gets a message-server delivery.
+        // The co-located app actor gets a message-server delivery (payload + author).
         if !app_id.is_empty() {
             let _ = message_server_send(app_id.to_string(), api::encode_delivery(&ev.author, &ev.payload));
         }
