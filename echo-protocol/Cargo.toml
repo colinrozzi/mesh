@@ -1,0 +1,7 @@
+[package]
+name = "echo-protocol"
+version = "0.1.0"
+edition = "2021"
+description = "Tier-2 reference per-SM protocol crate: the request/response (echo) payload kinds + codec ONLY. Shared by echo-sm and the echo executors so the wire has one owner, zero drift."
+
+[dependencies]
