@@ -17,7 +17,7 @@ use std::time::Duration;
 const THEATER_BIN: &str = "/home/colin/work/theater/target/release/theater";
 const MESH_DIR: &str = "/home/colin/work/actors/mesh";
 const NODE_WASM: &str = "target/wasm32-unknown-unknown/release/mesh_counter.wasm";
-const SYS_WASM: &str = "counter-system/target/wasm32-unknown-unknown/release/counter_system.wasm";
+const SYS_WASM: &str = "examples/counter/counter-system/target/wasm32-unknown-unknown/release/counter_system.wasm";
 const NODE_LISTEN: &str = "127.0.0.1:9491";
 const LOG: &str = "/tmp/mesh-counter-system.log";
 

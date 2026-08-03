@@ -19,7 +19,7 @@ use std::time::Duration;
 const THEATER_BIN: &str = "/home/colin/work/theater/target/release/theater";
 const MESH_DIR: &str = "/home/colin/work/actors/mesh";
 const NODE_WASM: &str = "target/wasm32-unknown-unknown/release/mesh_echo.wasm";
-const SYS_WASM: &str = "echo-system/target/wasm32-unknown-unknown/release/echo_system.wasm";
+const SYS_WASM: &str = "examples/echo/echo-system/target/wasm32-unknown-unknown/release/echo_system.wasm";
 
 const SERVER_SEED: &str = "echo-server-node";
 const CLIENT_SEED: &str = "echo-client-node";

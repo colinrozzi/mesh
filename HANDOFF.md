@@ -35,6 +35,32 @@ arrives with the first conflict-prone consumer. See the `mesh-rsm-reshape` memor
 `/home/colin/work/pack/target/release/packr … --output …` (== published 0.12.7),
 not the 0.12.2 nix binary. Every oracle recomposes with it.
 
+## Post-v0 hardening (2026-08-03)
+v0 is **PUSHED** (main == `oqqqkwty`). Integration work landed on top (see the
+`mesh-rsm-reshape` memory for the blow-by-blow):
+- **Confluence flagship** (`confluence-test/`, pushed) — concurrent authoring across
+  a partition; found+fixed 3 substrate bugs (gossip relay, non-confluent fold →
+  two-pass finality/application split, no anti-entropy).
+- **Fail-loud conflict injection** (`conflict-injection-test/`, pushed) — dishonest
+  peer forges a non-member event; node fires `conflict` + `stranded`, keeps it inert.
+- **Scale test + fold memoization** (`scale-test/`, **2 UNPUSHED commits**: `wkuqyzlx`
+  perf + `mxywvqsx` test). N-node line topology, wide concurrent frontier. It measured
+  the fold wall (40 events = 22s author + 74s converge) and drove the fix: per-event
+  **finality is memoized** (immutable per principle 1) in `final_json`/`ensure_finality`,
+  so `current-state`/`event-status`/`deliver_committed` read a shared cache instead of
+  re-folding per event — kills the O(events³) term. After: 0.85s/0.61s (~25×/~122×),
+  still byte-for-byte confluent to 8 nodes / 200 events. Residual is quadratic, floored
+  by per-event ancestry validation + theater's full-DAG-JSON-per-call persistence, not
+  the fold. **Suite (all green):** control-roundtrip, chat-smoke, confluence,
+  conflict-injection, scale + 19 host + 6 + 6 SM unit tests + clippy.
+- **STALE:** `multi-node-test` (+ likely `join-test`/`evict-test`/`membership-test`/
+  `app-test`) point at RAW `mesh.wasm`, which post-reshape can't instantiate alone
+  (`unknown import: state-machine::initial-state`). Pre-existing; re-home onto a
+  composite when touched.
+
+**Next / open:** push the 2 scale commits (Colin's go); lift the fleet-comms hold now
+that v0 is landed+pushed; pin `packr-guest 0.12.7`.
+
 ## Read first (the durable sources)
 - **`DESIGN-rsm.md`** — the pinned contract (5 principles, 3 interfaces, admission-final
   v0, conflict detection kept, deferred conflict-prone bundle).
