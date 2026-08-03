@@ -1,7 +1,10 @@
 //! Shared client helpers for mesh integration tests — the wire protocol from a
 //! client's perspective. Used by `smoke` and `multi-node-test`.
 
-use ed25519_dalek::{Signer, SigningKey};
+use ed25519_dalek::Signer;
+/// Re-exported so test binaries can name the key type without depending on
+/// `ed25519-dalek` directly.
+pub use ed25519_dalek::SigningKey;
 use sha2::{Digest, Sha256};
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
