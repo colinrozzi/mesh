@@ -1,0 +1,7 @@
+[package]
+name = "counter-protocol"
+version = "0.1.0"
+edition = "2021"
+description = "Reference RSM per-SM protocol crate: the counter payload kinds + [version][kind][content] codec ONLY (no validate/apply). Imported by counter-sm AND the counter executor so there is exactly one codec, zero wire drift — the middle layer of the executor / protocol / SM / node reference stack."
+
+[dependencies]
