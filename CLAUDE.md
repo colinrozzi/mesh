@@ -18,6 +18,11 @@ where the build is right now.
     RPC (actions) + the message-server stream (events); nodes gossip over TCP.
   - `tests/{control-roundtrip,chat-smoke,confluence,conflict-injection,scale}-test` —
     substrate property tests (driven via `testkit`'s std Client).
+  - `tests/bank/` — the currency SM: the FIRST conflict-prone consumer (a transfer needs
+    a balance). `bank-double-spend-test` shows the frontier LIVE — two concurrent
+    transfers from one wallet both finalize and the network converges on a *negative*
+    balance, i.e. admission-final finality is consistent but not sufficient. It is the
+    future acceptance test for the deferred witness-finality bundle.
   - `tests/testkit/` — shared std test harness.
   - `tests/fixtures/` — the SMs those property tests compose the node against: the REAL
     consumer SMs `control-sm` + `chat-sm` (sentinel's + manager's; here as fixtures so the
