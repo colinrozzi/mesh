@@ -4,7 +4,7 @@
 
 [[component]]
 name  = "mesh"
-wasm  = "target/wasm32-unknown-unknown/release/mesh.wasm"
+wasm  = "../../target/wasm32-unknown-unknown/release/mesh.wasm"
 entry = true
 
 [[component]]

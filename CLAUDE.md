@@ -6,16 +6,17 @@ state machine) — see `docs/DESIGN-rsm.md` for the locked design and `HANDOFF.m
 where the build is right now.
 
 ## Repo layout
-- `src/` — the node (core); `mesh-api/` — the app protocol; `state-machine.pact` — the
-  Interface-1 contract.
-- `control-sm/`, `chat-sm/` — the real fleet SMs (sentinel's + manager's; here for now,
-  slated to move to their own repos). `control-compose.toml` / `chat-compose.toml` compose them.
+- Root is pure substrate: `src/` — the node (core); `mesh-api/` — the app protocol;
+  `state-machine.pact` — the Interface-1 contract.
 - `examples/` — the reference systems, each a self-contained stack (protocol + SM +
   executor + its integration test) that is ALSO a test: `counter/` (tier-1, single node),
   `echo/` (tier-2, two-node request/response). This is where the intended pattern lives.
 - `tests/` — substrate integration tests: `testkit` (shared std harness) +
   `control-roundtrip-test`, `chat-smoke-test`, `confluence-test`, `conflict-injection-test`,
-  `scale-test`.
+  `scale-test`. `tests/fixtures/` holds the SMs those tests compose the node against —
+  the REAL consumer SMs `control-sm` + `chat-sm` (sentinel's + manager's; here as test
+  fixtures so the substrate is exercised against real consumers, slated to move to their
+  own repos) with their `*-compose.toml`.
 - `docs/` — `DESIGN-rsm.md` (live), `composition.md` (packr compose/packaging), +
   `history/` (superseded designs).
 
