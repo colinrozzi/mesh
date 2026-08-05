@@ -1,0 +1,29 @@
+# Compose the node (entry) with bank-sm → the currency node artifact.
+# Compose with the FIXED packr (== published 0.12.7). Paths relative to this dir.
+
+[[component]]
+name  = "mesh"
+wasm  = "../../target/wasm32-unknown-unknown/release/mesh.wasm"
+entry = true
+
+[[component]]
+name = "bank-sm"
+wasm = "bank-sm/target/wasm32-unknown-unknown/release/bank_sm.wasm"
+
+[[link]]
+consumer = "mesh"
+import   = "state-machine.initial-state"
+provider = "bank-sm"
+export   = "initial-state"
+
+[[link]]
+consumer = "mesh"
+import   = "state-machine.validate"
+provider = "bank-sm"
+export   = "validate"
+
+[[link]]
+consumer = "mesh"
+import   = "state-machine.apply"
+provider = "bank-sm"
+export   = "apply"

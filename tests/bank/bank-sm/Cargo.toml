@@ -1,0 +1,18 @@
+[package]
+name = "bank-sm"
+version = "0.1.0"
+edition = "2021"
+description = "A currency/bank as an RSM state-machine (DESIGN-rsm.md Interface 1): wallets -> balances, Mint + Transfer. The FIRST conflict-prone SM — a Transfer is valid iff the source holds the amount (ancestry-relative), so two concurrent transfers from one wallet are each valid alone but double-spend together. Exercises the conflict frontier the conflict-free SMs (counter/echo/chat/control) cannot."
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+packr-guest = "0.12.7"
+bank-protocol = { path = "../bank-protocol" }
+serde = { version = "1", default-features = false, features = ["alloc", "derive"] }
+serde_json = { version = "1", default-features = false, features = ["alloc"] }
+
+[profile.release]
+opt-level = "s"
+lto = true

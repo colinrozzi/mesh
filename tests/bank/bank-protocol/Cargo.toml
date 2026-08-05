@@ -1,0 +1,7 @@
+[package]
+name = "bank-protocol"
+version = "0.1.0"
+edition = "2021"
+description = "Bank/currency payload codec: Mint / Transfer kinds. Shared by bank-sm and the bank executor. The first CONFLICT-PRONE SM's wire (a transfer's validity depends on a balance, so concurrent transfers from one wallet can double-spend)."
+
+[dependencies]
