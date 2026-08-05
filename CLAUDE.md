@@ -10,10 +10,12 @@ where the build is right now.
   `state-machine.pact` — the Interface-1 contract.
 - `tests/` — everything test-and-reference (an example worth making is reused as a test,
   so there is no separate `examples/`):
-  - `tests/counter/`, `tests/echo/` — **the reference systems**, each a self-contained
-    stack (protocol + SM + executor + its integration test) that IS the test. **Start
-    here** to see how to build on mesh: `counter` (tier-1, single node), `echo` (tier-2,
-    two-node request/response over RPC + the message-server stream).
+  - `tests/counter/`, `tests/echo/`, `tests/cluster/` — **the reference systems**, each a
+    self-contained stack (SM/protocol + executor + its integration test) that IS the test.
+    **Start here** to see how to build on mesh: `counter` (tier-1, single node), `echo`
+    (tier-2, two-node request/response), `cluster` (tier-3, an orchestrator that spins up
+    N nodes, drives a workload, and observes the whole network to convergence). All over
+    RPC (actions) + the message-server stream (events); nodes gossip over TCP.
   - `tests/{control-roundtrip,chat-smoke,confluence,conflict-injection,scale}-test` —
     substrate property tests (driven via `testkit`'s std Client).
   - `tests/testkit/` — shared std test harness.
