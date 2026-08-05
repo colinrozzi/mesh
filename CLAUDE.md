@@ -16,8 +16,8 @@ where the build is right now.
 - `tests/` — substrate integration tests: `testkit` (shared std harness) +
   `control-roundtrip-test`, `chat-smoke-test`, `confluence-test`, `conflict-injection-test`,
   `scale-test`.
-- `docs/` — `DESIGN-rsm.md` (live) + `history/` (superseded designs).
-- `legacy/` — pre-reshape crates, kept only until wiped; do NOT build against them.
+- `docs/` — `DESIGN-rsm.md` (live), `composition.md` (packr compose/packaging), +
+  `history/` (superseded designs).
 
 ## Build & test
 - **Build node (wasm):** `cargo build --release --target wasm32-unknown-unknown`
@@ -54,7 +54,8 @@ commit messages with the `Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com
 trailer.
 
 ## State, work, and comms — pointers (read on demand)
-- **Current work + resume point:** `HANDOFF.md`, then `docs/DESIGN-rsm.md`.
+- **Current work + resume point:** the `mesh-rsm-reshape` memory (auto-surfaced via
+  `MEMORY.md`), then `docs/DESIGN-rsm.md`.
 - **Project state, decisions, preferences:** the memory system — the `MEMORY.md` index
   auto-loads; the files under `memory/*.md` are read on demand.
 - **Fleet email** (this project's identity = `mesh-dev@colinrozzi.com`): quick-ref in
