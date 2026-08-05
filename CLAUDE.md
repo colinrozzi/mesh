@@ -8,15 +8,19 @@ where the build is right now.
 ## Repo layout
 - Root is pure substrate: `src/` — the node (core); `mesh-api/` — the app protocol;
   `state-machine.pact` — the Interface-1 contract.
-- `examples/` — the reference systems, each a self-contained stack (protocol + SM +
-  executor + its integration test) that is ALSO a test: `counter/` (tier-1, single node),
-  `echo/` (tier-2, two-node request/response). This is where the intended pattern lives.
-- `tests/` — substrate integration tests: `testkit` (shared std harness) +
-  `control-roundtrip-test`, `chat-smoke-test`, `confluence-test`, `conflict-injection-test`,
-  `scale-test`. `tests/fixtures/` holds the SMs those tests compose the node against —
-  the REAL consumer SMs `control-sm` + `chat-sm` (sentinel's + manager's; here as test
-  fixtures so the substrate is exercised against real consumers, slated to move to their
-  own repos) with their `*-compose.toml`.
+- `tests/` — everything test-and-reference (an example worth making is reused as a test,
+  so there is no separate `examples/`):
+  - `tests/counter/`, `tests/echo/` — **the reference systems**, each a self-contained
+    stack (protocol + SM + executor + its integration test) that IS the test. **Start
+    here** to see how to build on mesh: `counter` (tier-1, single node), `echo` (tier-2,
+    two-node request/response over RPC + the message-server stream).
+  - `tests/{control-roundtrip,chat-smoke,confluence,conflict-injection,scale}-test` —
+    substrate property tests (driven via `testkit`'s std Client).
+  - `tests/testkit/` — shared std test harness.
+  - `tests/fixtures/` — the SMs those property tests compose the node against: the REAL
+    consumer SMs `control-sm` + `chat-sm` (sentinel's + manager's; here as fixtures so the
+    substrate is exercised against real consumers, slated to move to their own repos) with
+    their `*-compose.toml`.
 - `docs/` — `DESIGN-rsm.md` (live), `composition.md` (packr compose/packaging), +
   `history/` (superseded designs).
 

@@ -8,4 +8,4 @@ name = "mesh-echo-system-test"
 path = "src/main.rs"
 
 [dependencies]
-mesh-testkit = { path = "../../../tests/testkit" }
+mesh-testkit = { path = "../../testkit" }
