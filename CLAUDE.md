@@ -42,11 +42,12 @@ where the build is right now.
 - **Adjacent crates** are standalone (not a workspace) — build with
   `--manifest-path <path>/Cargo.toml`. SMs/systems (wasm cdylibs) need
   `--target wasm32-unknown-unknown`; the `*-test` runners are std host bins.
-- **Compose** a node ⊕ SM with the FIXED packr (== published 0.12.7):
-  `/home/colin/work/pack/target/release/packr compose <compose.toml> --output <out.wasm>`
-  (the 0.12.2 nix binary produces artifacts that fail to load — LTO import-strip bug).
-  Example composes live next to their example (`examples/*/*-compose.toml`); control/chat
-  compose from root.
+- **Compose** a node ⊕ SM with the **official** packr 0.13.0
+  (`cargo install packr@0.13.0` → `~/.cargo/bin/packr compose <compose.toml> --output
+  <out.wasm>`). REQUIRED now that the node is GENERIC (`state-machine<s>`) — 0.13.0
+  carries the M4 compose-time unification that binds `s` to the SM's concrete state.
+  The local `/home/colin/work/pack` build is STALE (pre-M4b) and rejects the generic
+  link with a hash mismatch. Compose tomls live under `tests/*/`.
 - **Integration tests self-spawn theater** (`/home/colin/work/theater/target/release/theater`):
   build the `-test` bin, then run it — e.g.
   `./examples/echo/echo-system-test/target/release/mesh-echo-system-test` or
