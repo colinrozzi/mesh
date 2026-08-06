@@ -8,7 +8,7 @@ description = "Reference RSM executor (the 'system'): a theater actor that super
 crate-type = ["cdylib"]
 
 [dependencies]
-packr-guest = { version = "0.12.7", features = ["derive"] }
+packr-guest = { version = "0.13.0", features = ["derive"] }
 mesh-client = { path = "../../../mesh-client" }
 counter-protocol = { path = "../counter-protocol" }
 serde = { version = "1", default-features = false, features = ["alloc", "derive"] }

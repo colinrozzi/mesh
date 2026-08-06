@@ -23,7 +23,7 @@ use alloc::vec::Vec;
 
 use counter_protocol::Cmd;
 use mesh_client::{Event, Session};
-use packr_guest::{export, import, pack_types, GraphValue, Value};
+use packr_guest::{decode, export, import, pack_types, GraphValue, Value};
 
 packr_guest::setup_guest!();
 
@@ -88,9 +88,13 @@ struct ClusterConfig {
     incrs_per_node: u64,
 }
 
-#[derive(serde::Deserialize, Default)]
+// counter-sm uses a TYPED state → current-state is the Graph-ABI structural encoding;
+// decode via GraphValue (fields must match CounterState: count + ops).
+#[derive(Default, GraphValue)]
+#[graph(crate = "packr_guest::composite_abi")]
 struct CounterView {
     count: i64,
+    ops: u64,
 }
 
 // ---- driving each node through the SDK ----
@@ -105,7 +109,7 @@ fn author_inc(node_id: &str) -> Result<(), String> {
 
 fn node_count(node_id: &str) -> Result<i64, String> {
     let bytes = session(node_id).current_state()?;
-    let view: CounterView = serde_json::from_slice(&bytes).unwrap_or_default();
+    let view = decode(&bytes).ok().and_then(|v| CounterView::try_from(v).ok()).unwrap_or_default();
     Ok(view.count)
 }
 
