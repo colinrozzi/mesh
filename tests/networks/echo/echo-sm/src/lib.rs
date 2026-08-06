@@ -78,9 +78,9 @@ fn do_apply(id: &[u8], payload: &[u8], state: &[u8]) -> Vec<u8> {
         Some(Msg::Request { body }) => s.requests.push((id.to_vec(), body)),
         // First response per request wins (single responder → conflict-free).
         Some(Msg::Response { req_id, result })
-            if !s.responses.iter().any(|(k, _)| k.as_slice() == req_id) =>
+            if !s.responses.iter().any(|(k, _)| k.as_slice() == req_id.as_slice()) =>
         {
-            s.responses.push((req_id.to_vec(), result));
+            s.responses.push((req_id, result));
         }
         _ => {}
     }
@@ -120,9 +120,9 @@ mod tests {
         assert!(do_validate(&req, &s).is_ok());
         s = do_apply(&[1u8; 32], &req, &s);
         // a response naming that request is valid; naming an unknown one is not
-        let resp = encode(&Msg::Response { req_id: [1u8; 32], result: b"pong".to_vec() });
+        let resp = encode(&Msg::Response { req_id: [1u8; 32].to_vec(), result: b"pong".to_vec() });
         assert!(do_validate(&resp, &s).is_ok());
-        let bad = encode(&Msg::Response { req_id: [9u8; 32], result: b"x".to_vec() });
+        let bad = encode(&Msg::Response { req_id: [9u8; 32].to_vec(), result: b"x".to_vec() });
         assert!(do_validate(&bad, &s).is_err(), "unknown request");
         s = do_apply(&[2u8; 32], &resp, &s);
         let st = EchoState::decode(&s);
@@ -134,7 +134,7 @@ mod tests {
     fn response_before_request_is_rejected() {
         // ancestry-relative: without the request in state, the response is invalid.
         let s = EchoState::default().encode();
-        let resp = encode(&Msg::Response { req_id: [1u8; 32], result: b"pong".to_vec() });
+        let resp = encode(&Msg::Response { req_id: [1u8; 32].to_vec(), result: b"pong".to_vec() });
         assert!(do_validate(&resp, &s).is_err());
     }
 }

@@ -49,6 +49,9 @@ dependencies = [
 [[package]]
 name = "counter-protocol"
 version = "0.1.0"
+dependencies = [
+ "packr-guest",
+]
 
 [[package]]
 name = "cpufeatures"

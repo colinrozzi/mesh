@@ -1,60 +1,33 @@
-//! `counter-protocol` — the counter SM's payload wire, and NOTHING else.
+//! `counter-protocol` — the counter SM's payload, as a TYPED value.
 //!
-//! The reference RSM stack is four layers with one owner each: **executor** (app
-//! logic) / **protocol crate** (this — the payload codec) / **SM** (validate+apply
-//! over decoded kinds) / **node** (the dumb core). This crate is the codec layer: it
-//! defines the payload `Cmd` kinds and their `[version][kind][content]` encoding, so
-//! `counter-sm` and the counter executor share ONE encode/decode and can never drift
-//! (the wire-mismatch bug class). It holds no state-machine logic — validity and the
-//! fold live in `counter-sm`, which imports this.
+//! The middle layer of the reference stack (executor / **protocol** / SM / node): the
+//! payload `Cmd` kinds, as a `#[derive(GraphValue)]` enum that marshals through the
+//! Graph ABI. `encode`/`decode` are one-liners — no hand-rolled cursor. `counter-sm` and
+//! the counter executor share `Cmd`, so the wire can never drift. No SM logic here.
 
 #![cfg_attr(not(test), no_std)]
 extern crate alloc;
 
 use alloc::vec::Vec;
 
-/// Wire version; bump on any incompatible codec change.
-pub const VERSION: u16 = 0;
+use packr_guest::{decode as abi_decode, encode as abi_encode, GraphValue, Value};
 
 /// A counter command. `Inc` moves the count by a signed delta; `Reset` zeroes it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, GraphValue)]
+#[graph(crate = "packr_guest::composite_abi")]
 pub enum Cmd {
     Inc(i64),
     Reset,
 }
 
-/// Encode a command as `[version: u16 BE][kind: u8][content]`.
-/// kind 0 = Inc (content = i64 BE), kind 1 = Reset (no content).
+/// Encode a command via the Graph ABI.
 pub fn encode(cmd: &Cmd) -> Vec<u8> {
-    let mut out = VERSION.to_be_bytes().to_vec();
-    match cmd {
-        Cmd::Inc(n) => {
-            out.push(0);
-            out.extend_from_slice(&n.to_be_bytes());
-        }
-        Cmd::Reset => out.push(1),
-    }
-    out
+    abi_encode(&Value::from(cmd.clone())).unwrap_or_default()
 }
 
-/// Decode a payload. Returns `None` on wrong version, unknown kind, or truncation.
+/// Decode a payload. `None` on anything that is not a well-formed `Cmd`.
 pub fn decode(payload: &[u8]) -> Option<Cmd> {
-    if payload.len() < 3 {
-        return None;
-    }
-    if u16::from_be_bytes([payload[0], payload[1]]) != VERSION {
-        return None;
-    }
-    match payload[2] {
-        0 => {
-            let c = payload.get(3..11)?;
-            let mut b = [0u8; 8];
-            b.copy_from_slice(c);
-            Some(Cmd::Inc(i64::from_be_bytes(b)))
-        }
-        1 => Some(Cmd::Reset),
-        _ => None,
-    }
+    abi_decode(payload).ok().and_then(|v| Cmd::try_from(v).ok())
 }
 
 #[cfg(test)]
@@ -69,11 +42,8 @@ mod tests {
     }
 
     #[test]
-    fn rejects_bad_input() {
+    fn rejects_garbage() {
         assert_eq!(decode(&[]), None);
-        assert_eq!(decode(&[0, 0]), None); // truncated
-        assert_eq!(decode(&[0, 1, 0]), None); // wrong version
-        assert_eq!(decode(&[0, 0, 9]), None); // unknown kind
-        assert_eq!(decode(&[0, 0, 0, 1, 2, 3]), None); // Inc truncated
+        assert_eq!(decode(&[1, 2, 3, 4, 5]), None);
     }
 }

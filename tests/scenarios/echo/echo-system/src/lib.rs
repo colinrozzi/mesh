@@ -186,7 +186,7 @@ fn handle_send(state: SysState, msg: Vec<u8>) -> Result<(SysState, ()), String> 
         ("server", Msg::Request { body }) => {
             log(format!("[echo/server] REQUEST id={} → replying", short(&id)));
             let result = body; // echo: reply with the same bytes
-            let resp = echo_protocol::encode(&Msg::Response { req_id: id, result });
+            let resp = echo_protocol::encode(&Msg::Response { req_id: id.to_vec(), result });
             match session(&state.node_id).author(&resp) {
                 Ok(_) => log("[echo/server] authored response".to_string()),
                 Err(e) => log(format!("[echo/server] author response failed: {}", e)),

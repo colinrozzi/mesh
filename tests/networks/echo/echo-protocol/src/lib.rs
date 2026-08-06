@@ -1,56 +1,33 @@
-//! `echo-protocol` — the request/response payload wire for the tier-2 reference.
+//! `echo-protocol` — the request/response payload, as a TYPED value.
 //!
-//! Two kinds, `[version: u16 BE][kind: u8][content]`:
-//!   - `Request { body }`            kind 0, content = body bytes.
-//!   - `Response { req_id, result }` kind 1, content = `[req_id: 32][result]`.
-//!
-//! The correlation id is the Request's own **sm-event id** (the substrate assigns it;
-//! the client learns it as `author`'s returned hash). A `Response` names that id, so
-//! the SM can require the Request be in the Response's ancestry and the client can
-//! match the reply. Codec only — validity/fold live in `echo-sm`.
+//! Two kinds as a `#[derive(GraphValue)]` enum: `Request { body }` and
+//! `Response { req_id, result }`. `encode`/`decode` marshal through the Graph ABI —
+//! no hand-rolled cursor. The correlation id is the Request's own sm-event id (the
+//! client learns it as `author`'s returned hash); a `Response` names it. Codec only.
 
 #![cfg_attr(not(test), no_std)]
 extern crate alloc;
 
 use alloc::vec::Vec;
 
-pub const VERSION: u16 = 0;
+use packr_guest::{decode as abi_decode, encode as abi_encode, GraphValue, Value};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, GraphValue)]
+#[graph(crate = "packr_guest::composite_abi")]
 pub enum Msg {
     Request { body: Vec<u8> },
-    Response { req_id: [u8; 32], result: Vec<u8> },
+    /// `req_id` is the Request's 32-byte sm-event id (a byte list on the wire).
+    Response { req_id: Vec<u8>, result: Vec<u8> },
 }
 
+/// Encode a message via the Graph ABI.
 pub fn encode(msg: &Msg) -> Vec<u8> {
-    let mut out = VERSION.to_be_bytes().to_vec();
-    match msg {
-        Msg::Request { body } => {
-            out.push(0);
-            out.extend_from_slice(body);
-        }
-        Msg::Response { req_id, result } => {
-            out.push(1);
-            out.extend_from_slice(req_id);
-            out.extend_from_slice(result);
-        }
-    }
-    out
+    abi_encode(&Value::from(msg.clone())).unwrap_or_default()
 }
 
+/// Decode a payload. `None` on anything that is not a well-formed `Msg`.
 pub fn decode(payload: &[u8]) -> Option<Msg> {
-    if payload.len() < 3 || u16::from_be_bytes([payload[0], payload[1]]) != VERSION {
-        return None;
-    }
-    let body = &payload[3..];
-    match payload[2] {
-        0 => Some(Msg::Request { body: body.to_vec() }),
-        1 => {
-            let req_id: [u8; 32] = body.get(0..32)?.try_into().ok()?;
-            Some(Msg::Response { req_id, result: body[32..].to_vec() })
-        }
-        _ => None,
-    }
+    abi_decode(payload).ok().and_then(|v| Msg::try_from(v).ok())
 }
 
 #[cfg(test)]
@@ -59,17 +36,17 @@ mod tests {
 
     #[test]
     fn round_trips() {
-        let r = Msg::Request { body: b"ping".to_vec() };
-        assert_eq!(decode(&encode(&r)), Some(r));
-        let resp = Msg::Response { req_id: [7u8; 32], result: b"pong".to_vec() };
-        assert_eq!(decode(&encode(&resp)), Some(resp));
+        for m in [
+            Msg::Request { body: b"ping".to_vec() },
+            Msg::Response { req_id: [7u8; 32].to_vec(), result: b"pong".to_vec() },
+        ] {
+            assert_eq!(decode(&encode(&m)), Some(m));
+        }
     }
 
     #[test]
-    fn rejects_bad() {
+    fn rejects_garbage() {
         assert_eq!(decode(&[]), None);
-        assert_eq!(decode(&[0, 1, 0]), None); // wrong version
-        assert_eq!(decode(&[0, 0, 9]), None); // unknown kind
-        assert_eq!(decode(&[0, 0, 1, 1, 2]), None); // Response req_id truncated
+        assert_eq!(decode(&[9, 9, 9]), None);
     }
 }
