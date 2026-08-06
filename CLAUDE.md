@@ -6,8 +6,9 @@ state machine) — see `docs/DESIGN-rsm.md` for the locked design and `HANDOFF.m
 where the build is right now.
 
 ## Repo layout
-- Root is pure substrate: `src/` — the node (core); `mesh-api/` — the app protocol;
-  `state-machine.pact` — the Interface-1 contract.
+- Root: `src/` — the node (core); `mesh-api/` — the app protocol; `state-machine.pact`
+  — the Interface-1 contract; `mesh-client/` — the system SDK (v2, the guest-side
+  `Session` an executor drives its node through: RPC actions + the finalized stream).
 - `tests/` — everything test-and-reference (an example worth making is reused as a test,
   so there is no separate `examples/`):
   - `tests/counter/`, `tests/echo/`, `tests/cluster/` — **the reference systems**, each a
