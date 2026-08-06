@@ -22,7 +22,8 @@ use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
 use counter_protocol::Cmd;
-use packr_guest::{export, import, pack_types, GraphValue, Value, ValueType};
+use mesh_client::{Event, Session};
+use packr_guest::{export, import, pack_types, GraphValue, Value};
 
 packr_guest::setup_guest!();
 
@@ -92,70 +93,20 @@ struct CounterView {
     count: i64,
 }
 
-// ---- RPC plumbing (same convention as the single-node executors) ----
+// ---- driving each node through the SDK ----
 
-fn no_options() -> Value {
-    Value::Option { inner_type: ValueType::Bool, value: None }
-}
-
-fn value_to_string(v: Value) -> String {
-    match v {
-        Value::String(s) => s,
-        o => format!("{:?}", o),
-    }
-}
-
-fn unwrap_result(v: Value) -> Result<Value, String> {
-    match v {
-        Value::Result { value: Ok(b), .. } => Ok(*b),
-        Value::Result { value: Err(b), .. } => Err(value_to_string(*b)),
-        Value::Variant { tag: 0, mut payload, .. } if !payload.is_empty() => Ok(payload.remove(0)),
-        Value::Variant { tag: 1, payload, .. } => {
-            Err(payload.into_iter().next().map(value_to_string).unwrap_or_else(|| "rpc error".to_string()))
-        }
-        other => Ok(other),
-    }
-}
-
-fn node_rpc(node_id: &str, func: &str, params: Value) -> Result<Value, String> {
-    unwrap_result(unwrap_result(rpc_call(node_id.to_string(), func.to_string(), params, no_options()))?)
+fn session(node_id: &str) -> Session {
+    Session::new(node_id.to_string(), rpc_call)
 }
 
 fn author_inc(node_id: &str) -> Result<(), String> {
-    let payload = Value::from(counter_protocol::encode(&Cmd::Inc(1)));
-    let ret = node_rpc(node_id, "my:mesh.author", payload)?;
-    match ret {
-        Value::Tuple(items) if items.len() == 2 => {
-            if matches!(items.into_iter().next(), Some(Value::Bool(true))) {
-                Ok(())
-            } else {
-                Err("author rejected".to_string())
-            }
-        }
-        other => Err(format!("author: unexpected ret {:?}", other)),
-    }
-}
-
-fn subscribe(node_id: &str, my_id: &str) {
-    let _ = node_rpc(node_id, "my:mesh.subscribe", Value::String(my_id.to_string()));
+    session(node_id).author(&counter_protocol::encode(&Cmd::Inc(1))).map(|_| ())
 }
 
 fn node_count(node_id: &str) -> Result<i64, String> {
-    let ret = node_rpc(node_id, "my:mesh.current-state", Value::from(Vec::<u8>::new()))?;
-    let bytes = Vec::<u8>::try_from(ret).map_err(|e| format!("{:?}", e))?;
+    let bytes = session(node_id).current_state()?;
     let view: CounterView = serde_json::from_slice(&bytes).unwrap_or_default();
     Ok(view.count)
-}
-
-/// Decode `(sm-event id, author, payload)` from a finalized dag-node frame.
-/// `[len u32][kind 0x93][id 32][author 32][ts u64][ndeps u16][deps..][payload]`.
-fn decode_finalized(frame: &[u8]) -> Option<([u8; 32], [u8; 32])> {
-    if frame.len() < 79 || frame[4] != 0x93 {
-        return None;
-    }
-    let id: [u8; 32] = frame[5..37].try_into().ok()?;
-    let author: [u8; 32] = frame[37..69].try_into().ok()?;
-    Some((id, author))
 }
 
 fn short(bytes: &[u8]) -> String {
@@ -222,7 +173,7 @@ fn handle_tick(state: ClusterState, _timer: String) -> Result<(ClusterState, ())
     if !state.armed {
         // Phase 1: subscribe to every node's stream, then drive the workload.
         for node in &state.node_ids {
-            subscribe(node, &state.my_id);
+            let _ = session(node).subscribe(&state.my_id);
         }
         let mut authored = 0u64;
         for node in &state.node_ids {
@@ -268,10 +219,10 @@ fn handle_tick(state: ClusterState, _timer: String) -> Result<(ClusterState, ())
 /// A finalized dag-node arrived from one of the nodes — the network event feed.
 #[export(name = "theater:simple/message-server-client.handle-send")]
 fn handle_send(state: ClusterState, msg: Vec<u8>) -> Result<(ClusterState, ()), String> {
-    let Some((id, author)) = decode_finalized(&msg) else {
+    let Some(Event::Finalized(node)) = Session::decode_event(&msg) else {
         return Ok((state, ()));
     };
     let n = state.finalizations + 1;
-    log(format!("[cluster] finalize #{} — event {} authored by node {}", n, short(&id), short(&author)));
+    log(format!("[cluster] finalize #{} — event {} authored by node {}", n, short(&node.id), short(&node.author)));
     Ok((ClusterState { finalizations: n, ..state }, ()))
 }
