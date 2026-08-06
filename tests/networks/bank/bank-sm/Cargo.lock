@@ -23,6 +23,9 @@ checksum = "683d7910e743518b0e34f1186f92494becacb047c7b6bf616c96772180fef923"
 [[package]]
 name = "bank-protocol"
 version = "0.1.0"
+dependencies = [
+ "packr-guest",
+]
 
 [[package]]
 name = "bank-sm"
@@ -144,6 +147,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "packr-derive"
+version = "0.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6234f8e2221184dc656f4e7842a8863fe881a778f4bd9fd53be005076d0c0b3a"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
+
+[[package]]
 name = "packr-guest"
 version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -151,6 +165,7 @@ checksum = "df9f5cbbadae71280d893f5197d8f0ee9ef55a108b973f0027bd4b50efeab0c5"
 dependencies = [
  "dlmalloc",
  "packr-abi",
+ "packr-derive",
  "packr-guest-macros",
 ]
 
