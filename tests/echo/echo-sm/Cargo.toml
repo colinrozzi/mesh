@@ -8,7 +8,7 @@ description = "Tier-2 reference state-machine: a request/response (echo) journal
 crate-type = ["cdylib"]
 
 [dependencies]
-packr-guest = "0.12.7"
+packr-guest = "0.13.0"
 echo-protocol = { path = "../echo-protocol" }
 serde = { version = "1", default-features = false, features = ["alloc", "derive"] }
 serde_json = { version = "1", default-features = false, features = ["alloc"] }

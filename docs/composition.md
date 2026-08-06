@@ -21,14 +21,16 @@ imported interface) / `#[export]` (to provide one).
   linked — the component keeps it, theater supplies it), so a consumer composes the
   client to get typed calls without touching the transport.
 
-## Use the FIXED packr
-Compose with `/home/colin/work/pack/target/release/packr` (== published **0.12.7**),
-**not** the 0.12.2 nix binary — the old one has an LTO import-strip bug that produces
-artifacts which *compose* fine but *fail to load* in theater (`No handler provides
-interface …`). `--output` is required on the newer packr:
+## Use the OFFICIAL packr 0.13.0
+Compose with the published **packr 0.13.0** (`cargo install packr@0.13.0` →
+`~/.cargo/bin/packr`). REQUIRED now that the node is generic (`state-machine<s>`): 0.13.0
+carries the M4 compose-time unification that binds the node's generic `s` to the SM's
+concrete state. The local `/home/colin/work/pack` build is **stale** (pre-M4b) and rejects
+a generic link with a hash mismatch; the old 0.12.2 nix binary has the LTO import-strip
+bug (composes but fails to load). `--output` is required.
 
 ```sh
-/home/colin/work/pack/target/release/packr compose <compose.toml> --output <out.wasm>
+~/.cargo/bin/packr compose <compose.toml> --output <out.wasm>
 ```
 
 ## Gotchas (each cost a debug cycle at some point)
