@@ -9,26 +9,25 @@ where the build is right now.
 - Root: `src/` — the node (core); `mesh-api/` — the app protocol; `state-machine.pact`
   — the Interface-1 contract; `mesh-client/` — the system SDK (v2, the guest-side
   `Session` an executor drives its node through: RPC actions + the finalized stream).
-- `tests/` — everything test-and-reference (an example worth making is reused as a test,
-  so there is no separate `examples/`):
-  - `tests/counter/`, `tests/echo/`, `tests/cluster/` — **the reference systems**, each a
-    self-contained stack (SM/protocol + executor + its integration test) that IS the test.
-    **Start here** to see how to build on mesh: `counter` (tier-1, single node), `echo`
-    (tier-2, two-node request/response), `cluster` (tier-3, an orchestrator that spins up
-    N nodes, drives a workload, and observes the whole network to convergence). All over
-    RPC (actions) + the message-server stream (events); nodes gossip over TCP.
-  - `tests/{control-roundtrip,chat-smoke,confluence,conflict-injection,scale}-test` —
+- `tests/networks/` — **the state machines** (a "network" = a mesh running an SM). Each
+  `networks/<name>/` holds the SM + its protocol crate + `*-compose.toml` (the node⊕SM
+  artifact `mesh_<name>.wasm`):
+  - `counter` — minimal, conflict-free, **typed state** (the generics example; `s =
+    CounterState` record).
+  - `echo` — request/response, conflict-free.
+  - `chat` — OR-Set membership + text log (manager's; consumer fixture, pending handoff).
+  - `control` — authz + command/response journal (sentinel's; consumer fixture).
+  - `bank` — the FIRST **conflict-prone** SM (a transfer needs a balance).
+- `tests/scenarios/` — **the tests** that drive a network + assert:
+  - `counter` / `echo` / `cluster` — executor-driven (over RPC + the message-server
+    stream), each with its `*-system` executor + `*-system-test`. **Start here** to see
+    how to build on mesh: 1-node, 2-node request/response, N-node orchestrator+observer.
+  - `control-roundtrip` / `chat-smoke` / `confluence` / `conflict-injection` / `scale` —
     substrate property tests (driven via `testkit`'s std Client).
-  - `tests/bank/` — the currency SM: the FIRST conflict-prone consumer (a transfer needs
-    a balance). `bank-double-spend-test` shows the frontier LIVE — two concurrent
-    transfers from one wallet both finalize and the network converges on a *negative*
-    balance, i.e. admission-final finality is consistent but not sufficient. It is the
-    future acceptance test for the deferred witness-finality bundle.
-  - `tests/testkit/` — shared std test harness.
-  - `tests/fixtures/` — the SMs those property tests compose the node against: the REAL
-    consumer SMs `control-sm` + `chat-sm` (sentinel's + manager's; here as fixtures so the
-    substrate is exercised against real consumers, slated to move to their own repos) with
-    their `*-compose.toml`.
+  - `double-spend` — the bank frontier LIVE: two concurrent transfers from one wallet both
+    finalize → the network converges on a *negative* balance (admission-final is consistent
+    but not sufficient). The future acceptance test for the deferred witness-finality bundle.
+- `tests/testkit/` — shared std test harness.
 - `docs/` — `DESIGN-rsm.md` (live), `composition.md` (packr compose/packaging), +
   `history/` (superseded designs).
 

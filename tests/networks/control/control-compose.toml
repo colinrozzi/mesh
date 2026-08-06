@@ -1,0 +1,30 @@
+# Compose the reshaped node (entry) with the real control-SM (provider). Proves
+# the node's state-machine import links to the control-SM and only theater host
+# imports remain. Paths relative to this manifest's directory.
+
+[[component]]
+name  = "mesh"
+wasm  = "../../../target/wasm32-unknown-unknown/release/mesh.wasm"
+entry = true
+
+[[component]]
+name = "control-sm"
+wasm = "control-sm/target/wasm32-unknown-unknown/release/control_sm.wasm"
+
+[[link]]
+consumer = "mesh"
+import   = "state-machine.initial-state"
+provider = "control-sm"
+export   = "initial-state"
+
+[[link]]
+consumer = "mesh"
+import   = "state-machine.validate"
+provider = "control-sm"
+export   = "validate"
+
+[[link]]
+consumer = "mesh"
+import   = "state-machine.apply"
+provider = "control-sm"
+export   = "apply"

@@ -1,0 +1,13 @@
+[package]
+name = "mesh-scale-test"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "mesh-scale-test"
+path = "src/main.rs"
+
+[dependencies]
+mesh-testkit = { path = "../../../testkit" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

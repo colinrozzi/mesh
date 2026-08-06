@@ -1,0 +1,31 @@
+# Compose the node (entry) with counter-sm — the reference RSM stack's node artifact
+# (node ⊕ SM). Same three state-machine links as chat/control-compose, different SM.
+# Compose with the FIXED packr (/home/colin/work/pack/target/release/packr … --output …
+# == published 0.12.7).
+
+[[component]]
+name  = "mesh"
+wasm  = "../../../target/wasm32-unknown-unknown/release/mesh.wasm"
+entry = true
+
+[[component]]
+name = "counter-sm"
+wasm = "counter-sm/target/wasm32-unknown-unknown/release/counter_sm.wasm"
+
+[[link]]
+consumer = "mesh"
+import   = "state-machine.initial-state"
+provider = "counter-sm"
+export   = "initial-state"
+
+[[link]]
+consumer = "mesh"
+import   = "state-machine.validate"
+provider = "counter-sm"
+export   = "validate"
+
+[[link]]
+consumer = "mesh"
+import   = "state-machine.apply"
+provider = "counter-sm"
+export   = "apply"

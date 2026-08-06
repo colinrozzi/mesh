@@ -1,0 +1,19 @@
+[package]
+name = "echo-system"
+version = "0.1.0"
+edition = "2021"
+description = "Tier-2 reference executor (client + server roles): theater actors that supervise their echo nodes and drive the request/response loop over RPC (author) + the message-server finalized stream (react-and-reply, await-matching-response). The two executor patterns sentinel needs, over real gossiping nodes."
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+packr-guest = { version = "0.13.0", features = ["derive"] }
+mesh-client = { path = "../../../../mesh-client" }
+echo-protocol = { path = "../../../networks/echo/echo-protocol" }
+serde = { version = "1", default-features = false, features = ["alloc", "derive"] }
+serde_json = { version = "1", default-features = false, features = ["alloc"] }
+
+[profile.release]
+opt-level = "s"
+lto = true
