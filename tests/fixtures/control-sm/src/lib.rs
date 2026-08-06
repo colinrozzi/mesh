@@ -18,6 +18,7 @@ use alloc::collections::BTreeSet;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
+use control_protocol::{decode, Msg};
 use packr_guest::export;
 use serde::{Deserialize, Serialize};
 
@@ -69,130 +70,15 @@ impl ControlState {
     }
 }
 
-// ===== payload codec: [version u16][kind u8][content] =====
-
-const VERSION: u16 = 0;
-
-enum Msg {
-    /// The bootstrap: seed members + allow-lists (valid only as the causal root).
-    Genesis { members: Vec<Vec<u8>>, join_allow: Vec<Vec<u8>>, command_allow: Vec<Vec<u8>> },
-    JoinRequest,
-    Depart,
-    Command { corr_id: u64, verb: String, args: Vec<u8> },
-    Response { corr_id: u64, cmd_author: Vec<u8>, result: Vec<u8> },
-}
-
-fn decode_msg(payload: &[u8]) -> Option<Msg> {
-    let mut c = Cur { b: payload, p: 0 };
-    if c.u16()? != VERSION {
-        return None;
-    }
-    match c.u8()? {
-        0 => Some(Msg::Genesis {
-            members: c.keys()?,
-            join_allow: c.keys()?,
-            command_allow: c.keys()?,
-        }),
-        1 => Some(Msg::JoinRequest),
-        2 => Some(Msg::Depart),
-        3 => Some(Msg::Command { corr_id: c.u64()?, verb: c.string()?, args: c.rest() }),
-        4 => Some(Msg::Response { corr_id: c.u64()?, cmd_author: c.key()?, result: c.rest() }),
-        _ => None,
-    }
-}
-
-struct Cur<'a> {
-    b: &'a [u8],
-    p: usize,
-}
-impl<'a> Cur<'a> {
-    fn take(&mut self, n: usize) -> Option<&'a [u8]> {
-        let e = self.p.checked_add(n)?;
-        if e > self.b.len() {
-            return None;
-        }
-        let s = &self.b[self.p..e];
-        self.p = e;
-        Some(s)
-    }
-    fn u8(&mut self) -> Option<u8> {
-        Some(self.take(1)?[0])
-    }
-    fn u16(&mut self) -> Option<u16> {
-        let b = self.take(2)?;
-        Some(u16::from_be_bytes([b[0], b[1]]))
-    }
-    fn u64(&mut self) -> Option<u64> {
-        let b = self.take(8)?;
-        Some(u64::from_be_bytes(b.try_into().ok()?))
-    }
-    fn key(&mut self) -> Option<Vec<u8>> {
-        Some(self.take(32)?.to_vec())
-    }
-    fn keys(&mut self) -> Option<Vec<Vec<u8>>> {
-        let n = self.u16()? as usize;
-        let mut out = Vec::with_capacity(n);
-        for _ in 0..n {
-            out.push(self.key()?);
-        }
-        Some(out)
-    }
-    fn string(&mut self) -> Option<String> {
-        let n = self.u16()? as usize;
-        String::from_utf8(self.take(n)?.to_vec()).ok()
-    }
-    fn rest(&mut self) -> Vec<u8> {
-        self.b[self.p..].to_vec()
-    }
-}
-
-// ===== encoders (used by tests + downstream systems/harnesses) =====
-
-fn put_keys(out: &mut Vec<u8>, keys: &[Vec<u8>]) {
-    out.extend_from_slice(&(keys.len() as u16).to_be_bytes());
-    for k in keys {
-        out.extend_from_slice(k);
-    }
-}
-
-/// Build a control payload. Public codec so a system/harness encodes what it Submits.
-#[allow(dead_code)]
-fn encode(msg: &Msg) -> Vec<u8> {
-    let mut out = VERSION.to_be_bytes().to_vec();
-    match msg {
-        Msg::Genesis { members, join_allow, command_allow } => {
-            out.push(0);
-            put_keys(&mut out, members);
-            put_keys(&mut out, join_allow);
-            put_keys(&mut out, command_allow);
-        }
-        Msg::JoinRequest => out.push(1),
-        Msg::Depart => out.push(2),
-        Msg::Command { corr_id, verb, args } => {
-            out.push(3);
-            out.extend_from_slice(&corr_id.to_be_bytes());
-            out.extend_from_slice(&(verb.len() as u16).to_be_bytes());
-            out.extend_from_slice(verb.as_bytes());
-            out.extend_from_slice(args);
-        }
-        Msg::Response { corr_id, cmd_author, result } => {
-            out.push(4);
-            out.extend_from_slice(&corr_id.to_be_bytes());
-            out.extend_from_slice(cmd_author);
-            out.extend_from_slice(result);
-        }
-    }
-    out
-}
-
 // ===== core logic (host-testable; the #[export] wrappers are thin) =====
+// The payload codec (kinds + encode/decode) lives in `control-protocol`.
 
 fn do_validate(author: &[u8], payload: &[u8], state: &[u8]) -> Result<bool, String> {
     if payload.is_empty() {
         return Ok(true); // inert graft (the node's own genesis / witness)
     }
     let s = ControlState::decode(state);
-    let msg = decode_msg(payload).ok_or_else(|| "undecodable control payload".to_string())?;
+    let msg = decode(payload).ok_or_else(|| "undecodable control payload".to_string())?;
     match msg {
         Msg::Genesis { .. } => {
             if s.members.is_empty() && s.join_allow.is_empty() && s.command_allow.is_empty() {
@@ -241,7 +127,7 @@ fn do_validate(author: &[u8], payload: &[u8], state: &[u8]) -> Result<bool, Stri
 
 fn do_apply(author: &[u8], payload: &[u8], state: &[u8]) -> Vec<u8> {
     let mut s = ControlState::decode(state);
-    let Some(msg) = decode_msg(payload) else {
+    let Some(msg) = decode(payload) else {
         return s.encode(); // empty / undecodable → inert
     };
     match msg {
@@ -293,6 +179,7 @@ fn members(state: Vec<u8>) -> Vec<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use control_protocol::encode;
 
     fn k(n: u8) -> Vec<u8> {
         alloc::vec![n; 32]

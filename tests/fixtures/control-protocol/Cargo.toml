@@ -1,0 +1,7 @@
+[package]
+name = "control-protocol"
+version = "0.1.0"
+edition = "2021"
+description = "The control-plane payload codec: the 5 kinds (genesis / join-request / depart / command / response) + [version][kind][content] encode/decode ONLY (no validate/apply). Imported by control-sm AND the sentinel executors so there is exactly one codec, zero wire drift."
+
+[dependencies]
