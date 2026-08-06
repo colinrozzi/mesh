@@ -82,6 +82,11 @@ pub struct ActorState {
 }
 
 pack_types! {
+    // The node is GENERIC over the SM's state type `s` (interface-level generic,
+    // packr 0.13 M4). `s` is erased at the wire and the node binds it to the dynamic
+    // `Value` — so ONE universal node composes with any SM: compose unifies `s` to the
+    // SM's concrete state (a typed record, or `list<u8>` for a byte-state SM).
+    type s: serializable
     imports {
         theater:simple/runtime {
             log: func(msg: string),
@@ -109,10 +114,10 @@ pack_types! {
         // (the hash covers all four) even though `members` is dormant while v0 is
         // uniformly admission-final.
         state-machine {
-            initial-state: func() -> list<u8>,
-            validate: func(id: list<u8>, author: list<u8>, timestamp: u64, payload: list<u8>, state: list<u8>) -> result<bool, string>,
-            apply: func(id: list<u8>, author: list<u8>, timestamp: u64, payload: list<u8>, state: list<u8>) -> list<u8>,
-            members: func(state: list<u8>) -> list<list<u8>>,
+            initial-state: func() -> s,
+            validate: func(id: list<u8>, author: list<u8>, timestamp: u64, payload: list<u8>, state: s) -> result<bool, string>,
+            apply: func(id: list<u8>, author: list<u8>, timestamp: u64, payload: list<u8>, state: s) -> s,
+            members: func(state: s) -> list<list<u8>>,
         }
     }
     exports {
@@ -162,20 +167,23 @@ fn message_server_send(actor_id: String, msg: Vec<u8>) -> Result<(), String>;
 // ---- composed state machine (DESIGN-rsm.md Interface 1) ----
 // The pure fold the node drives: `validate`/`apply` against the ancestry-relative
 // state, `members` for the (dormant) finality utility, `initial_state` at genesis.
+// `s` (the SM state) is bound to the dynamic `Value`: the node never inspects state,
+// it only shuttles it between validate/apply, so binding the erased generic to Value
+// keeps the node universal (any SM's concrete state marshals through).
 #[import_from("state-machine", name = "initial-state")]
-fn sm_initial_state() -> Vec<u8>;
+fn sm_initial_state() -> Value;
 #[import_from("state-machine", name = "validate")]
 fn sm_validate(
     id: Vec<u8>,
     author: Vec<u8>,
     timestamp: u64,
     payload: Vec<u8>,
-    state: Vec<u8>,
+    state: Value,
 ) -> Result<bool, String>;
 #[import_from("state-machine", name = "apply")]
-fn sm_apply(id: Vec<u8>, author: Vec<u8>, timestamp: u64, payload: Vec<u8>, state: Vec<u8>) -> Vec<u8>;
+fn sm_apply(id: Vec<u8>, author: Vec<u8>, timestamp: u64, payload: Vec<u8>, state: Value) -> Value;
 #[import_from("state-machine", name = "members")]
-fn sm_members(state: Vec<u8>) -> Vec<Vec<u8>>;
+fn sm_members(state: Value) -> Vec<Vec<u8>>;
 
 const LISTEN_ADDR: &str = "127.0.0.1:9447";
 const TICK_TIMER: &str = "tick";
@@ -731,7 +739,7 @@ fn current_state_rpc(input: Value) -> Value {
         Err(e) => return rpc_err(&e),
     };
     let mut finality: BTreeMap<Hash, bool> = finality_from_json(&state.final_json);
-    let bytes = current_state(&dag, &mut finality);
+    let bytes = state_bytes(current_state(&dag, &mut finality));
     rpc_ok(state, Value::from(bytes))
 }
 
@@ -933,7 +941,7 @@ fn answer_query(dag: &Dag, conn_id: &str, body: &[u8], finality: &mut BTreeMap<H
         return;
     };
     let reply = match qkind {
-        Q_STATE => encode_query_reply(Q_STATE, &current_state(dag, finality)),
+        Q_STATE => encode_query_reply(Q_STATE, &state_bytes(current_state(dag, finality))),
         Q_STATUS => {
             let status =
                 query_arg_hash(arg).map(|h| event_status(dag, &h, finality)).unwrap_or(STATUS_UNKNOWN);
@@ -1011,8 +1019,22 @@ fn author_genesis(dag: &mut Dag, signing_key: &SigningKey) -> Event {
 /// `current-state`. v0 is admission-final, so every admitted event is finalized and
 /// this is the fold of the entire held DAG. (Same routine `deliver_committed` uses
 /// per-event, here over all heads.)
-fn current_state(dag: &Dag, finality: &mut BTreeMap<Hash, bool>) -> Vec<u8> {
+fn current_state(dag: &Dag, finality: &mut BTreeMap<Hash, bool>) -> Value {
     fold_state_at(dag, &all_heads(dag), finality)
+}
+
+/// Serialize the folded SM state (a dynamic `Value`) to the bytes handed to consumers
+/// over the read verbs. A byte-state SM (`s := list<u8>`) yields its raw bytes
+/// unchanged (wire-preserving — existing JSON-parsing consumers keep working); a
+/// typed-state SM yields the Graph-ABI structural encoding, which the consumer decodes
+/// via its `GraphValue`.
+fn state_bytes(v: Value) -> Vec<u8> {
+    match v {
+        Value::List { ref items, .. } if items.iter().all(|i| matches!(i, Value::U8(_))) => {
+            Vec::<u8>::try_from(v).unwrap_or_default()
+        }
+        other => packr_guest::encode(&other).unwrap_or_default(),
+    }
 }
 
 /// Author an event on this node's chain: self_parent = current head (`None` for
@@ -1190,7 +1212,7 @@ fn deps_of(ev: &Event) -> Vec<Hash> {
 /// O(events³) — that was the wall the N-node scale test measured). Application still
 /// re-folds the frontier's ancestry each call (Pass 2), which is O(events); only the
 /// expensive *finality* judgement is cached.
-fn fold_state_at(dag: &Dag, frontier: &[Hash], finality: &mut BTreeMap<Hash, bool>) -> Vec<u8> {
+fn fold_state_at(dag: &Dag, frontier: &[Hash], finality: &mut BTreeMap<Hash, bool>) -> Value {
     ensure_finality(dag, finality);
     apply_final(dag, frontier, finality)
 }
@@ -1215,7 +1237,7 @@ fn ensure_finality(dag: &Dag, finality: &mut BTreeMap<Hash, bool>) {
 
 /// Fold only the events in `ancestors_of(frontier)` marked final in `is_final`,
 /// applying each (no re-validation) in deterministic topo order.
-fn apply_final(dag: &Dag, frontier: &[Hash], is_final: &BTreeMap<Hash, bool>) -> Vec<u8> {
+fn apply_final(dag: &Dag, frontier: &[Hash], is_final: &BTreeMap<Hash, bool>) -> Value {
     let mut state = sm_initial_state();
     for h in dag.topo_sort(&dag.ancestors_of(frontier)) {
         if is_final.get(&h).copied().unwrap_or(false) {
