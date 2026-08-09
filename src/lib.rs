@@ -81,6 +81,39 @@ pub struct ActorState {
     pub ready_sent: bool,
 }
 
+/// A deferred output action. The pure protocol/fold logic pushes these instead of
+/// calling host I/O inline; the thin theater handlers drain the outbox via `perform`.
+/// This is the seam that lets the engine become a pure component (see DESIGN-dx.md).
+enum Effect {
+    /// tcp `send` of `bytes` on connection `conn`.
+    Send(String, Vec<u8>),
+    /// message-server `send` of `bytes` to actor `id` (the subscribed app).
+    App(String, Vec<u8>),
+    /// tcp `close` of connection `conn`.
+    Close(String),
+}
+
+/// Outbound actions accumulated by a handler, drained by [`perform`].
+type Outbox = Vec<Effect>;
+
+/// Perform every accumulated effect against the host — the only I/O sink. The pure
+/// engine never calls host I/O directly; it fills an [`Outbox`] the handler drains here.
+fn perform(out: Outbox) {
+    for e in out {
+        match e {
+            Effect::Send(conn, bytes) => {
+                let _ = tcp_send(conn, bytes);
+            }
+            Effect::App(id, bytes) => {
+                let _ = message_server_send(id, bytes);
+            }
+            Effect::Close(conn) => {
+                let _ = tcp_close(conn);
+            }
+        }
+    }
+}
+
 pack_types! {
     // The node is GENERIC over the SM's state type `s` (interface-level generic,
     // packr 0.13 M4). `s` is erased at the wire and the node binds it to the dynamic
@@ -151,8 +184,6 @@ fn tcp_activate(conn_id: String) -> Result<(), String>;
 fn tcp_set_active(conn_id: String, mode: String) -> Result<(), String>;
 #[import(module = "theater:simple/tcp", name = "send")]
 fn tcp_send(conn_id: String, data: Vec<u8>) -> Result<u64, String>;
-#[import(module = "theater:simple/tcp", name = "receive")]
-fn tcp_receive(conn_id: String, max_bytes: u32) -> Result<Vec<u8>, String>;
 #[import(module = "theater:simple/tcp", name = "close")]
 fn tcp_close(conn_id: String) -> Result<(), String>;
 #[import(module = "theater:simple/timer", name = "set-interval")]
@@ -257,10 +288,10 @@ fn init(state: Value) -> Result<(ActorState, ()), String> {
     // Dial peers, handshake from the client side, register them as authed.
     let mut conns: BTreeMap<String, ConnState> = BTreeMap::new();
     for p in &cfg.dial {
-        match open_peer_connection(&p.address, &signing_key, &dag) {
+        match open_peer_connection(&p.address, &signing_key) {
             Ok(conn_id) => {
                 log(format!("[mesh] dialed peer {} (conn {})", p.address, conn_id));
-                conns.insert(conn_id, ConnState::authed(p.pubkey.clone()));
+                conns.insert(conn_id, ConnState::dialing(p.pubkey.clone()));
             }
             Err(e) => log(format!("[mesh] dial {} failed: {}", p.address, e)),
         }
@@ -284,68 +315,20 @@ fn init(state: Value) -> Result<(ActorState, ()), String> {
     ))
 }
 
-/// Dial a peer and run the client side of the handshake, then kick off catch-up
-/// (WANT what its ACCEPTED frontier shows we lack, and announce our own
-/// frontier). Returns the live, active connection id.
-fn open_peer_connection(
-    address: &str,
-    signing_key: &SigningKey,
-    dag: &Dag,
-) -> Result<String, String> {
+/// Dial a peer and send our HELLO, then return the live, active connection. The rest
+/// of the handshake (CHALLENGE → AUTH → ACCEPTED → catch-up) runs event-driven in
+/// `on_data` via the `AwaitingChallenge`/`AwaitingAccepted` phases — a pure core can't
+/// block on `receive`, so both handshake directions share one async phase machine.
+fn open_peer_connection(address: &str, signing_key: &SigningKey) -> Result<String, String> {
     let conn_id =
         tcp_connect(address.to_string()).map_err(|e| format!("connect {}: {}", address, e))?;
-    let pk = signing_key.verifying_key().to_bytes();
-
-    tcp_send(conn_id.clone(), encode_hello(&pk)).map_err(|e| format!("send HELLO: {}", e))?;
-    let (kind, nonce) = recv_one_frame(&conn_id)?;
-    if kind != FRAME_CHALLENGE || nonce.len() != 32 {
-        let _ = tcp_close(conn_id);
-        return Err(format!("expected CHALLENGE, got {:#x}", kind));
-    }
-    let sig = signing_key.sign(&nonce).to_bytes();
-    tcp_send(conn_id.clone(), encode_auth(&sig)).map_err(|e| format!("send AUTH: {}", e))?;
-    let (kind, payload) = recv_one_frame(&conn_id)?;
-    if kind != FRAME_ACCEPTED {
-        let _ = tcp_close(conn_id);
-        return Err(format!("peer rejected: {:#x}", kind));
-    }
-
-    // Catch up against the peer's advertised frontier, and announce ours.
-    for want in decode_hashes(&payload).into_iter().filter(|h| !dag.has(h)) {
-        let _ = tcp_send(conn_id.clone(), encode_hashes(FRAME_WANT, &[want]));
-    }
-    let _ = tcp_send(conn_id.clone(), encode_hashes(FRAME_FRONTIER, &all_heads(dag)));
-
+    // Make the connection deliver `on-data` before we drive the handshake from it.
+    let _ = tcp_activate(conn_id.clone());
     tcp_set_active(conn_id.clone(), "active".to_string())
         .map_err(|e| format!("set-active: {}", e))?;
+    let pk = signing_key.verifying_key().to_bytes();
+    tcp_send(conn_id.clone(), encode_hello(&pk)).map_err(|e| format!("send HELLO: {}", e))?;
     Ok(conn_id)
-}
-
-/// Blocking read of one full frame (used during the synchronous dial handshake).
-fn recv_one_frame(conn_id: &str) -> Result<(u8, Vec<u8>), String> {
-    let mut buf = Vec::with_capacity(4);
-    while buf.len() < 4 {
-        let chunk = tcp_receive(conn_id.to_string(), 4 - buf.len() as u32)
-            .map_err(|e| format!("receive len: {}", e))?;
-        if chunk.is_empty() {
-            return Err("closed during frame length".to_string());
-        }
-        buf.extend_from_slice(&chunk);
-    }
-    let len = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
-    if len == 0 || len > 16 * 1024 * 1024 {
-        return Err(format!("bad frame length: {}", len));
-    }
-    let mut body = Vec::with_capacity(len);
-    while body.len() < len {
-        let chunk = tcp_receive(conn_id.to_string(), (len - body.len()) as u32)
-            .map_err(|e| format!("receive body: {}", e))?;
-        if chunk.is_empty() {
-            return Err("closed during frame body".to_string());
-        }
-        body.extend_from_slice(&chunk);
-    }
-    Ok((body[0], body[1..].to_vec()))
 }
 
 // ---- connection lifecycle ----
@@ -380,6 +363,7 @@ fn on_data(state: ActorState, conn_id: String, data: Vec<u8>) -> Result<(ActorSt
     let mut delivered: BTreeSet<Hash> =
         hashes_from_json(&state.delivered_json).into_iter().collect();
     let mut finality: BTreeMap<Hash, bool> = finality_from_json(&state.final_json);
+    let mut out: Outbox = Vec::new();
 
     let mut conn_state = match conns.remove(&conn_id) {
         Some(c) => c,
@@ -398,8 +382,8 @@ fn on_data(state: ActorState, conn_id: String, data: Vec<u8>) -> Result<(ActorSt
             Ok(None) => break,
             Err(e) => {
                 log(format!("[mesh] conn {} parse error: {}", conn_id, e));
-                let _ = tcp_send(conn_id.clone(), encode_rejected(&e));
-                let _ = tcp_close(conn_id.clone());
+                out.push(Effect::Send(conn_id.clone(), encode_rejected(&e)));
+                out.push(Effect::Close(conn_id.clone()));
                 should_close = true;
                 break;
             }
@@ -408,7 +392,7 @@ fn on_data(state: ActorState, conn_id: String, data: Vec<u8>) -> Result<(ActorSt
         *conn_state.recv_buf_mut() = kept;
 
         match conn_state.phase.clone() {
-            Phase::AwaitingHello => match step_hello(&conn_id, &frame) {
+            Phase::AwaitingHello => match step_hello(&conn_id, &frame, &mut out) {
                 Step::Advance(p) => conn_state.phase = p,
                 Step::Close => {
                     should_close = true;
@@ -416,17 +400,35 @@ fn on_data(state: ActorState, conn_id: String, data: Vec<u8>) -> Result<(ActorSt
                 }
             },
             Phase::AwaitingAuth { pubkey_hex, nonce_hex } => {
-                match step_auth(&conn_id, &frame, &pubkey_hex, &nonce_hex, &dag)? {
+                match step_auth(&conn_id, &frame, &pubkey_hex, &nonce_hex, &dag, &mut out)? {
                     Step::Advance(p) => {
                         conn_state.phase = p;
                         // Announce our frontier; a behind peer WANTs what it lacks
                         // and we answer with the event (full history is retained,
                         // so every event we've admitted is still here to serve).
-                        let _ = tcp_send(
+                        out.push(Effect::Send(
                             conn_id.clone(),
                             encode_hashes(FRAME_FRONTIER, &all_heads(&dag)),
-                        );
+                        ));
                     }
+                    Step::Close => {
+                        should_close = true;
+                        break;
+                    }
+                }
+            }
+            Phase::AwaitingChallenge { peer_pubkey_hex } => {
+                match step_challenge(&conn_id, &frame, &peer_pubkey_hex, &signing_key, &mut out) {
+                    Step::Advance(p) => conn_state.phase = p,
+                    Step::Close => {
+                        should_close = true;
+                        break;
+                    }
+                }
+            }
+            Phase::AwaitingAccepted { peer_pubkey_hex } => {
+                match step_accepted(&conn_id, &frame, &peer_pubkey_hex, &dag, &mut out) {
+                    Step::Advance(p) => conn_state.phase = p,
                     Step::Close => {
                         should_close = true;
                         break;
@@ -442,6 +444,7 @@ fn on_data(state: ActorState, conn_id: String, data: Vec<u8>) -> Result<(ActorSt
                     self_head,
                     &frame,
                     &mut finality,
+                    &mut out,
                 );
             }
         }
@@ -451,8 +454,9 @@ fn on_data(state: ActorState, conn_id: String, data: Vec<u8>) -> Result<(ActorSt
         conns.insert(conn_id.clone(), conn_state);
     }
     // Deliver any newly-admitted messages to TCP clients and the co-located app.
-    deliver_committed(&dag, &conns, &state.app_id, &mut delivered, &mut finality);
-    let ready_sent = maybe_emit_ready(&state.app_id, state.ready_sent);
+    deliver_committed(&dag, &conns, &state.app_id, &mut delivered, &mut finality, &mut out);
+    let ready_sent = maybe_emit_ready(&state.app_id, state.ready_sent, &mut out);
+    perform(out);
 
     let delivered_vec: Vec<Hash> = delivered.iter().copied().collect();
     Ok((
@@ -492,8 +496,9 @@ fn handle_tick(state: ActorState, _timer_name: String) -> Result<(ActorState, ()
     let mut delivered: BTreeSet<Hash> =
         hashes_from_json(&state.delivered_json).into_iter().collect();
     let mut finality: BTreeMap<Hash, bool> = finality_from_json(&state.final_json);
+    let mut out: Outbox = Vec::new();
 
-    deliver_committed(&dag, &conns, &state.app_id, &mut delivered, &mut finality);
+    deliver_committed(&dag, &conns, &state.app_id, &mut delivered, &mut finality, &mut out);
 
     // Anti-entropy: re-advertise our frontier to every authed peer. A peer missing
     // any of these heads answers with WANT, so a one-shot-at-dial gossip miss (or a
@@ -502,11 +507,12 @@ fn handle_tick(state: ActorState, _timer_name: String) -> Result<(ActorState, ()
     if !frontier.is_empty() {
         for (cid, cs) in &conns {
             if matches!(cs.phase, Phase::Authed { .. }) {
-                let _ = tcp_send(cid.clone(), encode_hashes(FRAME_FRONTIER, &frontier));
+                out.push(Effect::Send(cid.clone(), encode_hashes(FRAME_FRONTIER, &frontier)));
             }
         }
     }
-    let ready_sent = maybe_emit_ready(&state.app_id, state.ready_sent);
+    let ready_sent = maybe_emit_ready(&state.app_id, state.ready_sent, &mut out);
+    perform(out);
 
     let delivered_vec: Vec<Hash> = delivered.iter().copied().collect();
     Ok((
@@ -554,10 +560,12 @@ fn handle_request(
         hashes_from_json(&state.delivered_json).into_iter().collect();
     let mut finality: BTreeMap<Hash, bool> = finality_from_json(&state.final_json);
     let mut app_id = state.app_id.clone();
+    let mut out: Outbox = Vec::new();
 
     let ack = match api::decode_command(&body) {
         Some(api::Command::Submit(payload)) => {
-            let (h, result) = run_command(&mut dag, &conns, &signing_key, self_head, payload, &mut finality);
+            let (h, result) =
+                run_command(&mut dag, &conns, &signing_key, self_head, payload, &mut finality, &mut out);
             self_head = h;
             ack_bytes(result)
         }
@@ -577,7 +585,7 @@ fn handle_request(
                     if ev.payload.is_empty() {
                         continue;
                     }
-                    let _ = message_server_send(id.clone(), api::encode_delivery(&ev.author, &ev.payload));
+                    out.push(Effect::App(id.clone(), api::encode_delivery(&ev.author, &ev.payload)));
                     delivered.insert(h);
                 }
             }
@@ -587,7 +595,8 @@ fn handle_request(
         None => api::encode_ack(false, &[0u8; 32], "unrecognized command"),
     };
 
-    deliver_committed(&dag, &conns, &app_id, &mut delivered, &mut finality);
+    deliver_committed(&dag, &conns, &app_id, &mut delivered, &mut finality, &mut out);
+    perform(out);
 
     let delivered_vec: Vec<Hash> = delivered.iter().copied().collect();
     Ok((
@@ -699,9 +708,10 @@ fn author_rpc(input: Value) -> Value {
     };
     let mut delivered: BTreeSet<Hash> = hashes_from_json(&state.delivered_json).into_iter().collect();
     let mut finality: BTreeMap<Hash, bool> = finality_from_json(&state.final_json);
+    let mut out: Outbox = Vec::new();
 
     let (new_self_head, result) =
-        run_command(&mut dag, &conns, &signing_key, self_head, payload, &mut finality);
+        run_command(&mut dag, &conns, &signing_key, self_head, payload, &mut finality, &mut out);
     // A validation REJECTION is a normal business outcome, not an actor fault — so it
     // is carried IN-BAND as `tuple<ok: bool, data: list<u8>>` (data = hash on success,
     // the SM reason on rejection), never as an export-level `result::err` (which
@@ -709,7 +719,8 @@ fn author_rpc(input: Value) -> Value {
     // genuine faults only (undecodable input / corrupt state).
     match result {
         Ok(hash) => {
-            deliver_committed(&dag, &conns, &state.app_id, &mut delivered, &mut finality);
+            deliver_committed(&dag, &conns, &state.app_id, &mut delivered, &mut finality, &mut out);
+            perform(out);
             let delivered_vec: Vec<Hash> = delivered.iter().copied().collect();
             let new_state = ActorState {
                 dag_json: dag_to_json(&dag),
@@ -790,7 +801,9 @@ fn subscribe_rpc(input: Value) -> Value {
     // Replay the whole finalized history to the fresh subscriber.
     let mut delivered: BTreeSet<Hash> = BTreeSet::new();
     let mut finality: BTreeMap<Hash, bool> = finality_from_json(&state.final_json);
-    deliver_committed(&dag, &conns, &state.app_id, &mut delivered, &mut finality);
+    let mut out: Outbox = Vec::new();
+    deliver_committed(&dag, &conns, &state.app_id, &mut delivered, &mut finality, &mut out);
+    perform(out);
     let delivered_vec: Vec<Hash> = delivered.iter().copied().collect();
     let new_state = ActorState {
         delivered_json: hashes_to_json(&delivered_vec),
@@ -810,16 +823,16 @@ enum Step {
 /// HELLO → CHALLENGE. Identity proof only: any well-formed pubkey is challenged;
 /// the transport does not gate membership (the SM does). The CHALLENGE/AUTH
 /// signature still proves the peer owns the key it presented.
-fn step_hello(conn_id: &str, frame: &ParsedFrame) -> Step {
+fn step_hello(conn_id: &str, frame: &ParsedFrame, out: &mut Outbox) -> Step {
     if frame.kind != FRAME_HELLO || frame.payload.len() != 32 {
-        let _ = tcp_send(conn_id.to_string(), encode_rejected("expected HELLO(pubkey)"));
-        let _ = tcp_close(conn_id.to_string());
+        out.push(Effect::Send(conn_id.to_string(), encode_rejected("expected HELLO(pubkey)")));
+        out.push(Effect::Close(conn_id.to_string()));
         return Step::Close;
     }
     let mut pk = [0u8; 32];
     pk.copy_from_slice(&frame.payload);
     let nonce = challenge_nonce(conn_id);
-    let _ = tcp_send(conn_id.to_string(), encode_challenge(&nonce));
+    out.push(Effect::Send(conn_id.to_string(), encode_challenge(&nonce)));
     Step::Advance(Phase::AwaitingAuth { pubkey_hex: hex(&pk), nonce_hex: hex(&nonce) })
 }
 
@@ -829,10 +842,11 @@ fn step_auth(
     pubkey_hex: &str,
     nonce_hex: &str,
     dag: &Dag,
+    out: &mut Outbox,
 ) -> Result<Step, String> {
     if frame.kind != FRAME_AUTH || frame.payload.len() != 64 {
-        let _ = tcp_send(conn_id.to_string(), encode_rejected("expected AUTH(sig)"));
-        let _ = tcp_close(conn_id.to_string());
+        out.push(Effect::Send(conn_id.to_string(), encode_rejected("expected AUTH(sig)")));
+        out.push(Effect::Close(conn_id.to_string()));
         return Ok(Step::Close);
     }
     let pk = from_hex32(pubkey_hex)?;
@@ -842,18 +856,61 @@ fn step_auth(
     use ed25519_dalek::{Signature, Verifier, VerifyingKey};
     let vk = VerifyingKey::from_bytes(&pk).map_err(|e| format!("bad pubkey: {}", e))?;
     if vk.verify(&nonce, &Signature::from_bytes(&sig)).is_err() {
-        let _ = tcp_send(conn_id.to_string(), encode_rejected("auth failed"));
-        let _ = tcp_close(conn_id.to_string());
+        out.push(Effect::Send(conn_id.to_string(), encode_rejected("auth failed")));
+        out.push(Effect::Close(conn_id.to_string()));
         return Ok(Step::Close);
     }
-    let _ = tcp_send(conn_id.to_string(), encode_hashes(FRAME_ACCEPTED, &all_heads(dag)));
+    out.push(Effect::Send(conn_id.to_string(), encode_hashes(FRAME_ACCEPTED, &all_heads(dag))));
     log(format!("[mesh] conn {} authed as {}", conn_id, pubkey_hex));
     Ok(Step::Advance(Phase::Authed { pubkey_hex: pubkey_hex.to_string() }))
+}
+
+/// Client side: CHALLENGE → AUTH. Sign the peer's nonce to prove we own the pubkey
+/// we presented in our HELLO.
+fn step_challenge(
+    conn_id: &str,
+    frame: &ParsedFrame,
+    peer_pubkey_hex: &str,
+    signing_key: &SigningKey,
+    out: &mut Outbox,
+) -> Step {
+    if frame.kind != FRAME_CHALLENGE || frame.payload.len() != 32 {
+        out.push(Effect::Send(conn_id.to_string(), encode_rejected("expected CHALLENGE(nonce)")));
+        out.push(Effect::Close(conn_id.to_string()));
+        return Step::Close;
+    }
+    let sig = signing_key.sign(&frame.payload).to_bytes();
+    out.push(Effect::Send(conn_id.to_string(), encode_auth(&sig)));
+    Step::Advance(Phase::AwaitingAccepted { peer_pubkey_hex: peer_pubkey_hex.to_string() })
+}
+
+/// Client side: ACCEPTED(frontier) → Authed. Catch up on anything the peer's
+/// advertised frontier shows we lack, and announce our own frontier.
+fn step_accepted(
+    conn_id: &str,
+    frame: &ParsedFrame,
+    peer_pubkey_hex: &str,
+    dag: &Dag,
+    out: &mut Outbox,
+) -> Step {
+    if frame.kind != FRAME_ACCEPTED {
+        out.push(Effect::Send(conn_id.to_string(), encode_rejected("expected ACCEPTED(frontier)")));
+        out.push(Effect::Close(conn_id.to_string()));
+        return Step::Close;
+    }
+    for want in decode_hashes(&frame.payload).into_iter().filter(|h| !dag.has(h)) {
+        out.push(Effect::Send(conn_id.to_string(), encode_hashes(FRAME_WANT, &[want])));
+    }
+    out.push(Effect::Send(conn_id.to_string(), encode_hashes(FRAME_FRONTIER, &all_heads(dag))));
+    log(format!("[mesh] conn {} authed to {}", conn_id, peer_pubkey_hex));
+    Step::Advance(Phase::Authed { pubkey_hex: peer_pubkey_hex.to_string() })
 }
 
 // ---- post-handshake frame handling ----
 
 /// Handle one authenticated frame. Returns the (possibly advanced) self_head.
+// Wide by nature (the fold context threaded through); becomes an engine struct in M3.
+#[allow(clippy::too_many_arguments)]
 fn handle_authed_frame(
     dag: &mut Dag,
     conns: &BTreeMap<String, ConnState>,
@@ -862,22 +919,30 @@ fn handle_authed_frame(
     self_head: Option<Hash>,
     frame: &ParsedFrame,
     finality: &mut BTreeMap<Hash, bool>,
+    out: &mut Outbox,
 ) -> Option<Hash> {
     match frame.kind {
         FRAME_DELIVER => match Event::decode(&frame.payload) {
-            Ok(ev) => ingest_and_propagate(dag, conns, conn_id, self_head, ev),
+            Ok(ev) => ingest_and_propagate(dag, conns, conn_id, self_head, ev, out),
             Err(e) => {
                 log(format!("[mesh] DELIVER decode failed: {}", e));
                 self_head
             }
         },
         // App client asks us to author a payload event on our own chain.
-        FRAME_SUBMIT => {
-            author_and_broadcast(dag, conns, conn_id, signing_key, self_head, frame.payload.clone(), finality)
-        }
+        FRAME_SUBMIT => author_and_broadcast(
+            dag,
+            conns,
+            conn_id,
+            signing_key,
+            self_head,
+            frame.payload.clone(),
+            finality,
+            out,
+        ),
         // Interface 2 read verbs (current-state / event-status / witnesses / ancestry).
         FRAME_QUERY => {
-            answer_query(dag, conn_id, &frame.payload, finality);
+            answer_query(dag, conn_id, &frame.payload, finality, out);
             self_head
         }
         FRAME_WANT => {
@@ -886,7 +951,7 @@ fn handle_authed_frame(
             // don't hold yet we simply skip and the requester re-asks.
             for h in decode_hashes(&frame.payload) {
                 if let Some(ev) = dag.events.get(&h) {
-                    let _ = tcp_send(conn_id.to_string(), encode_deliver(&ev.encode()));
+                    out.push(Effect::Send(conn_id.to_string(), encode_deliver(&ev.encode())));
                 }
             }
             self_head
@@ -897,7 +962,7 @@ fn handle_authed_frame(
                 .filter(|h| !dag.has(h))
                 .collect();
             if !missing.is_empty() {
-                let _ = tcp_send(conn_id.to_string(), encode_hashes(FRAME_WANT, &missing));
+                out.push(Effect::Send(conn_id.to_string(), encode_hashes(FRAME_WANT, &missing)));
             }
             self_head
         }
@@ -936,7 +1001,7 @@ fn query_arg_hash(arg: &[u8]) -> Option<Hash> {
 }
 
 /// Answer an Interface 2 read verb and send the reply on `conn_id`.
-fn answer_query(dag: &Dag, conn_id: &str, body: &[u8], finality: &mut BTreeMap<Hash, bool>) {
+fn answer_query(dag: &Dag, conn_id: &str, body: &[u8], finality: &mut BTreeMap<Hash, bool>, out: &mut Outbox) {
     let Some((&qkind, arg)) = body.split_first() else {
         return;
     };
@@ -961,7 +1026,7 @@ fn answer_query(dag: &Dag, conn_id: &str, body: &[u8], finality: &mut BTreeMap<H
         }
         _ => return,
     };
-    let _ = tcp_send(conn_id.to_string(), reply);
+    out.push(Effect::Send(conn_id.to_string(), reply));
 }
 
 /// Ingest a gossiped event: dedup, backfill on missing deps, else admit + forward.
@@ -973,6 +1038,7 @@ fn ingest_and_propagate(
     from_conn: &str,
     self_head: Option<Hash>,
     event: Event,
+    out: &mut Outbox,
 ) -> Option<Hash> {
     if dag.has(&event.event_hash()) {
         return self_head; // dedup — already have it
@@ -988,7 +1054,7 @@ fn ingest_and_propagate(
             // received a chain out of order), breaking multi-hop propagation.
             for h in &admitted {
                 if let Some(ev) = dag.events.get(h) {
-                    broadcast(conns, from_conn, &encode_deliver(&ev.encode()));
+                    broadcast(conns, from_conn, &encode_deliver(&ev.encode()), out);
                 }
             }
             self_head
@@ -996,7 +1062,7 @@ fn ingest_and_propagate(
         Ok(_) => {
             // Buffered — missing a dependency; ask the source for it.
             if !missing.is_empty() {
-                let _ = tcp_send(from_conn.to_string(), encode_hashes(FRAME_WANT, &missing));
+                out.push(Effect::Send(from_conn.to_string(), encode_hashes(FRAME_WANT, &missing)));
             }
             self_head
         }
@@ -1075,6 +1141,8 @@ fn author_event(
 
 /// Author a payload event, ACK the requester, and broadcast it. Returns the new
 /// self_head on success, unchanged on failure.
+// Wide by nature (the fold context threaded through); becomes an engine struct in M3.
+#[allow(clippy::too_many_arguments)]
 fn author_and_broadcast(
     dag: &mut Dag,
     conns: &BTreeMap<String, ConnState>,
@@ -1083,16 +1151,17 @@ fn author_and_broadcast(
     self_head: Option<Hash>,
     payload: Vec<u8>,
     finality: &mut BTreeMap<Hash, bool>,
+    out: &mut Outbox,
 ) -> Option<Hash> {
     match author_event(dag, signing_key, self_head, payload, finality) {
         Ok(ev) => {
             let h = ev.event_hash();
-            let _ = tcp_send(conn_id.to_string(), encode_ack(&h, true, ""));
-            broadcast(conns, conn_id, &encode_deliver(&ev.encode()));
+            out.push(Effect::Send(conn_id.to_string(), encode_ack(&h, true, "")));
+            broadcast(conns, conn_id, &encode_deliver(&ev.encode()), out);
             Some(h)
         }
         Err(e) => {
-            let _ = tcp_send(conn_id.to_string(), encode_ack(&[0u8; 32], false, &e));
+            out.push(Effect::Send(conn_id.to_string(), encode_ack(&[0u8; 32], false, &e)));
             self_head
         }
     }
@@ -1108,11 +1177,12 @@ fn run_command(
     self_head: Option<Hash>,
     payload: Vec<u8>,
     finality: &mut BTreeMap<Hash, bool>,
+    out: &mut Outbox,
 ) -> (Option<Hash>, Result<Hash, String>) {
     match author_event(dag, signing_key, self_head, payload, finality) {
         Ok(ev) => {
             let h = ev.event_hash();
-            broadcast(conns, "", &encode_deliver(&ev.encode()));
+            broadcast(conns, "", &encode_deliver(&ev.encode()), out);
             (Some(h), Ok(h))
         }
         Err(e) => (self_head, Err(e)),
@@ -1156,13 +1226,13 @@ fn missing_deps(dag: &Dag, ev: &Event) -> Vec<Hash> {
 }
 
 /// Broadcast a frame to every authed connection except `exclude`.
-fn broadcast(conns: &BTreeMap<String, ConnState>, exclude: &str, frame: &[u8]) {
+fn broadcast(conns: &BTreeMap<String, ConnState>, exclude: &str, frame: &[u8], out: &mut Outbox) {
     for (cid, cs) in conns {
         if cid == exclude {
             continue;
         }
         if matches!(cs.phase, Phase::Authed { .. }) {
-            let _ = tcp_send(cid.clone(), frame.to_vec());
+            out.push(Effect::Send(cid.clone(), frame.to_vec()));
         }
     }
 }
@@ -1170,11 +1240,11 @@ fn broadcast(conns: &BTreeMap<String, ConnState>, exclude: &str, frame: &[u8]) {
 /// Emit the one-shot Ready signal to the subscribed app the first time an app is
 /// registered — a node is ready to author as soon as it has an app to serve.
 /// Returns the updated `ready_sent`.
-fn maybe_emit_ready(app_id: &str, ready_sent: bool) -> bool {
+fn maybe_emit_ready(app_id: &str, ready_sent: bool, out: &mut Outbox) -> bool {
     if ready_sent || app_id.is_empty() {
         return ready_sent;
     }
-    let _ = message_server_send(app_id.to_string(), api::encode_ready());
+    out.push(Effect::App(app_id.to_string(), api::encode_ready()));
     log(format!("[mesh] signalled READY to app {}", app_id));
     true
 }
@@ -1265,6 +1335,7 @@ fn deliver_committed(
     app_id: &str,
     delivered: &mut BTreeSet<Hash>,
     finality: &mut BTreeMap<Hash, bool>,
+    out: &mut Outbox,
 ) {
     ensure_finality(dag, finality);
     // `ordered()` (topo) only sets a stable *delivery* order; validity for each
@@ -1287,7 +1358,7 @@ fn deliver_committed(
                 let frame = encode_conflict(&h, &reason);
                 for (cid, cs) in conns {
                     if matches!(cs.phase, Phase::Authed { .. }) {
-                        let _ = tcp_send(cid.clone(), frame.clone());
+                        out.push(Effect::Send(cid.clone(), frame.clone()));
                     }
                 }
             }
@@ -1301,14 +1372,14 @@ fn deliver_committed(
         let frame = encode_finalized(&h, &ev.author, ev.timestamp, &deps, &ev.payload);
         for (cid, cs) in conns {
             if matches!(cs.phase, Phase::Authed { .. }) {
-                let _ = tcp_send(cid.clone(), frame.clone());
+                out.push(Effect::Send(cid.clone(), frame.clone()));
             }
         }
         // A subscribed executor gets the SAME dag-node frame over the message-server
         // stream (the reference "watch events" surface). Reuses the wire encoding, so
         // TCP peers and co-located executors see one dag-node format.
         if !app_id.is_empty() {
-            let _ = message_server_send(app_id.to_string(), frame.clone());
+            out.push(Effect::App(app_id.to_string(), frame.clone()));
         }
     }
 }
