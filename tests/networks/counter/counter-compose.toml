@@ -1,16 +1,64 @@
-# Compose the node (entry) with counter-sm — the reference RSM stack's node artifact
-# (node ⊕ SM). Same three state-machine links as chat/control-compose, different SM.
-# Compose with the FIXED packr (/home/colin/work/pack/target/release/packr … --output …
-# == published 0.12.7).
+# Compose the full counter actor: counter-system (entry, DOMAIN interface) ⊕ node ⊕ counter-SM.
+#   counter-system → node : the `node` interface (node.pact). Only the functions the typed
+#                           system actually uses are linked; subscribe/event-status are
+#                           declared (interface hash) but unlinked — the sealed substrate.
+#   node           → SM   : the `state-machine` interface (Interface 1) — the fold hot path.
+# Compose with the official packr 0.13.0 (~/.cargo/bin/packr). Paths relative to this dir.
 
 [[component]]
-name  = "mesh"
-wasm  = "../../../target/wasm32-unknown-unknown/release/mesh.wasm"
+name  = "counter-system"
+wasm  = "counter-system/target/wasm32-unknown-unknown/release/counter_system.wasm"
 entry = true
+
+[[component]]
+name = "mesh"
+wasm = "../../../target/wasm32-unknown-unknown/release/mesh.wasm"
 
 [[component]]
 name = "counter-sm"
 wasm = "counter-sm/target/wasm32-unknown-unknown/release/counter_sm.wasm"
+
+[[link]]
+consumer = "counter-system"
+import   = "node.init"
+provider = "mesh"
+export   = "init"
+
+[[link]]
+consumer = "counter-system"
+import   = "node.on-connect"
+provider = "mesh"
+export   = "on-connect"
+
+[[link]]
+consumer = "counter-system"
+import   = "node.on-bytes"
+provider = "mesh"
+export   = "on-bytes"
+
+[[link]]
+consumer = "counter-system"
+import   = "node.on-close"
+provider = "mesh"
+export   = "on-close"
+
+[[link]]
+consumer = "counter-system"
+import   = "node.tick"
+provider = "mesh"
+export   = "tick"
+
+[[link]]
+consumer = "counter-system"
+import   = "node.author"
+provider = "mesh"
+export   = "author"
+
+[[link]]
+consumer = "counter-system"
+import   = "node.current-state"
+provider = "mesh"
+export   = "current-state"
 
 [[link]]
 consumer = "mesh"

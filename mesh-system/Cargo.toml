@@ -1,0 +1,15 @@
+[package]
+name = "mesh-system"
+version = "0.1.0"
+edition = "2021"
+description = "The generic mesh system entry actor: owns ALL host I/O (tcp/timer/message-server) and drives a composed pure `node` component (node.pact) — the entry half of the `system ⊕ node ⊕ SM` composite (DESIGN-dx.md). It shuttles bytes to the node and performs the effects the node returns, injecting wall-clock time where events are signed. Keeps the RPC + finalized-stream surfaces executors drive (retired in M6)."
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+packr-guest = { version = "0.13.0", features = ["derive"] }
+
+[profile.release]
+opt-level = "s"
+lto = true

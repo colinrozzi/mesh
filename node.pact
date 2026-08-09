@@ -33,7 +33,7 @@ interface node {
         // cannot `listen`/`connect` itself. Plan encoding:
         //   [listen-len:u16 BE][listen utf8]  then, repeated: [pk-len:u16][pk][addr-len:u16][addr]
         // For each planned dial the system `connect`s, then calls `on-connect(dialed=true)`.
-        init: func(config: string) -> result<tuple<list<u8>, list<u8>>, string>
+        init: func(config: string, now: u64) -> result<tuple<list<u8>, list<u8>>, string>
 
         // A raw connection now exists: `dialed`=true for a peer WE dialed (the system
         // just `connect`ed it), false for an inbound accept. `peer` is the expected peer
@@ -43,7 +43,7 @@ interface node {
 
         // Inbound bytes on a connection — handshake or gossip. Drives the connection's
         // phase machine and the fold. Returns new state + effects.
-        on-bytes: func(state: list<u8>, conn: string, data: list<u8>) -> tuple<list<u8>, list<list<u8>>>
+        on-bytes: func(state: list<u8>, conn: string, data: list<u8>, now: u64) -> tuple<list<u8>, list<list<u8>>>
 
         // A connection closed; drop it from the peer table. New state, no effects.
         on-close: func(state: list<u8>, conn: string) -> list<u8>
@@ -53,10 +53,11 @@ interface node {
         tick: func(state: list<u8>) -> tuple<list<u8>, list<list<u8>>>
 
         // Author a payload event on this node's chain, PRE-VALIDATED against the current
-        // frontier. Returns new state, an ok/reason result (32-byte hash on success, the
-        // SM's reason on rejection — a rejection is a normal outcome, not an error), and
-        // effects (gossip the event + emit the finalized stream).
-        author: func(state: list<u8>, payload: list<u8>) -> tuple<list<u8>, result<list<u8>, string>, list<list<u8>>>
+        // frontier. Returns new state, an `ok` flag + `data` (the 32-byte hash on success,
+        // the SM's reason bytes on rejection — a rejection is a normal outcome, not an
+        // error), and effects (gossip the event + emit the finalized stream). Flattened
+        // rather than `result<..>` so it decodes on the import side.
+        author: func(state: list<u8>, payload: list<u8>, now: u64) -> tuple<list<u8>, bool, list<u8>, list<list<u8>>>
 
         // Register/replace the subscribed app and replay the finalized history to it as
         // `app` effects (idempotent — the app folds by SM state). New state + effects.

@@ -106,22 +106,24 @@ fn main() {
     let _ = child.wait();
 
     let log = fs::read_to_string(LOG).unwrap_or_default();
-    let ok = log.contains("COUNTER-SYSTEM OK");
-    let rejected = log.contains("Inc(-5) rejected as expected");
-    let stream = log.matches("STREAM finalized event").count();
+    // The driver talks to the counter participant through its DOMAIN interface only.
+    let ok = log.contains("COUNTER OK");
+    let rejected = log.contains("increment(-5) rejected");
+    // Typed `watch` notifications: count updates pushed as the value changes.
+    let watch = log.matches("WATCH update").count();
 
-    println!("--- counter-system log ---");
-    for line in log.lines().filter(|l| l.contains("counter-system")) {
+    println!("--- counter-driver log ---");
+    for line in log.lines().filter(|l| l.contains("counter-driver")) {
         println!("{line}");
     }
     println!("--------------------------");
-    println!("verdict-line={ok} rejected={rejected} stream_events={stream}");
+    println!("verdict={ok} rejected={rejected} watch_updates={watch}");
 
-    if ok && rejected && stream >= 4 {
+    if ok && rejected && watch >= 2 {
         println!("\nCOUNTER-SYSTEM TEST PASSED");
         std::process::exit(0);
     } else {
-        eprintln!("\nCOUNTER-SYSTEM TEST FAILED (ok={ok} rejected={rejected} stream={stream}, want >=4)");
+        eprintln!("\nCOUNTER-SYSTEM TEST FAILED (ok={ok} rejected={rejected} watch={watch}, want >=2)");
         std::process::exit(1);
     }
 }

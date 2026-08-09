@@ -1,15 +1,73 @@
-# Compose the reshaped node (entry) with the real control-SM (provider). Proves
-# the node's state-machine import links to the control-SM and only theater host
-# imports remain. Paths relative to this manifest's directory.
+# Compose the full RSM actor: mesh-system (entry) ⊕ mesh node ⊕ control-sm.
+#   system → node : node.pact (system owns host I/O) ;  node → SM : state-machine (Interface 1).
+# Compose with the official packr 0.13.0 (~/.cargo/bin/packr). Paths relative to this dir.
 
 [[component]]
-name  = "mesh"
-wasm  = "../../../target/wasm32-unknown-unknown/release/mesh.wasm"
+name  = "mesh-system"
+wasm  = "../../../mesh-system/target/wasm32-unknown-unknown/release/mesh_system.wasm"
 entry = true
+
+[[component]]
+name = "mesh"
+wasm = "../../../target/wasm32-unknown-unknown/release/mesh.wasm"
 
 [[component]]
 name = "control-sm"
 wasm = "control-sm/target/wasm32-unknown-unknown/release/control_sm.wasm"
+
+[[link]]
+consumer = "mesh-system"
+import   = "node.init"
+provider = "mesh"
+export   = "init"
+
+[[link]]
+consumer = "mesh-system"
+import   = "node.on-connect"
+provider = "mesh"
+export   = "on-connect"
+
+[[link]]
+consumer = "mesh-system"
+import   = "node.on-bytes"
+provider = "mesh"
+export   = "on-bytes"
+
+[[link]]
+consumer = "mesh-system"
+import   = "node.on-close"
+provider = "mesh"
+export   = "on-close"
+
+[[link]]
+consumer = "mesh-system"
+import   = "node.tick"
+provider = "mesh"
+export   = "tick"
+
+[[link]]
+consumer = "mesh-system"
+import   = "node.author"
+provider = "mesh"
+export   = "author"
+
+[[link]]
+consumer = "mesh-system"
+import   = "node.subscribe"
+provider = "mesh"
+export   = "subscribe"
+
+[[link]]
+consumer = "mesh-system"
+import   = "node.current-state"
+provider = "mesh"
+export   = "current-state"
+
+[[link]]
+consumer = "mesh-system"
+import   = "node.event-status"
+provider = "mesh"
+export   = "event-status"
 
 [[link]]
 consumer = "mesh"

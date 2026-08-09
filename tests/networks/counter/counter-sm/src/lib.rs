@@ -16,8 +16,8 @@ extern crate alloc;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
-use counter_protocol::{decode, Cmd};
-use packr_guest::{export, GraphValue};
+use counter_protocol::{decode, Cmd, CounterState};
+use packr_guest::export;
 
 #[cfg(not(test))]
 packr_guest::setup_guest!();
@@ -34,13 +34,8 @@ packr_guest::pack_types! {
     }
 }
 
-#[derive(Clone, Default, GraphValue)]
-#[graph(crate = "packr_guest::composite_abi")]
-pub struct CounterState {
-    pub count: i64,
-    /// Number of ops applied — a derived field beyond the raw count.
-    pub ops: u64,
-}
+// `CounterState` (the typed `counter-state`) now lives in `counter-protocol`, shared with
+// the counter system so `current-state` decodes back into it typed.
 
 // ===== core logic (host-testable; the #[export] wrappers are thin) =====
 

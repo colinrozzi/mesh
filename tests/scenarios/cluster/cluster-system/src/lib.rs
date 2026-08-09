@@ -21,9 +21,9 @@ use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
-use counter_protocol::Cmd;
-use mesh_client::{Event, Session};
-use packr_guest::{decode, export, import, pack_types, GraphValue, Value};
+use counter_protocol::decode_count;
+use mesh_client::Session;
+use packr_guest::{export, import, pack_types, GraphValue, Value};
 
 packr_guest::setup_guest!();
 
@@ -88,37 +88,19 @@ struct ClusterConfig {
     incrs_per_node: u64,
 }
 
-// counter-sm uses a TYPED state → current-state is the Graph-ABI structural encoding;
-// decode via GraphValue (fields must match CounterState: count + ops).
-#[derive(Default, GraphValue)]
-#[graph(crate = "packr_guest::composite_abi")]
-struct CounterView {
-    count: i64,
-    ops: u64,
-}
-
-// ---- driving each node through the SDK ----
+// ---- driving each node through its TYPED counter interface (my:counter.*) ----
 
 fn session(node_id: &str) -> Session {
     Session::new(node_id.to_string(), rpc_call)
 }
 
 fn author_inc(node_id: &str) -> Result<(), String> {
-    session(node_id).author(&counter_protocol::encode(&Cmd::Inc(1))).map(|_| ())
+    session(node_id).call("my:counter.increment", Value::from(1i64)).map(|_| ())
 }
 
 fn node_count(node_id: &str) -> Result<i64, String> {
-    let bytes = session(node_id).current_state()?;
-    let view = decode(&bytes).ok().and_then(|v| CounterView::try_from(v).ok()).unwrap_or_default();
-    Ok(view.count)
-}
-
-fn short(bytes: &[u8]) -> String {
-    let mut s = String::with_capacity(12);
-    for &b in bytes.iter().take(6) {
-        s.push_str(&format!("{:02x}", b));
-    }
-    s
+    let v = session(node_id).call("my:counter.count", Value::from(Vec::<u8>::new()))?;
+    i64::try_from(v).map_err(|e| format!("count decode: {:?}", e))
 }
 
 #[export(name = "theater:simple/actor.init")]
@@ -177,7 +159,7 @@ fn handle_tick(state: ClusterState, _timer: String) -> Result<(ClusterState, ())
     if !state.armed {
         // Phase 1: subscribe to every node's stream, then drive the workload.
         for node in &state.node_ids {
-            let _ = session(node).subscribe(&state.my_id);
+            let _ = session(node).call("my:counter.watch", Value::String(state.my_id.clone()));
         }
         let mut authored = 0u64;
         for node in &state.node_ids {
@@ -223,10 +205,10 @@ fn handle_tick(state: ClusterState, _timer: String) -> Result<(ClusterState, ())
 /// A finalized dag-node arrived from one of the nodes — the network event feed.
 #[export(name = "theater:simple/message-server-client.handle-send")]
 fn handle_send(state: ClusterState, msg: Vec<u8>) -> Result<(ClusterState, ()), String> {
-    let Some(Event::Finalized(node)) = Session::decode_event(&msg) else {
+    let Some(c) = decode_count(&msg) else {
         return Ok((state, ()));
     };
     let n = state.finalizations + 1;
-    log(format!("[cluster] finalize #{} — event {} authored by node {}", n, short(&node.id), short(&node.author)));
+    log(format!("[cluster] count-update #{} — count={}", n, c));
     Ok((ClusterState { finalizations: n, ..state }, ()))
 }

@@ -106,9 +106,10 @@ impl Session {
         self.call("my:mesh.subscribe", Value::String(my_id.to_string())).map(|_| ())
     }
 
-    /// One RPC verb call, peeling the two `result` layers (transport wrapper + the
-    /// node's export result) down to the `ret` value.
-    fn call(&self, func: &str, params: Value) -> Result<Value, String> {
+    /// Call any verb by name and get its `ret` value — the generic escape hatch a caller
+    /// uses to reach a network's TYPED interface (e.g. `call("my:counter.increment", n)`),
+    /// peeling the two `result` layers (transport wrapper + the node's export result).
+    pub fn call(&self, func: &str, params: Value) -> Result<Value, String> {
         let out = (self.rpc)(self.node_id.clone(), func.to_string(), params, none());
         unwrap_result(unwrap_result(out)?)
     }

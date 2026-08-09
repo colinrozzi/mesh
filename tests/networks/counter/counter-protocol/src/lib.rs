@@ -20,6 +20,32 @@ pub enum Cmd {
     Reset,
 }
 
+/// The counter's replicated state — a TYPED record (`counter-state` in the interface).
+/// Shared here (beside the wire `Cmd`) so the SM folds it AND a consumer/system can
+/// decode `current-state` back into it typed — no drift, no re-declaration.
+#[derive(Debug, Clone, Default, PartialEq, Eq, GraphValue)]
+#[graph(crate = "packr_guest::composite_abi")]
+pub struct CounterState {
+    pub count: i64,
+    /// Number of ops applied — a derived field beyond the raw count.
+    pub ops: u64,
+}
+
+/// Decode `current-state` bytes back into a typed `CounterState`.
+pub fn decode_state(bytes: &[u8]) -> Option<CounterState> {
+    abi_decode(bytes).ok().and_then(|v| CounterState::try_from(v).ok())
+}
+
+/// Encode a `count` change notification pushed to `watch` subscribers (a big-endian i64).
+pub fn encode_count(n: i64) -> Vec<u8> {
+    n.to_be_bytes().to_vec()
+}
+
+/// Decode a `count` notification.
+pub fn decode_count(bytes: &[u8]) -> Option<i64> {
+    <[u8; 8]>::try_from(bytes).ok().map(i64::from_be_bytes)
+}
+
 /// Encode a command via the Graph ABI.
 pub fn encode(cmd: &Cmd) -> Vec<u8> {
     abi_encode(&Value::from(cmd.clone())).unwrap_or_default()

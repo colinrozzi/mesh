@@ -1,0 +1,11 @@
+[package]
+name = "mesh-runtime"
+version = "0.1.0"
+edition = "2021"
+description = "The reusable system-entry framework for mesh: the generic glue that drives a composed pure `node` (node.pact) from a theater entry actor. A per-network system crate provides its host + node import bindings as `Host`/`NodeApi` fn-pointer structs and gets the standard lifecycle (init/on-data/on-close/tick + effect perform) for free, then adds its own typed interface (my:<net>.*). Pure no_std rlib — no #[export], no host imports of its own — so a network entry links it without pulling a second guest runtime."
+
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]
+packr-guest = { version = "0.13.0", features = ["derive"] }

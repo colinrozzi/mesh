@@ -1,0 +1,17 @@
+[package]
+name = "counter-system"
+version = "0.1.0"
+edition = "2021"
+description = "The counter network's SYSTEM — the theater entry actor that composes the pure node + counter-SM and exposes the counter's TYPED interface (my:counter.increment / my:counter.count) on top of the generic substrate. Thin: the generic node-driving lives in mesh-runtime; this crate just wires imports and adds the typed verbs (each a translator over node.author / node.current-state). The pattern every network follows."
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+packr-guest = { version = "0.13.0", features = ["derive"] }
+mesh-runtime = { path = "../../../../mesh-runtime" }
+counter-protocol = { path = "../counter-protocol" }
+
+[profile.release]
+opt-level = "s"
+lto = true
