@@ -1,11 +1,11 @@
 //! `counter-sm` — a replicated counter as an RSM `state-machine` component.
 //!
-//! The SM layer of the reference stack (executor / protocol / **SM** / node),
-//! implementing DESIGN-rsm.md Interface 1. This is the FIRST SM to use **typed state**
-//! (packr 0.13 generics): it pins the node's generic `s` to a `CounterState` record via
-//! `#[derive(GraphValue)]`, so `validate`/`apply` take and return a real `CounterState`
-//! — no `serde_json`, no hand-rolled state codec. The state marshals across the composed
-//! boundary through the Graph ABI; compose unifies the node's `s := counter-state`.
+//! The SM layer of the reference stack (system / **SM** / node), implementing
+//! DESIGN-rsm.md Interface 1 with **typed state**: the node's generic `s` is pinned to a
+//! `CounterState` record, so `validate`/`apply` take/return a real state — no serde, no
+//! hand-rolled codec. `Cmd`/`CounterState` are the counter's data schema, defined ONCE in
+//! `counter.wit` and generated here via `wit!` (shared with `counter-system` — no protocol
+//! crate; drift is caught at compose by structural hashing).
 //!
 //! **Conflict-free (admission-final).** `apply` is `count += n`; the only validity rule
 //! (`Inc` deltas must be positive) is a pure function of the payload, so events commute.
@@ -16,13 +16,14 @@ extern crate alloc;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
-use counter_protocol::{decode, Cmd, CounterState};
-use packr_guest::export;
+use packr_guest::{export, wit};
 
 #[cfg(not(test))]
 packr_guest::setup_guest!();
 
-// State is a TYPED record now: `counter-state` in the interface, `CounterState` in Rust.
+// Generate `Cmd` + `CounterState` from the shared counter.wit (wit/ symlink).
+wit! {}
+
 packr_guest::pack_types! {
     exports {
         state-machine {
@@ -34,8 +35,10 @@ packr_guest::pack_types! {
     }
 }
 
-// `CounterState` (the typed `counter-state`) now lives in `counter-protocol`, shared with
-// the counter system so `current-state` decodes back into it typed.
+/// Decode a counter payload into a `Cmd` (the wire is the Graph-ABI encoding of `Cmd`).
+fn decode(payload: &[u8]) -> Option<Cmd> {
+    packr_guest::decode(payload).ok().and_then(|v| Cmd::try_from(v).ok())
+}
 
 // ===== core logic (host-testable; the #[export] wrappers are thin) =====
 
@@ -44,8 +47,6 @@ fn do_validate(payload: &[u8]) -> Result<bool, String> {
         return Ok(true); // inert graft (the node's own genesis / witness)
     }
     match decode(payload).ok_or_else(|| "undecodable counter payload".to_string())? {
-        // Positive-only increments: a pure-payload rule, so validity is
-        // state-independent and every event commutes (confluent, admission-final).
         Cmd::Inc(n) if n > 0 => Ok(true),
         Cmd::Inc(_) => Err("increment must be positive".to_string()),
         Cmd::Reset => Ok(true),
@@ -71,7 +72,7 @@ fn do_apply(payload: &[u8], mut s: CounterState) -> CounterState {
 
 #[export(name = "initial-state")]
 fn initial_state() -> CounterState {
-    CounterState::default()
+    CounterState { count: 0, ops: 0 }
 }
 
 #[export]
@@ -86,58 +87,49 @@ fn apply(_id: Vec<u8>, _author: Vec<u8>, _timestamp: u64, payload: Vec<u8>, stat
 
 #[export]
 fn members(_state: CounterState) -> Vec<Vec<u8>> {
-    // A counter has no membership concept.
     Vec::new()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use counter_protocol::encode;
+    use packr_guest::Value;
 
-    fn fold(cmds: &[Cmd]) -> CounterState {
-        let mut s = CounterState::default();
-        for cmd in cmds {
-            let p = encode(cmd);
-            if do_validate(&p).is_ok() {
-                s = do_apply(&p, s);
-            }
-        }
-        s
+    fn encode(cmd: Cmd) -> Vec<u8> {
+        packr_guest::encode(&Value::from(cmd)).unwrap_or_default()
     }
 
     #[test]
     fn increments_accumulate() {
-        let s = fold(&[Cmd::Inc(3), Cmd::Inc(4), Cmd::Inc(10)]);
+        let mut s = CounterState { count: 0, ops: 0 };
+        for c in [Cmd::Inc(3), Cmd::Inc(4), Cmd::Inc(10)] {
+            let p = encode(c);
+            assert!(do_validate(&p).is_ok());
+            s = do_apply(&p, s);
+        }
         assert_eq!(s.count, 17);
         assert_eq!(s.ops, 3);
     }
 
     #[test]
-    fn reset_zeroes() {
-        assert_eq!(fold(&[Cmd::Inc(5), Cmd::Reset, Cmd::Inc(2)]).count, 2);
-    }
-
-    #[test]
     fn non_positive_increment_is_rejected() {
-        assert!(do_validate(&encode(&Cmd::Inc(0))).is_err());
-        assert!(do_validate(&encode(&Cmd::Inc(-3))).is_err());
-        assert!(do_validate(&encode(&Cmd::Inc(1))).is_ok());
-        assert_eq!(fold(&[Cmd::Inc(5), Cmd::Inc(2)]).count, 7);
+        assert!(do_validate(&encode(Cmd::Inc(0))).is_err());
+        assert!(do_validate(&encode(Cmd::Inc(-3))).is_err());
+        assert!(do_validate(&encode(Cmd::Inc(1))).is_ok());
     }
 
     #[test]
-    fn increments_commute() {
-        assert_eq!(
-            fold(&[Cmd::Inc(3), Cmd::Inc(4), Cmd::Inc(5)]).count,
-            fold(&[Cmd::Inc(5), Cmd::Inc(3), Cmd::Inc(4)]).count
-        );
+    fn reset_zeroes() {
+        let s0 = do_apply(&encode(Cmd::Inc(5)), CounterState { count: 0, ops: 0 });
+        let s1 = do_apply(&encode(Cmd::Reset), s0);
+        let s2 = do_apply(&encode(Cmd::Inc(2)), s1);
+        assert_eq!(s2.count, 2);
     }
 
     #[test]
     fn empty_payload_is_inert() {
-        let s = fold(&[Cmd::Inc(9)]);
+        let s = do_apply(&encode(Cmd::Inc(9)), CounterState { count: 0, ops: 0 });
         assert!(do_validate(b"").is_ok());
-        assert_eq!(do_apply(b"", s.clone()).count, s.count);
+        assert_eq!(do_apply(b"", CounterState { count: s.count, ops: s.ops }).count, s.count);
     }
 }

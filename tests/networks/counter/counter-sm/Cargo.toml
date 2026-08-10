@@ -2,14 +2,13 @@
 name = "counter-sm"
 version = "0.1.0"
 edition = "2021"
-description = "Reference RSM state-machine component: a replicated counter (DESIGN-rsm.md Interface 1). Pure/confluent/structure-blind validate+apply over counter-protocol kinds; Inc is commutative so it is admission-final (conflict-free). The SM layer of the reference stack; imports counter-protocol for the codec."
+description = "Reference RSM state-machine component: a replicated counter (DESIGN-rsm.md Interface 1). Pure/confluent/structure-blind validate+apply over typed state; Inc is commutative so it is admission-final (conflict-free). Cmd/CounterState are generated from the shared counter.wit via wit! — no protocol crate."
 
 [lib]
 crate-type = ["cdylib"]
 
 [dependencies]
-packr-guest = { version = "0.13.0", features = ["derive"] }
-counter-protocol = { path = "../counter-protocol" }
+packr-guest = { version = "0.13.1", features = ["derive"] }
 
 [profile.release]
 opt-level = "s"

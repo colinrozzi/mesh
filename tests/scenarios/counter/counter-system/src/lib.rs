@@ -18,11 +18,15 @@ use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
-use counter_protocol::decode_count;
 use mesh_client::Session;
 use packr_guest::{export, import, pack_types, GraphValue, Value};
 
 packr_guest::setup_guest!();
+
+/// Decode a typed count notification (a big-endian i64) — the watch stream's payload.
+fn decode_count(b: &[u8]) -> Option<i64> {
+    <[u8; 8]>::try_from(b).ok().map(i64::from_be_bytes)
+}
 
 pack_types! {
     imports {

@@ -21,14 +21,27 @@ use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
-use counter_protocol::{decode_state, encode, encode_count, Cmd};
 use mesh_runtime::{
     run_author, run_current_state, run_init, run_notify, run_on_close, run_on_connect,
     run_on_data, run_tick, run_watch, rpc_err, rpc_ok, rpc_split, Host, NodeApi, SysState,
 };
-use packr_guest::{export, import, import_from, pack_types, Value};
+use packr_guest::{export, import, import_from, pack_types, wit, Value};
 
 packr_guest::setup_guest!();
+
+// Generate Cmd + CounterState from the shared counter.wit (wit/ symlink) — the same schema
+// the SM folds; no protocol crate. The codecs are one-liners over the Graph ABI.
+wit! {}
+
+fn encode(cmd: Cmd) -> Vec<u8> {
+    packr_guest::encode(&Value::from(cmd)).unwrap_or_default()
+}
+fn decode_state(bytes: &[u8]) -> Option<CounterState> {
+    packr_guest::decode(bytes).ok().and_then(|v| CounterState::try_from(v).ok())
+}
+fn encode_count(n: i64) -> Vec<u8> {
+    n.to_be_bytes().to_vec()
+}
 
 pack_types! {
     imports {
@@ -209,7 +222,7 @@ fn increment(input: Value) -> Value {
         Ok(n) => n,
         Err(e) => return rpc_err(&format!("increment: expected s64: {:?}", e)),
     };
-    let (state, _ok, _data) = run_author(state, encode(&Cmd::Inc(n)), &host(), &node_api());
+    let (state, _ok, _data) = run_author(state, encode(Cmd::Inc(n)), &host(), &node_api());
     let state = notify(state);
     let c = current_count(&state);
     rpc_ok(state, Value::from(c))
@@ -222,7 +235,7 @@ fn reset(input: Value) -> Value {
         Ok(v) => v,
         Err(e) => return rpc_err(&e),
     };
-    let (state, _ok, _data) = run_author(state, encode(&Cmd::Reset), &host(), &node_api());
+    let (state, _ok, _data) = run_author(state, encode(Cmd::Reset), &host(), &node_api());
     let state = notify(state);
     let c = current_count(&state);
     rpc_ok(state, Value::from(c))
