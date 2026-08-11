@@ -109,10 +109,12 @@ struct InitPlan {
 }
 
 pack_types! {
-    // The node is GENERIC over the SM's state `s` (packr 0.13 M4): compose unifies `s` to
-    // the SM's concrete state. `s` is erased to the dynamic `Value` here — the node never
-    // inspects SM state, only shuttles it between validate/apply.
+    // The node is GENERIC over the SM's state `s` AND its payload `p` (packr 0.13 M4):
+    // compose unifies both to the SM's concrete types. Both are erased to the dynamic
+    // `Value` here — the node never inspects them, it just decodes the payload bytes to a
+    // typed value and shuttles state between validate/apply.
     type s: serializable
+    type p: serializable
     imports {
         // The node is I/O-FREE — it imports NO host functions, only the composed SM. A
         // non-entry composed component can't call host imports (theater rejects the
@@ -121,8 +123,8 @@ pack_types! {
         // synchronously on the fold hot path.
         state-machine {
             initial-state: func() -> s,
-            validate: func(id: list<u8>, author: list<u8>, timestamp: u64, payload: list<u8>, state: s) -> result<bool, string>,
-            apply: func(id: list<u8>, author: list<u8>, timestamp: u64, payload: list<u8>, state: s) -> s,
+            validate: func(id: list<u8>, author: list<u8>, timestamp: u64, payload: p, state: s) -> result<bool, string>,
+            apply: func(id: list<u8>, author: list<u8>, timestamp: u64, payload: p, state: s) -> s,
             members: func(state: s) -> list<list<u8>>,
         }
     }
@@ -157,11 +159,17 @@ fn sm_validate(
     id: Vec<u8>,
     author: Vec<u8>,
     timestamp: u64,
-    payload: Vec<u8>,
+    payload: Value,
     state: Value,
 ) -> Result<bool, String>;
 #[import_from("state-machine", name = "apply")]
-fn sm_apply(id: Vec<u8>, author: Vec<u8>, timestamp: u64, payload: Vec<u8>, state: Value) -> Value;
+fn sm_apply(id: Vec<u8>, author: Vec<u8>, timestamp: u64, payload: Value, state: Value) -> Value;
+
+/// Decode a payload's bytes into the typed value the SM expects (the erased `p`). The wire
+/// is the Graph-ABI encoding of the SM's payload type; `None` if it isn't well-formed.
+fn decode_payload(bytes: &[u8]) -> Option<Value> {
+    packr_guest::decode(bytes).ok()
+}
 #[import_from("state-machine", name = "members")]
 fn sm_members(state: Value) -> Vec<Vec<u8>>;
 
@@ -936,7 +944,8 @@ fn author_event(
     let ev = Event::sign(signing_key, now, self_parent, refs, payload);
     if !ev.payload.is_empty() {
         let state = current_state(dag, finality);
-        sm_validate(ev.event_hash().to_vec(), author.to_vec(), ev.timestamp, ev.payload.clone(), state)?;
+        let p = decode_payload(&ev.payload).ok_or_else(|| "undecodable payload".to_string())?;
+        sm_validate(ev.event_hash().to_vec(), author.to_vec(), ev.timestamp, p, state)?;
     }
     match dag.ingest(ev.clone())? {
         true => Ok(ev),
@@ -1081,7 +1090,9 @@ fn ensure_finality(dag: &Dag, finality: &mut BTreeMap<Hash, bool>) {
         let Some(ev) = dag.events.get(&h) else { continue };
         let ancestry_state = apply_final(dag, &deps_of(ev), finality);
         let final_here = ev.payload.is_empty()
-            || sm_validate(h.to_vec(), ev.author.to_vec(), ev.timestamp, ev.payload.clone(), ancestry_state).is_ok();
+            || decode_payload(&ev.payload)
+                .map(|p| sm_validate(h.to_vec(), ev.author.to_vec(), ev.timestamp, p, ancestry_state).is_ok())
+                .unwrap_or(false); // undecodable payload → not final (inert)
         finality.insert(h, final_here);
     }
 }
@@ -1092,7 +1103,11 @@ fn apply_final(dag: &Dag, frontier: &[Hash], is_final: &BTreeMap<Hash, bool>) ->
     for h in dag.topo_sort(&dag.ancestors_of(frontier)) {
         if is_final.get(&h).copied().unwrap_or(false) {
             if let Some(ev) = dag.events.get(&h) {
-                state = sm_apply(h.to_vec(), ev.author.to_vec(), ev.timestamp, ev.payload.clone(), state);
+                if !ev.payload.is_empty() {
+                    if let Some(p) = decode_payload(&ev.payload) {
+                        state = sm_apply(h.to_vec(), ev.author.to_vec(), ev.timestamp, p, state);
+                    }
+                }
             }
         }
     }
@@ -1119,10 +1134,12 @@ fn deliver_committed(
         if !finality.get(&h).copied().unwrap_or(false) {
             if delivered.insert(h) {
                 let state_at = apply_final(dag, &deps, finality);
-                let reason =
-                    sm_validate(h.to_vec(), ev.author.to_vec(), ev.timestamp, ev.payload.clone(), state_at)
+                let reason = match decode_payload(&ev.payload) {
+                    Some(p) => sm_validate(h.to_vec(), ev.author.to_vec(), ev.timestamp, p, state_at)
                         .err()
-                        .unwrap_or_else(|| "invalid against ancestry".to_string());
+                        .unwrap_or_else(|| "invalid against ancestry".to_string()),
+                    None => "undecodable payload".to_string(),
+                };
                 log(format!("[mesh] CONFLICT {}: {}", hex(&h), reason));
                 let frame = encode_conflict(&h, &reason);
                 for (cid, cs) in conns {

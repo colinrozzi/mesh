@@ -22,7 +22,12 @@
 //   id        : list<u8>  — 32-byte event hash (stable identity: corr_id journals, dedup)
 //   author    : list<u8>  — 32-byte signer pubkey (the SM gates membership on this)
 //   timestamp : u64       — author's wall clock (ms); SM may use for display / LWW
-//   payload   : list<u8>  — the SM's own event bytes: [version u16][kind][content]
+//   payload   : p         — the SM's own TYPED event value (a generic `p` the node is
+//                           parametric over). The node still stores/gossips/hashes the
+//                           payload as opaque bytes; it decodes bytes → `p` at the fold
+//                           and hands the SM a real value, so the SM never decodes. An
+//                           empty-payload graft (a node's own genesis/witness) skips the
+//                           SM entirely; bytes that don't decode to `p` are never final.
 // state is opaque bytes the SM owns and (de)serializes; the node never inspects it.
 //
 // Validate:  pact check state-machine.pact
@@ -37,11 +42,11 @@ interface state-machine {
         // the node has already folded and passes in)? Pure. Ok(true) = admit;
         // Err(reason) = inadmissible (reason is a human string for surfacing). A
         // genuine conflict is an Err against the consistent state at fold time.
-        validate: func(id: list<u8>, author: list<u8>, timestamp: u64, payload: list<u8>, state: list<u8>) -> result<bool, string>
+        validate: func(id: list<u8>, author: list<u8>, timestamp: u64, payload: p, state: list<u8>) -> result<bool, string>
 
         // Deterministic transition. Called ONLY on events that passed validate.
         // Returns the next state.
-        apply: func(id: list<u8>, author: list<u8>, timestamp: u64, payload: list<u8>, state: list<u8>) -> list<u8>
+        apply: func(id: list<u8>, author: list<u8>, timestamp: u64, payload: p, state: list<u8>) -> list<u8>
 
         // Project the current member set (32-byte pubkeys) from state. Feeds the
         // witness-based finality utility (witnesses(E) superset-of members). Dormant

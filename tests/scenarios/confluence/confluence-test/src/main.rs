@@ -30,31 +30,19 @@ const ADDR_B: &str = "127.0.0.1:9462";
 const ADDR_C: &str = "127.0.0.1:9463"; // seed bridge
 const ADDR_C2: &str = "127.0.0.1:9464"; // heal bridge (fresh port avoids TIME_WAIT)
 
-// ---- chat payload codec (mirrors chat-sm) ----
-const VERSION: u16 = 0;
+// ---- chat payloads via chat-protocol (Graph-ABI / packr) — one owner, no drift ----
+use chat_protocol::Msg;
 
 fn genesis(members: &[[u8; 32]]) -> Vec<u8> {
-    let mut o = VERSION.to_be_bytes().to_vec();
-    o.push(0);
-    o.extend_from_slice(&(members.len() as u16).to_be_bytes());
-    for m in members {
-        o.extend_from_slice(m);
-    }
-    o
+    chat_protocol::encode(&Msg::Genesis { members: members.iter().map(|m| m.to_vec()).collect() })
 }
 
 fn text(body: &str) -> Vec<u8> {
-    let mut o = VERSION.to_be_bytes().to_vec();
-    o.push(1);
-    o.extend_from_slice(body.as_bytes());
-    o
+    chat_protocol::encode(&Msg::Text { body: body.to_string() })
 }
 
 fn member_remove(subject: &[u8; 32]) -> Vec<u8> {
-    let mut o = VERSION.to_be_bytes().to_vec();
-    o.push(3);
-    o.extend_from_slice(subject);
-    o
+    chat_protocol::encode(&Msg::MemberRemove { subject: subject.to_vec() })
 }
 
 // ---- current-state (chat-sm ChatState) parse ----

@@ -27,40 +27,28 @@ const ADDR_B: &str = "127.0.0.1:9454";
 const SEED_A: &str = "rsm-chat-alice-seed";
 const SEED_B: &str = "rsm-chat-bob-seed";
 
-// ---- chat payload codec: [version u16][kind u8][content] (mirrors chat-sm) ----
-const VERSION: u16 = 0;
+// ---- chat payloads via chat-protocol (Graph-ABI / packr) — one owner, no drift ----
+use chat_protocol::Msg;
 
 fn genesis(members: &[[u8; 32]]) -> Vec<u8> {
-    let mut o = VERSION.to_be_bytes().to_vec();
-    o.push(0);
-    o.extend_from_slice(&(members.len() as u16).to_be_bytes());
-    for m in members {
-        o.extend_from_slice(m);
-    }
-    o
+    chat_protocol::encode(&Msg::Genesis { members: members.iter().map(|m| m.to_vec()).collect() })
 }
 
 fn text(body: &str) -> Vec<u8> {
-    let mut o = VERSION.to_be_bytes().to_vec();
-    o.push(1);
-    o.extend_from_slice(body.as_bytes());
-    o
+    chat_protocol::encode(&Msg::Text { body: body.to_string() })
 }
 
 fn member_add(subject: &[u8; 32]) -> Vec<u8> {
-    let mut o = VERSION.to_be_bytes().to_vec();
-    o.push(2);
-    o.extend_from_slice(subject);
-    o
+    chat_protocol::encode(&Msg::MemberAdd { subject: subject.to_vec() })
 }
 
 /// Decode a `text` payload → its body. `None` for any other kind so the receive
 /// loop skips genesis/member-add NOTIFYs.
 fn decode_text(p: &[u8]) -> Option<String> {
-    if p.len() < 3 || u16::from_be_bytes([p[0], p[1]]) != VERSION || p[2] != 1 {
-        return None;
+    match chat_protocol::decode(p)? {
+        Msg::Text { body } => Some(body),
+        _ => None,
     }
-    String::from_utf8(p[3..].to_vec()).ok()
 }
 
 fn write_manifest(path: &str, seed: &str, addr: &str, dial: Option<(&str, &str)>, store: &str) {

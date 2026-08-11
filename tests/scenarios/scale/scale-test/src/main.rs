@@ -22,27 +22,19 @@ use std::time::{Duration, Instant};
 
 const WASM: &str = "target/wasm32-unknown-unknown/release/mesh_chat.wasm";
 const BASE_PORT: u16 = 9481;
-const VERSION: u16 = 0;
+
+use chat_protocol::Msg;
 
 fn env_usize(key: &str, default: usize) -> usize {
     std::env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
 }
 
 fn genesis(members: &[[u8; 32]]) -> Vec<u8> {
-    let mut o = VERSION.to_be_bytes().to_vec();
-    o.push(0);
-    o.extend_from_slice(&(members.len() as u16).to_be_bytes());
-    for m in members {
-        o.extend_from_slice(m);
-    }
-    o
+    chat_protocol::encode(&Msg::Genesis { members: members.iter().map(|m| m.to_vec()).collect() })
 }
 
 fn text(body: &str) -> Vec<u8> {
-    let mut o = VERSION.to_be_bytes().to_vec();
-    o.push(1);
-    o.extend_from_slice(body.as_bytes());
-    o
+    chat_protocol::encode(&Msg::Text { body: body.to_string() })
 }
 
 #[derive(Deserialize)]

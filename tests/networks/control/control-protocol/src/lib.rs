@@ -1,10 +1,9 @@
-//! `control-protocol` — the control-plane payload wire, and nothing else.
+//! `control-protocol` — the control-plane payload schema, as a typed value.
 //!
-//! The 5 kinds + their `[version: u16 BE][kind: u8][content]` encoding, shared by
-//! `control-sm` (validate/apply over decoded kinds) and the sentinel executors
-//! (`sentinel.system` / `sentinelctl.system`, which encode what they Submit and decode
-//! `finalized` payloads). One codec, one owner, zero wire drift. No state-machine
-//! logic lives here — that is `control-sm`, which imports this.
+//! The 5 kinds as a `#[derive(GraphValue)]` enum that marshals through the Graph ABI, so
+//! the node hands `control-sm` a real `Msg` (typed payload — the node is generic over the
+//! payload `p`) and consumers build+encode the same type. `encode`/`decode` are one-liners
+//! over the ABI — no hand-rolled cursor. One codec, one owner, zero wire drift.
 
 #![cfg_attr(not(test), no_std)]
 extern crate alloc;
@@ -12,10 +11,10 @@ extern crate alloc;
 use alloc::string::String;
 use alloc::vec::Vec;
 
-/// Wire version; bump on any incompatible codec change.
-pub const VERSION: u16 = 0;
+use packr_guest::{decode as abi_decode, encode as abi_encode, GraphValue, Value};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, GraphValue)]
+#[graph(crate = "packr_guest::composite_abi")]
 pub enum Msg {
     /// The bootstrap: seed members + allow-lists (valid only as the causal root).
     Genesis { members: Vec<Vec<u8>>, join_allow: Vec<Vec<u8>>, command_allow: Vec<Vec<u8>> },
@@ -25,105 +24,14 @@ pub enum Msg {
     Response { corr_id: u64, cmd_author: Vec<u8>, result: Vec<u8> },
 }
 
-fn put_keys(out: &mut Vec<u8>, keys: &[Vec<u8>]) {
-    out.extend_from_slice(&(keys.len() as u16).to_be_bytes());
-    for k in keys {
-        out.extend_from_slice(k);
-    }
-}
-
-/// Build a control payload. Public so a system/harness encodes what it Submits.
+/// Encode a control payload via the Graph ABI.
 pub fn encode(msg: &Msg) -> Vec<u8> {
-    let mut out = VERSION.to_be_bytes().to_vec();
-    match msg {
-        Msg::Genesis { members, join_allow, command_allow } => {
-            out.push(0);
-            put_keys(&mut out, members);
-            put_keys(&mut out, join_allow);
-            put_keys(&mut out, command_allow);
-        }
-        Msg::JoinRequest => out.push(1),
-        Msg::Depart => out.push(2),
-        Msg::Command { corr_id, verb, args } => {
-            out.push(3);
-            out.extend_from_slice(&corr_id.to_be_bytes());
-            out.extend_from_slice(&(verb.len() as u16).to_be_bytes());
-            out.extend_from_slice(verb.as_bytes());
-            out.extend_from_slice(args);
-        }
-        Msg::Response { corr_id, cmd_author, result } => {
-            out.push(4);
-            out.extend_from_slice(&corr_id.to_be_bytes());
-            out.extend_from_slice(cmd_author);
-            out.extend_from_slice(result);
-        }
-    }
-    out
+    abi_encode(&Value::from(msg.clone())).unwrap_or_default()
 }
 
-/// Decode a control payload. `None` on wrong version, unknown kind, or truncation.
+/// Decode a control payload; `None` on anything not a well-formed `Msg`.
 pub fn decode(payload: &[u8]) -> Option<Msg> {
-    let mut c = Cur { b: payload, p: 0 };
-    if c.u16()? != VERSION {
-        return None;
-    }
-    match c.u8()? {
-        0 => Some(Msg::Genesis {
-            members: c.keys()?,
-            join_allow: c.keys()?,
-            command_allow: c.keys()?,
-        }),
-        1 => Some(Msg::JoinRequest),
-        2 => Some(Msg::Depart),
-        3 => Some(Msg::Command { corr_id: c.u64()?, verb: c.string()?, args: c.rest() }),
-        4 => Some(Msg::Response { corr_id: c.u64()?, cmd_author: c.key()?, result: c.rest() }),
-        _ => None,
-    }
-}
-
-struct Cur<'a> {
-    b: &'a [u8],
-    p: usize,
-}
-impl<'a> Cur<'a> {
-    fn take(&mut self, n: usize) -> Option<&'a [u8]> {
-        let e = self.p.checked_add(n)?;
-        if e > self.b.len() {
-            return None;
-        }
-        let s = &self.b[self.p..e];
-        self.p = e;
-        Some(s)
-    }
-    fn u8(&mut self) -> Option<u8> {
-        Some(self.take(1)?[0])
-    }
-    fn u16(&mut self) -> Option<u16> {
-        let b = self.take(2)?;
-        Some(u16::from_be_bytes([b[0], b[1]]))
-    }
-    fn u64(&mut self) -> Option<u64> {
-        let b = self.take(8)?;
-        Some(u64::from_be_bytes(b.try_into().ok()?))
-    }
-    fn key(&mut self) -> Option<Vec<u8>> {
-        Some(self.take(32)?.to_vec())
-    }
-    fn keys(&mut self) -> Option<Vec<Vec<u8>>> {
-        let n = self.u16()? as usize;
-        let mut out = Vec::with_capacity(n);
-        for _ in 0..n {
-            out.push(self.key()?);
-        }
-        Some(out)
-    }
-    fn string(&mut self) -> Option<String> {
-        let n = self.u16()? as usize;
-        String::from_utf8(self.take(n)?.to_vec()).ok()
-    }
-    fn rest(&mut self) -> Vec<u8> {
-        self.b[self.p..].to_vec()
-    }
+    abi_decode(payload).ok().and_then(|v| Msg::try_from(v).ok())
 }
 
 #[cfg(test)]
@@ -146,9 +54,8 @@ mod tests {
     }
 
     #[test]
-    fn rejects_bad() {
+    fn rejects_garbage() {
         assert_eq!(decode(&[]), None);
-        assert_eq!(decode(&[0, 1, 0]), None); // wrong version
-        assert_eq!(decode(&[0, 0, 9]), None); // unknown kind
+        assert_eq!(decode(&[1, 2, 3, 4, 5]), None);
     }
 }

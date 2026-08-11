@@ -8,4 +8,5 @@ name = "mesh-chat-smoke-test"
 path = "src/main.rs"
 
 [dependencies]
+chat-protocol = { path = "../../../networks/chat/chat-protocol" }
 mesh-testkit = { path = "../../../testkit" }

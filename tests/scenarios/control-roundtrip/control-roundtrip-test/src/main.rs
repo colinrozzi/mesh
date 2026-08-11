@@ -29,63 +29,46 @@ const ADDR_M: &str = "127.0.0.1:9452";
 const SEED_S: &str = "rsm-control-sentinel-seed";
 const SEED_M: &str = "rsm-control-manager-seed";
 
-// ---- control payload codec: [version u16][kind u8][content] ----
-// A faithful mirror of control-sm's private codec — this harness is the "system"
-// side that encodes what it Submits and decodes what it receives. Kept tiny and
-// standalone on purpose (the oracle must not share code with what it tests).
-const VERSION: u16 = 0;
-
-fn put_keys(out: &mut Vec<u8>, keys: &[[u8; 32]]) {
-    out.extend_from_slice(&(keys.len() as u16).to_be_bytes());
-    for k in keys {
-        out.extend_from_slice(k);
-    }
-}
+// ---- control payloads via control-protocol (Graph-ABI / packr) — one owner, no drift ----
+// This harness is the "system" side: it encodes the typed `Msg` it Submits and decodes
+// the typed `Msg` it receives, through the SAME schema control-sm now takes as its payload.
+use control_protocol::Msg;
 
 fn genesis(members: &[[u8; 32]], join_allow: &[[u8; 32]], command_allow: &[[u8; 32]]) -> Vec<u8> {
-    let mut o = VERSION.to_be_bytes().to_vec();
-    o.push(0);
-    put_keys(&mut o, members);
-    put_keys(&mut o, join_allow);
-    put_keys(&mut o, command_allow);
-    o
+    let v = |ks: &[[u8; 32]]| -> Vec<Vec<u8>> { ks.iter().map(|k| k.to_vec()).collect() };
+    control_protocol::encode(&Msg::Genesis {
+        members: v(members),
+        join_allow: v(join_allow),
+        command_allow: v(command_allow),
+    })
 }
 
 fn join_request() -> Vec<u8> {
-    let mut o = VERSION.to_be_bytes().to_vec();
-    o.push(1);
-    o
+    control_protocol::encode(&Msg::JoinRequest)
 }
 
 fn command(corr_id: u64, verb: &str, args: &[u8]) -> Vec<u8> {
-    let mut o = VERSION.to_be_bytes().to_vec();
-    o.push(3);
-    o.extend_from_slice(&corr_id.to_be_bytes());
-    o.extend_from_slice(&(verb.len() as u16).to_be_bytes());
-    o.extend_from_slice(verb.as_bytes());
-    o.extend_from_slice(args);
-    o
+    control_protocol::encode(&Msg::Command { corr_id, verb: verb.to_string(), args: args.to_vec() })
 }
 
 fn response(corr_id: u64, cmd_author: &[u8; 32], result: &[u8]) -> Vec<u8> {
-    let mut o = VERSION.to_be_bytes().to_vec();
-    o.push(4);
-    o.extend_from_slice(&corr_id.to_be_bytes());
-    o.extend_from_slice(cmd_author);
-    o.extend_from_slice(result);
-    o
+    control_protocol::encode(&Msg::Response {
+        corr_id,
+        cmd_author: cmd_author.to_vec(),
+        result: result.to_vec(),
+    })
 }
 
 /// Decode a Response payload → (corr_id, cmd_author, result). `None` for any other
 /// kind, so the receive loop can skip the genesis/join/command NOTIFYs.
 fn decode_response(p: &[u8]) -> Option<(u64, [u8; 32], Vec<u8>)> {
-    if p.len() < 3 || u16::from_be_bytes([p[0], p[1]]) != VERSION || p[2] != 4 {
-        return None;
+    match control_protocol::decode(p)? {
+        Msg::Response { corr_id, cmd_author, result } => {
+            let author: [u8; 32] = cmd_author.try_into().ok()?;
+            Some((corr_id, author, result))
+        }
+        _ => None,
     }
-    let corr_id = u64::from_be_bytes(p.get(3..11)?.try_into().ok()?);
-    let mut author = [0u8; 32];
-    author.copy_from_slice(p.get(11..43)?);
-    Some((corr_id, author, p[43..].to_vec()))
 }
 
 fn write_manifest(path: &str, seed: &str, addr: &str, dial: Option<(&str, &str)>, store: &str) {

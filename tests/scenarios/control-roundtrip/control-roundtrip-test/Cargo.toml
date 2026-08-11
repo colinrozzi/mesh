@@ -9,3 +9,4 @@ path = "src/main.rs"
 
 [dependencies]
 mesh-testkit = { path = "../../../testkit" }
+control-protocol = { path = "../../../networks/control/control-protocol" }

@@ -1,0 +1,8 @@
+[package]
+name = "chat-protocol"
+version = "0.1.0"
+edition = "2021"
+description = "The chat network's payload schema: the `Msg` kinds as a #[derive(GraphValue)] enum that marshals through the Graph ABI. Shared by chat-sm (which now receives a TYPED Msg — the node is generic over the payload) and the chat test harnesses, so the wire has one owner."
+
+[dependencies]
+packr-guest = { version = "0.13.1", features = ["derive"] }
