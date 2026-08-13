@@ -22,10 +22,8 @@
 //! Partition model mirrors the confluence test: A and B are stable and never dial each
 //! other; a bridge node is "the network" (spawn = link, kill = partition, respawn = heal).
 
-use bank_protocol::Cmd;
+use bank_protocol::{BankState, Cmd};
 use mesh_testkit::{hex, pubkey, seeded_key, spawn_mesh, wait_for_port, Client};
-use serde::Deserialize;
-use std::collections::BTreeMap;
 use std::fs;
 use std::process::Child;
 use std::time::Duration;
@@ -44,17 +42,10 @@ fn transfer(from: &str, to: &str, amount: u64) -> Vec<u8> {
     bank_protocol::encode(&Cmd::Transfer { from: from.to_string(), to: to.to_string(), amount })
 }
 
-#[derive(Deserialize)]
-struct BankView {
-    wallets: BTreeMap<String, i64>,
-}
-impl BankView {
-    fn parse(bytes: &[u8]) -> Result<BankView, String> {
-        serde_json::from_slice(bytes).map_err(|e| format!("parse current-state: {e}"))
-    }
-    fn bal(&self, w: &str) -> i64 {
-        self.wallets.get(w).copied().unwrap_or(0)
-    }
+// The node's `current-state` returns bank-sm's TYPED state on the wire (Graph ABI), so the
+// harness decodes it through the SAME `BankState` schema the SM folds — no serde, one owner.
+fn parse_state(bytes: &[u8]) -> Result<BankState, String> {
+    bank_protocol::decode_state(bytes).ok_or_else(|| "decode current-state (BankState)".to_string())
 }
 
 fn write_manifest(path: &str, seed: &str, addr: &str, dials: &[(&str, &str)], store: &str) {
@@ -108,11 +99,11 @@ fn spawn(seed: &str, addr: &str, dials: &[(&str, &str)], tag: &str) -> Result<Ch
     Ok(child)
 }
 
-fn state_of(addr: &str, observer_seed: &str) -> Result<(Vec<u8>, BankView), String> {
+fn state_of(addr: &str, observer_seed: &str) -> Result<(Vec<u8>, BankState), String> {
     let key = seeded_key(observer_seed);
     let mut c = Client::connect(addr, &key).map_err(|e| format!("connect {addr}: {e}"))?;
     let bytes = c.current_state().map_err(|e| format!("current-state {addr}: {e}"))?;
-    let parsed = BankView::parse(&bytes)?;
+    let parsed = parse_state(&bytes)?;
     Ok((bytes, parsed))
 }
 
@@ -161,8 +152,8 @@ fn run() -> Result<(), String> {
 
     for (addr, seed) in [(ADDR_A, "obs-a1"), (ADDR_B, "obs-b1")] {
         let (_, st) = ok_or_bail!(state_of(addr, seed), "seed checkpoint");
-        if st.bal("alice") != 100 {
-            bail!(format!("seed failed: {addr} sees alice={}, want 100", st.bal("alice")));
+        if st.balance("alice") != 100 {
+            bail!(format!("seed failed: {addr} sees alice={}, want 100", st.balance("alice")));
         }
     }
     println!("✓ alice=100 seeded to BOTH A and B");
@@ -188,11 +179,11 @@ fn run() -> Result<(), String> {
     {
         let (_, sa) = ok_or_bail!(state_of(ADDR_A, "obs-a2"), "A partitioned state");
         let (_, sb) = ok_or_bail!(state_of(ADDR_B, "obs-b2"), "B partitioned state");
-        if sa.bal("alice") != 40 || sa.bal("bob") != 60 {
-            bail!(format!("A should show alice=40,bob=60; got alice={},bob={}", sa.bal("alice"), sa.bal("bob")));
+        if sa.balance("alice") != 40 || sa.balance("bob") != 60 {
+            bail!(format!("A should show alice=40,bob=60; got alice={},bob={}", sa.balance("alice"), sa.balance("bob")));
         }
-        if sb.bal("alice") != 40 || sb.bal("carol") != 60 {
-            bail!(format!("B should show alice=40,carol=60; got alice={},carol={}", sb.bal("alice"), sb.bal("carol")));
+        if sb.balance("alice") != 40 || sb.balance("carol") != 60 {
+            bail!(format!("B should show alice=40,carol=60; got alice={},carol={}", sb.balance("alice"), sb.balance("carol")));
         }
         println!("✓ partition confirmed divergent: A={{alice:40,bob:60}}, B={{alice:40,carol:60}}");
     }
@@ -228,15 +219,15 @@ fn run() -> Result<(), String> {
 
     // The frontier: BOTH transfers finalized (admission-final) → alice overdrawn. The
     // substrate is consistent but the invariant is broken.
-    if sa.bal("alice") != -20 || sa.bal("bob") != 60 || sa.bal("carol") != 60 {
+    if sa.balance("alice") != -20 || sa.balance("bob") != 60 || sa.balance("carol") != 60 {
         bail!(format!(
             "expected the double-spend to land: alice=-20,bob=60,carol=60; got alice={},bob={},carol={}",
-            sa.bal("alice"),
-            sa.bal("bob"),
-            sa.bal("carol")
+            sa.balance("alice"),
+            sa.balance("bob"),
+            sa.balance("carol")
         ));
     }
-    println!("✓ DOUBLE-SPEND ADMITTED: alice={} (100−60−60), bob=60, carol=60", sa.bal("alice"));
+    println!("✓ DOUBLE-SPEND ADMITTED: alice={} (100−60−60), bob=60, carol=60", sa.balance("alice"));
     println!("  → the substrate is CONSISTENT (both nodes agree) but the currency invariant is broken:");
     println!("    admission-final finality is not sufficient for a conflict-prone SM. This is the");
     println!("    exact case the deferred witness-finality bundle would reject one transfer for.");

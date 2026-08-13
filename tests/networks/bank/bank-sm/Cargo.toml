@@ -8,10 +8,8 @@ description = "A currency/bank as an RSM state-machine (DESIGN-rsm.md Interface 
 crate-type = ["cdylib"]
 
 [dependencies]
-packr-guest = "0.13.0"
+packr-guest = "0.15"
 bank-protocol = { path = "../bank-protocol" }
-serde = { version = "1", default-features = false, features = ["alloc", "derive"] }
-serde_json = { version = "1", default-features = false, features = ["alloc"] }
 
 [profile.release]
 opt-level = "s"

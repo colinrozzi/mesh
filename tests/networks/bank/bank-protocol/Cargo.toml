@@ -5,4 +5,4 @@ edition = "2021"
 description = "Bank/currency payload codec: Mint / Transfer kinds. Shared by bank-sm and the bank executor. The first CONFLICT-PRONE SM's wire (a transfer's validity depends on a balance, so concurrent transfers from one wallet can double-spend)."
 
 [dependencies]
-packr-guest = { version = "0.13.0", features = ["derive"] }
+packr-guest = { version = "0.15", features = ["derive"] }

@@ -193,22 +193,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "itoa"
-version = "1.0.18"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
-
-[[package]]
 name = "libc"
 version = "0.2.189"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
-
-[[package]]
-name = "memchr"
-version = "2.8.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
 name = "mesh-bank-double-spend-test"
@@ -216,8 +204,6 @@ version = "0.1.0"
 dependencies = [
  "bank-protocol",
  "mesh-testkit",
- "serde",
- "serde_json",
 ]
 
 [[package]]
@@ -236,9 +222,9 @@ checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
 
 [[package]]
 name = "packr-abi"
-version = "0.13.0"
+version = "0.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "da5bdb649ff161101ff7820fa2d497835eef5cbe47683fd8fb1d225e00795984"
+checksum = "097ecf6bd6def8017da416e1eb27253914f1303ca46328ecd518d2a5d6a7f6d1"
 dependencies = [
  "hashbrown",
  "sha2",
@@ -246,9 +232,9 @@ dependencies = [
 
 [[package]]
 name = "packr-derive"
-version = "0.13.0"
+version = "0.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6234f8e2221184dc656f4e7842a8863fe881a778f4bd9fd53be005076d0c0b3a"
+checksum = "d577db80ca6de88c29840ef662f9114ef6ec39e4899632af6d982ea4a4ddece7"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -257,9 +243,9 @@ dependencies = [
 
 [[package]]
 name = "packr-guest"
-version = "0.13.0"
+version = "0.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "df9f5cbbadae71280d893f5197d8f0ee9ef55a108b973f0027bd4b50efeab0c5"
+checksum = "c1ace4108207a43074ecb5edfccb315201cd989251f65fca99766177e910def1"
 dependencies = [
  "dlmalloc",
  "packr-abi",
@@ -269,9 +255,9 @@ dependencies = [
 
 [[package]]
 name = "packr-guest-macros"
-version = "0.13.0"
+version = "0.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "69a43527fb87964d3a38b4b95ab2e18e3243477ed31ae5ee1da7993259601050"
+checksum = "d8edecf13ce7adc2d749ee46fa3dec33c846af7abb24f5c01ddcc59e1732c9fe"
 dependencies = [
  "packr-abi",
  "proc-macro2",
@@ -338,7 +324,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4148590afebada386688f18773da617792bf2ef03ffc1e4cbd2b1d45b023e0ba"
 dependencies = [
  "serde_core",
- "serde_derive",
 ]
 
 [[package]]
@@ -359,19 +344,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 3.0.3",
-]
-
-[[package]]
-name = "serde_json"
-version = "1.0.151"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c841b55ecdae098c80dcae9cf767f6f8a0c2cdb3416bbef72181df4d0fe73f14"
-dependencies = [
- "itoa",
- "memchr",
- "serde",
- "serde_core",
- "zmij",
 ]
 
 [[package]]
@@ -496,9 +468,3 @@ name = "zeroize"
 version = "1.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e13c156562582aa81c60cb29407084cdb54c4164760106ab78e6c5b0858cf64e"
-
-[[package]]
-name = "zmij"
-version = "1.0.23"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
