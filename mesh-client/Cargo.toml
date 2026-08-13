@@ -5,4 +5,4 @@ edition = "2021"
 description = "The mesh system SDK (mesh-client v2): the guest-side Session an executor drives its node through — RPC for actions (author + read verbs + subscribe) and a decoder for the message-server finalized stream. Wraps every theater-RPC quirk (double result-unwrap, in-band tuple returns, no-arg param shape, dag-node frame layout) so an executor writes app logic, not glue."
 
 [dependencies]
-packr-guest = "0.13.0"
+packr-guest = "0.15"

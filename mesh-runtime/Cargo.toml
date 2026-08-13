@@ -8,4 +8,4 @@ description = "The reusable system-entry framework for mesh: the generic glue th
 crate-type = ["rlib"]
 
 [dependencies]
-packr-guest = { version = "0.13.0", features = ["derive"] }
+packr-guest = { version = "0.15", features = ["derive"] }

@@ -5,4 +5,4 @@ edition = "2021"
 description = "The control-plane payload schema: the 5 kinds (genesis / join-request / depart / command / response) as a #[derive(GraphValue)] enum + encode/decode one-liners over the Graph ABI (no validate/apply). Shared by control-sm (which now receives a TYPED Msg) and any executor, so there is one owner, zero wire drift."
 
 [dependencies]
-packr-guest = { version = "0.13.1", features = ["derive"] }
+packr-guest = { version = "0.15", features = ["derive"] }
