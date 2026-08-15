@@ -6,8 +6,9 @@
 //! Admission-final under the **no-kick invariant** (membership shrinks only via causal
 //! self-`depart`). Config (members + allow-lists) arrives as a **genesis event**.
 //!
-//! The payload arrives **typed** as a `control_protocol::Msg` (the node is generic over the
-//! payload `p`) — no `decode` in the SM. State is opaque bytes (serde).
+//! The payload arrives **typed** as `Msg` (a variant over records), generated from the
+//! shared `control.wit` via `wit!(from …)` — no protocol crate, no `decode` in the SM (the
+//! node is generic over the payload `p`). State is opaque bytes (serde).
 
 #![cfg_attr(not(test), no_std)]
 extern crate alloc;
@@ -16,12 +17,15 @@ use alloc::collections::BTreeSet;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
-use control_protocol::Msg;
 use packr_guest::export;
 use serde::{Deserialize, Serialize};
 
 #[cfg(not(test))]
 packr_guest::setup_guest!();
+
+// `Msg` + its payload records (GenesisCfg / CommandBody / ResponseBody), generated from the
+// shared `control.wit` (one source of truth).
+packr_guest::wit!(from "../control.wit");
 
 packr_guest::pack_types! {
     exports {
@@ -73,7 +77,7 @@ impl ControlState {
 fn do_validate(author: &[u8], msg: &Msg, state: &[u8]) -> Result<bool, String> {
     let s = ControlState::decode(state);
     match msg {
-        Msg::Genesis { .. } => {
+        Msg::Genesis(_) => {
             if s.members.is_empty() && s.join_allow.is_empty() && s.command_allow.is_empty() {
                 Ok(true)
             } else {
@@ -94,7 +98,7 @@ fn do_validate(author: &[u8], msg: &Msg, state: &[u8]) -> Result<bool, String> {
                 Err("depart: author is not a member".to_string())
             }
         }
-        Msg::Command { corr_id, .. } => {
+        Msg::Command(CommandBody { corr_id, .. }) => {
             if !s.members.contains(author) {
                 Err("command: author is not a member".to_string())
             } else if !s.command_allow.contains(author) {
@@ -105,7 +109,7 @@ fn do_validate(author: &[u8], msg: &Msg, state: &[u8]) -> Result<bool, String> {
                 Ok(true)
             }
         }
-        Msg::Response { corr_id, cmd_author, .. } => {
+        Msg::Response(ResponseBody { corr_id, cmd_author, .. }) => {
             if !s.members.contains(author) {
                 return Err("response: author is not a member".to_string());
             }
@@ -121,7 +125,7 @@ fn do_validate(author: &[u8], msg: &Msg, state: &[u8]) -> Result<bool, String> {
 fn do_apply(author: &[u8], msg: Msg, state: &[u8]) -> Vec<u8> {
     let mut s = ControlState::decode(state);
     match msg {
-        Msg::Genesis { members, join_allow, command_allow } => {
+        Msg::Genesis(GenesisCfg { members, join_allow, command_allow }) => {
             s.members = members.into_iter().collect();
             s.join_allow = join_allow.into_iter().collect();
             s.command_allow = command_allow.into_iter().collect();
@@ -132,10 +136,10 @@ fn do_apply(author: &[u8], msg: Msg, state: &[u8]) -> Vec<u8> {
         Msg::Depart => {
             s.members.remove(author);
         }
-        Msg::Command { corr_id, verb, args } => {
+        Msg::Command(CommandBody { corr_id, verb, args }) => {
             s.journal.push(Entry { author: author.to_vec(), corr_id, verb, args, response: None });
         }
-        Msg::Response { corr_id, cmd_author, result } => {
+        Msg::Response(ResponseBody { corr_id, cmd_author, result }) => {
             if let Some(e) = s.journal.iter_mut().find(|e| e.author == cmd_author && e.corr_id == corr_id) {
                 e.response = Some(result);
             }
@@ -196,11 +200,11 @@ mod tests {
     }
 
     fn genesis() -> Msg {
-        Msg::Genesis {
+        Msg::Genesis(GenesisCfg {
             members: alloc::vec![sentinel()],
             join_allow: alloc::vec![manager()],
             command_allow: alloc::vec![manager()],
-        }
+        })
     }
 
     #[test]
@@ -229,7 +233,7 @@ mod tests {
     #[test]
     fn command_requires_membership_and_command_allow_and_fresh_corrid() {
         let s = fold(b"", &[(sentinel(), genesis()), (manager(), Msg::JoinRequest)]);
-        let cmd = |c| Msg::Command { corr_id: c, verb: "list".into(), args: alloc::vec![] };
+        let cmd = |c| Msg::Command(CommandBody { corr_id: c, verb: "list".into(), args: alloc::vec![] });
         assert!(do_validate(&manager(), &cmd(1), &s).is_ok());
         assert!(do_validate(&stranger(), &cmd(1), &s).is_err());
         let s2 = fold(&s, &[(manager(), cmd(1))]);
@@ -239,15 +243,15 @@ mod tests {
 
     #[test]
     fn response_answers_a_pending_command_once() {
-        let cmd = Msg::Command { corr_id: 7, verb: "list".into(), args: alloc::vec![] };
+        let cmd = Msg::Command(CommandBody { corr_id: 7, verb: "list".into(), args: alloc::vec![] });
         let s = fold(b"", &[(sentinel(), genesis()), (manager(), Msg::JoinRequest), (manager(), cmd)]);
-        let resp = |r: &[u8]| Msg::Response { corr_id: 7, cmd_author: manager(), result: r.to_vec() };
+        let resp = |r: &[u8]| Msg::Response(ResponseBody { corr_id: 7, cmd_author: manager(), result: r.to_vec() });
         assert!(do_validate(&sentinel(), &resp(b"ok"), &s).is_ok());
         let s2 = fold(&s, &[(sentinel(), resp(b"ok"))]);
         let st = ControlState::decode(&s2);
         assert_eq!(st.entry(&manager(), 7).unwrap().response.as_deref(), Some(&b"ok"[..]));
         assert!(do_validate(&sentinel(), &resp(b"again"), &s2).is_err(), "already answered");
-        assert!(do_validate(&sentinel(), &Msg::Response { corr_id: 99, cmd_author: manager(), result: alloc::vec![] }, &s2).is_err());
+        assert!(do_validate(&sentinel(), &Msg::Response(ResponseBody { corr_id: 99, cmd_author: manager(), result: alloc::vec![] }), &s2).is_err());
     }
 
     #[test]

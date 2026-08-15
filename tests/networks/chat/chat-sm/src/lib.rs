@@ -9,8 +9,9 @@
 //! `member-remove` deletes only the `(subject, tag)` pairs in the event's ANCESTRY state,
 //! so a concurrent add survives — add-wins from ancestry-relative validity.
 //!
-//! The payload arrives **typed** as a `chat_protocol::Msg` (the node is generic over the
-//! payload `p`) — no `decode` in the SM. State is opaque bytes (serde).
+//! The payload arrives **typed** as `Msg`, generated from the shared `chat.wit` via
+//! `wit!(from …)` — no protocol crate, no `decode` in the SM (the node is generic over the
+//! payload `p`). State is opaque bytes (serde).
 
 #![cfg_attr(not(test), no_std)]
 extern crate alloc;
@@ -19,12 +20,14 @@ use alloc::collections::BTreeSet;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
-use chat_protocol::Msg;
 use packr_guest::export;
 use serde::{Deserialize, Serialize};
 
 #[cfg(not(test))]
 packr_guest::setup_guest!();
+
+// `Msg` — the chat payload, generated from the shared `chat.wit` (one source of truth).
+packr_guest::wit!(from "../chat.wit");
 
 packr_guest::pack_types! {
     exports {
@@ -77,7 +80,7 @@ impl ChatState {
 fn do_validate(author: &[u8], msg: &Msg, state: &[u8]) -> Result<bool, String> {
     let s = ChatState::decode(state);
     match msg {
-        Msg::Genesis { .. } => {
+        Msg::Genesis(_) => {
             if s.is_empty_seed() {
                 Ok(true)
             } else {
@@ -85,7 +88,7 @@ fn do_validate(author: &[u8], msg: &Msg, state: &[u8]) -> Result<bool, String> {
             }
         }
         // v0: any member may post / add / remove (OR-Set makes add/remove race-safe).
-        Msg::Text { .. } | Msg::MemberAdd { .. } | Msg::MemberRemove { .. } => {
+        Msg::Text(_) | Msg::MemberAdd(_) | Msg::MemberRemove(_) => {
             if s.is_member(author) {
                 Ok(true)
             } else {
@@ -98,18 +101,18 @@ fn do_validate(author: &[u8], msg: &Msg, state: &[u8]) -> Result<bool, String> {
 fn do_apply(id: &[u8], author: &[u8], ts: u64, msg: Msg, state: &[u8]) -> Vec<u8> {
     let mut s = ChatState::decode(state);
     match msg {
-        Msg::Genesis { members } => {
+        Msg::Genesis(members) => {
             for m in members {
                 s.members.insert((m, id.to_vec()));
             }
         }
-        Msg::Text { body } => {
+        Msg::Text(body) => {
             s.log.push(Message { id: id.to_vec(), author: author.to_vec(), ts, body });
         }
-        Msg::MemberAdd { subject } => {
+        Msg::MemberAdd(subject) => {
             s.members.insert((subject, id.to_vec()));
         }
-        Msg::MemberRemove { subject } => {
+        Msg::MemberRemove(subject) => {
             s.members.retain(|(pk, _)| pk != &subject);
         }
     }
@@ -181,10 +184,10 @@ mod tests {
     }
 
     fn genesis(ms: &[Vec<u8>]) -> Msg {
-        Msg::Genesis { members: ms.to_vec() }
+        Msg::Genesis(ms.to_vec())
     }
     fn text(b: &str) -> Msg {
-        Msg::Text { body: b.to_string() }
+        Msg::Text(b.to_string())
     }
 
     #[test]
@@ -209,7 +212,7 @@ mod tests {
     fn member_add_admits_a_new_poster() {
         let s = fold(b"", &[(id(0), alice(), genesis(&[alice()]))]);
         assert!(do_validate(&bob(), &text("hi"), &s).is_err());
-        let s2 = fold(&s, &[(id(1), alice(), Msg::MemberAdd { subject: bob() })]);
+        let s2 = fold(&s, &[(id(1), alice(), Msg::MemberAdd(bob()))]);
         assert!(ChatState::decode(&s2).is_member(&bob()));
         assert!(do_validate(&bob(), &text("now i can"), &s2).is_ok());
     }
@@ -220,14 +223,14 @@ mod tests {
             b"",
             &[
                 (id(0), alice(), genesis(&[alice()])),
-                (id(1), alice(), Msg::MemberAdd { subject: bob() }),
+                (id(1), alice(), Msg::MemberAdd(bob())),
             ],
         );
-        let s_concurrent = do_apply(&id(2), &alice(), 0, Msg::MemberAdd { subject: bob() }, &s);
-        let s_removed = do_apply(&id(3), &alice(), 0, Msg::MemberRemove { subject: bob() }, &s_concurrent);
+        let s_concurrent = do_apply(&id(2), &alice(), 0, Msg::MemberAdd(bob()), &s);
+        let s_removed = do_apply(&id(3), &alice(), 0, Msg::MemberRemove(bob()), &s_concurrent);
         assert!(!ChatState::decode(&s_removed).is_member(&bob()), "observed remove clears bob");
-        let s_removed_partial = do_apply(&id(3), &alice(), 0, Msg::MemberRemove { subject: bob() }, &s);
-        let s_merged = do_apply(&id(2), &alice(), 0, Msg::MemberAdd { subject: bob() }, &s_removed_partial);
+        let s_removed_partial = do_apply(&id(3), &alice(), 0, Msg::MemberRemove(bob()), &s);
+        let s_merged = do_apply(&id(2), &alice(), 0, Msg::MemberAdd(bob()), &s_removed_partial);
         assert!(ChatState::decode(&s_merged).is_member(&bob()), "unobserved add wins");
     }
 
@@ -237,8 +240,8 @@ mod tests {
             b"",
             &[
                 (id(0), alice(), genesis(&[alice()])),
-                (id(1), alice(), Msg::MemberAdd { subject: bob() }),
-                (id(2), alice(), Msg::MemberAdd { subject: bob() }),
+                (id(1), alice(), Msg::MemberAdd(bob())),
+                (id(2), alice(), Msg::MemberAdd(bob())),
             ],
         );
         let m = distinct_members(&ChatState::decode(&s));

@@ -1,53 +1,34 @@
-//! Fail-loud conflict injection — exercises the ONE safety path that never fires
-//! in an honest mesh. DESIGN-rsm.md's only baked-in conflict behavior is "loser
-//! inert", surfaced as a `conflict` event. With pre-validated `author` and
-//! conflict-free consumers, an honest node never produces an invalid event — so the
-//! only way to test the net is a DISHONEST peer that gossips a properly-signed but
-//! SM-invalid event, bypassing `author`.
+//! Fail-loud conflict injection — the ONE node-safety path that never fires in an
+//! honest mesh. DESIGN-rsm.md's only baked-in conflict behavior is "loser inert",
+//! surfaced as a `conflict` event. With pre-validated `author`, an honest node never
+//! produces an SM-invalid event — so the only way to exercise the net is a DISHONEST
+//! peer that gossips a properly-signed but SM-invalid event, bypassing `author`.
 //!
-//! Setup: one node hosts a chat room {alice, bob}. A forged event — authored by a
-//! NON-MEMBER key, signed correctly, ref: the room genesis (so it's structurally
-//! admissible) — is injected via the raw gossip frame. The node ingests it, the
-//! fold finds it invalid against its ancestry, and must:
+//! Vehicle: bank-sm (a mesh-owned example — this is a NODE property, not a bank one).
+//! alice is minted 100. A forged transfer of 999 out of alice — signed by a stranger
+//! key, ref: the mint (so it is structurally admissible) — is injected via the raw
+//! gossip frame. bank's `validate` rejects it (insufficient balance) against its
+//! ancestry, and the node must:
 //!   1. emit a `conflict` naming the event + the SM's reason,
 //!   2. keep it INERT — never `finalized`, absent from `current-state`,
 //!   3. classify it `stranded` via `event-status`.
 
+use bank_protocol::{BankState, Cmd};
 use mesh_testkit::{
     forge_event, hex, pubkey, seeded_key, spawn_mesh, wait_for_port, Client, STATUS_STRANDED,
 };
-use serde::Deserialize;
 use std::fs;
 use std::time::Duration;
 
 const MESH_DIR: &str = "/home/colin/work/actors/mesh";
-const WASM: &str = "target/wasm32-unknown-unknown/release/mesh_chat.wasm";
+const WASM: &str = "target/wasm32-unknown-unknown/release/mesh_bank.wasm";
 const ADDR: &str = "127.0.0.1:9471";
 
-use chat_protocol::Msg;
-
-fn genesis(members: &[[u8; 32]]) -> Vec<u8> {
-    chat_protocol::encode(&Msg::Genesis { members: members.iter().map(|m| m.to_vec()).collect() })
+fn mint(to: &str, amount: u64) -> Vec<u8> {
+    bank_protocol::encode(&Cmd::Mint { to: to.to_string(), amount })
 }
-
-fn text(body: &str) -> Vec<u8> {
-    chat_protocol::encode(&Msg::Text { body: body.to_string() })
-}
-
-#[derive(Deserialize)]
-struct ChatState {
-    members: Vec<(Vec<u8>, Vec<u8>)>,
-    log: Vec<ChatMsg>,
-}
-#[derive(Deserialize)]
-struct ChatMsg {
-    #[allow(dead_code)]
-    id: Vec<u8>,
-    #[allow(dead_code)]
-    author: Vec<u8>,
-    #[allow(dead_code)]
-    ts: u64,
-    body: String,
+fn transfer(from: &str, to: &str, amount: u64) -> Vec<u8> {
+    bank_protocol::encode(&Cmd::Transfer { from: from.to_string(), to: to.to_string(), amount })
 }
 
 fn write_manifest(path: &str, seed: &str, store: &str) {
@@ -113,34 +94,35 @@ fn main() {
 fn run() -> Result<(), String> {
     let key_alice = seeded_key("conflict-alice-seed"); // the node's own key
     let pk_alice = pubkey(&key_alice);
-    let pk_bob = pubkey(&seeded_key("conflict-bob-seed"));
-    let key_mallory = seeded_key("conflict-mallory-seed"); // the dishonest NON-member
+    let key_mallory = seeded_key("conflict-mallory-seed"); // the dishonest peer
     let pk_mallory = pubkey(&key_mallory);
-    println!("alice (member) : {}", hex(&pk_alice));
-    println!("mallory (NOT a member): {}", hex(&pk_mallory));
+    println!("alice (node)   : {}", hex(&pk_alice));
+    println!("mallory (forger): {}", hex(&pk_mallory));
 
-    // alice creates the room {alice, bob}; capture the genesis event hash.
+    // alice mints herself 100 (the honest origin of value); capture the mint hash.
     let mut ca = Client::connect(ADDR, &key_alice).map_err(|e| format!("connect alice: {e}"))?;
-    let genesis_hash = ca.submit(&genesis(&[pk_alice, pk_bob])).map_err(|e| format!("genesis: {e}"))?;
-    println!("✓ room {{alice, bob}} created (genesis {})", hex(&genesis_hash));
+    let mint_hash = ca.submit(&mint("alice", 100)).map_err(|e| format!("mint: {e}"))?;
+    println!("✓ alice minted 100 (mint {})", hex(&mint_hash));
 
     // Observer connects BEFORE the injection so it catches the conflict broadcast.
     let mut obs = Client::connect(ADDR, &seeded_key("conflict-observer")).map_err(|e| format!("connect obs: {e}"))?;
 
-    // Forge mallory's invalid event: a genesis-rooted (self_parent = None) text that
-    // refs the room genesis, so it is structurally admissible; but mallory is not a
-    // member, so `validate` must reject it against its ancestry.
-    let (evil_id, evil_bytes) = forge_event(&key_mallory, 1, None, &[genesis_hash], &text("evil forged message"));
+    // Forge mallory's invalid event: a transfer of 999 out of alice (she has 100), ref:
+    // the mint (so it is structurally admissible). alice's balance is insufficient, so
+    // `validate` must reject it against its ancestry.
+    let (evil_id, evil_bytes) =
+        forge_event(&key_mallory, 1, None, &[mint_hash], &transfer("alice", "mallory", 999));
     let mut mallory = Client::connect(ADDR, &key_mallory).map_err(|e| format!("connect mallory: {e}"))?;
     mallory.gossip_raw(&evil_bytes).map_err(|e| format!("inject: {e}"))?;
-    println!("✓ dishonest peer injected a signed non-member event ({})", hex(&evil_id));
+    println!("✓ dishonest peer injected a signed over-balance transfer ({})", hex(&evil_id));
 
     // 1. the node must surface it as a conflict naming the event + the SM's reason.
     let (conflict_id, reason) = obs.recv_conflict().map_err(|e| format!("await conflict: {e}"))?;
     if conflict_id != evil_id {
         return Err(format!("conflict names {}, expected {}", hex(&conflict_id), hex(&evil_id)));
     }
-    if !reason.to_lowercase().contains("member") {
+    let r = reason.to_lowercase();
+    if !r.contains("balance") && !r.contains("insufficient") {
         return Err(format!("conflict reason unexpected: {reason:?}"));
     }
     println!("✓ node fired CONFLICT for the forged event: {reason:?}");
@@ -153,17 +135,14 @@ fn run() -> Result<(), String> {
     println!("✓ event-status(forged) = stranded");
 
     let bytes = ca.current_state().map_err(|e| format!("current-state: {e}"))?;
-    let st: ChatState = serde_json::from_slice(&bytes).map_err(|e| format!("parse state: {e}"))?;
-    if st.log.iter().any(|m| m.body == "evil forged message") {
-        return Err("the forged message leaked into current-state".to_string());
+    let st: BankState = bank_protocol::decode_state(&bytes)
+        .ok_or_else(|| "decode current-state (BankState)".to_string())?;
+    if st.balance("alice") != 100 {
+        return Err(format!("alice perturbed: balance {}, want 100", st.balance("alice")));
     }
-    let members: std::collections::BTreeSet<Vec<u8>> = st.members.iter().map(|(pk, _)| pk.clone()).collect();
-    if members.contains(&pk_mallory.to_vec()) {
-        return Err("mallory was wrongly admitted as a member".to_string());
+    if st.balance("mallory") != 0 {
+        return Err(format!("mallory wrongly credited: balance {}", st.balance("mallory")));
     }
-    if members.len() != 2 {
-        return Err(format!("membership perturbed: {} members, want 2", members.len()));
-    }
-    println!("✓ forged event is inert: absent from the log, mallory not a member, room intact");
+    println!("✓ forged event is inert: alice still 100, mallory never credited");
     Ok(())
 }
