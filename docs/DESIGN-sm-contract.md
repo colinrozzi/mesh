@@ -62,11 +62,13 @@ Two supported ways, both producing the same Graph value:
   `#[derive(GraphValue)]` and `#[graph(crate = "packr_guest::composite_abi")]`. This is the
   right tool for **rich multi-field variants** (they stay ergonomic). See
   `tests/networks/echo/echo-protocol/src/lib.rs`, `.../bank/bank-protocol/src/lib.rs`.
-- **`wit!(from "x.wit")`** — declare the schema in a `.wit`, generate the Rust type. Best for
-  **simple** shapes. See `tests/networks/counter/counter.wit`, and the evaporated
-  `chat.wit`/`control.wit`. Note: a WIT variant case carries **one** payload, so a multi-field
-  kind becomes a case wrapping a `record` (`Msg::Command(CommandBody{..})`) — which is exactly
-  what the derive emits for a struct-variant, so it round-trips identically.
+- **`wit!(from "x.wit")`** — declare the schema in a `.wit`, generate the Rust type on **each**
+  side (SM + executor) from the one file; no shared crate. See `tests/networks/counter/counter.wit`
+  and `hello-system/hello-sm/hello.wit` (the stable exemplars). `chat` and `control` also use
+  this pattern — their `.wit` is the single source and travels with them to their own repos.
+  Note: a WIT variant case carries **one** payload, so a multi-field kind becomes a case
+  wrapping a `record` (`Msg::Command(CommandBody{..})`) — which is exactly what the derive emits
+  for a struct-variant, so it round-trips identically.
 
 **The derive is `GraphValue`.** There is no `Encode`/`Decode` derive anywhere in packr
 (`packr-derive-*/src/lib.rs:` `#[proc_macro_derive(GraphValue, attributes(graph))]`; re-exported
@@ -137,8 +139,10 @@ pub fn subscribe(&self, my_id: &str) -> Result<(), String>
 ```
 
 There is **no `author<T>` / `DagNode<T>`.** You type it by encoding/decoding with the **same
-GraphValue payload type your SM uses** — `session.author(&chat_protocol::encode(&Msg::Text …))`,
-and decode `DagNode.payload` the same way. (Any stale ref claiming a typed `author<T>`/`DagNode<T>`
+GraphValue payload type your SM uses**. With a `wit!`-generated type (no protocol crate — what
+`counter-system` and `chat` do): `session.author(&packr_guest::encode(&Value::from(Msg::Text(body)))?)`,
+and decode `DagNode.payload` the same way. A protocol crate (echo/bank) just wraps that pair as
+`encode(&Msg)` / `decode(bytes)` one-liners. (Any stale ref claiming a typed `author<T>`/`DagNode<T>`
 surface is wrong.) A **typed public API** (`my:chat.post`, `my:fs.write`) only exists if you
 build a **custom system** that exposes typed RPC verbs — `tests/networks/counter/counter-system`
 is the worked example (it replaces the generic `mesh-system` as the entry). Otherwise you drive
