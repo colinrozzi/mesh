@@ -8,7 +8,7 @@ description = "A currency/bank as an RSM state-machine (DESIGN-rsm.md Interface 
 crate-type = ["cdylib"]
 
 [dependencies]
-packr-guest = "0.15"
+packr-guest = "0.16"
 bank-protocol = { path = "../bank-protocol" }
 
 [profile.release]

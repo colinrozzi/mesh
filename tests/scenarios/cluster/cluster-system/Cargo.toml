@@ -8,7 +8,7 @@ description = "Tier-3 reference: a cluster ORCHESTRATOR + OBSERVER. One theater 
 crate-type = ["cdylib"]
 
 [dependencies]
-packr-guest = { version = "0.15", features = ["derive"] }
+packr-guest = { version = "0.16", features = ["derive"] }
 mesh-client = { path = "../../../../mesh-client" }
 serde = { version = "1", default-features = false, features = ["alloc", "derive"] }
 serde_json = { version = "1", default-features = false, features = ["alloc"] }
