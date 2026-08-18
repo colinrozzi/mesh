@@ -24,13 +24,14 @@ only covers one:
   satisfied, store poisoned, deps never resolve). The heartbeat (`tick`) still fires. **This
   is the smtp-acceptor class, and the in-node pet-or-panic catches it fully.**
 - **HARD wedge — a handler infinite-loops / deadlocks, the thread is STUCK.** No in-guest code
-  can fire to check-and-panic (single-threaded). This genuinely needs a **host-level**
-  watchdog: theater killing an actor whose handler doesn't return within K seconds. That is a
-  **theater-dev dependency**, not something mesh can self-implement. Flagging it.
+  can fire to check-and-panic (single-threaded). This needs a **host-level** watchdog —
+  **already covered:** theater's **epoch trap** interrupts a runaway handler → supervised
+  crash (confirmed by theater-dev). No mesh work, no new theater work.
 
-So: mesh delivers the SOFT-wedge fail-loud (the named failure class); the HARD-loop case is a
-theater host-timeout we should request separately. Being honest about this split matters — a
-"self-watchdog" that silently can't catch a deadlock is worse than one whose scope is stated.
+So both classes are covered: mesh delivers the SOFT-wedge fail-loud (the named failure class);
+the HARD-loop case is already caught by theater's epoch trap. Stating the split matters — a
+"self-watchdog" that silently can't catch a deadlock would be worse than one whose scope is
+stated, and here the deadlock case has a real owner (theater), not a silent gap.
 
 ## The mechanism: pet-or-panic in the heartbeat
 
@@ -71,8 +72,9 @@ policy lives in the node, not sentinel).
    violation. Conservative defaults; the knobs are node config.
 3. **Tuning + a test** — a wedge-injection test (force a stall) asserting the panic fires, and
    an idle/isolated test asserting it does NOT (no false crash).
-4. **theater-dev dependency (separate):** request a host-level per-handler execution timeout so
-   HARD infinite-loops (which the in-guest watchdog cannot catch) also become loud deaths.
+4. **HARD infinite-loops — already handled by theater** (epoch trap → supervised crash;
+   confirmed by theater-dev). No mesh ticket, no new theater work — noted here so the split is
+   documented and the deadlock case has a stated owner.
 
 ## Sequencing
 
