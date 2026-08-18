@@ -7,7 +7,7 @@
 //! self-`depart`). Config (members + allow-lists) arrives as a **genesis event**.
 //!
 //! The payload arrives **typed** as `Msg` (a variant over records), generated from the
-//! shared `control.wit` via `wit!(from …)` — no protocol crate, no `decode` in the SM (the
+//! shared `control.pact` via `pact!(from …)` — no protocol crate, no `decode` in the SM (the
 //! node is generic over the payload `p`). State is opaque bytes (serde).
 
 #![cfg_attr(not(test), no_std)]
@@ -24,8 +24,8 @@ use serde::{Deserialize, Serialize};
 packr_guest::setup_guest!();
 
 // `Msg` + its payload records (GenesisCfg / CommandBody / ResponseBody), generated from the
-// shared `control.wit` (one source of truth).
-packr_guest::wit!(from "../control.wit");
+// shared `control.pact` (one source of truth).
+packr_guest::pact!(from "../control.pact");
 
 packr_guest::pack_types! {
     exports {

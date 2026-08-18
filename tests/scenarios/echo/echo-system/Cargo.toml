@@ -8,7 +8,7 @@ description = "Tier-2 reference executor (client + server roles): theater actors
 crate-type = ["cdylib"]
 
 [dependencies]
-packr-guest = { version = "0.16", features = ["derive"] }
+packr-guest = { version = "0.20", features = ["derive"] }
 mesh-client = { path = "../../../../mesh-client" }
 echo-protocol = { path = "../../../networks/echo/echo-protocol" }
 serde = { version = "1", default-features = false, features = ["alloc", "derive"] }

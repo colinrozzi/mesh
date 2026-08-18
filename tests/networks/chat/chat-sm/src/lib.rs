@@ -9,8 +9,8 @@
 //! `member-remove` deletes only the `(subject, tag)` pairs in the event's ANCESTRY state,
 //! so a concurrent add survives — add-wins from ancestry-relative validity.
 //!
-//! The payload arrives **typed** as `Msg`, generated from the shared `chat.wit` via
-//! `wit!(from …)` — no protocol crate, no `decode` in the SM (the node is generic over the
+//! The payload arrives **typed** as `Msg`, generated from the shared `chat.pact` via
+//! `pact!(from …)` — no protocol crate, no `decode` in the SM (the node is generic over the
 //! payload `p`). State is opaque bytes (serde).
 
 #![cfg_attr(not(test), no_std)]
@@ -26,8 +26,8 @@ use serde::{Deserialize, Serialize};
 #[cfg(not(test))]
 packr_guest::setup_guest!();
 
-// `Msg` — the chat payload, generated from the shared `chat.wit` (one source of truth).
-packr_guest::wit!(from "../chat.wit");
+// `Msg` — the chat payload, generated from the shared `chat.pact` (one source of truth).
+packr_guest::pact!(from "../chat.pact");
 
 packr_guest::pack_types! {
     exports {

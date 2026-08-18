@@ -6,7 +6,7 @@ grounded in the shipped code — the worked examples are `tests/networks/{counte
 (in-tree) and `hello-system/` (a full external repo). When this doc and a stale ref
 disagree, this doc + the code win.
 
-Status: packr **0.16** canonical. Node generic over payload `p` and state `s`. Verified
+Status: packr **0.20** canonical (`pact!` macro + `.pact` schema; `wit!`/`.wit` renamed at 0.18). Node generic over payload `p` and state `s`. Verified
 against `src/lib.rs`, `state-machine.pact`, `mesh-client/src/lib.rs`, and the composed,
 running examples.
 
@@ -62,10 +62,10 @@ Two supported ways, both producing the same Graph value:
   `#[derive(GraphValue)]` and `#[graph(crate = "packr_guest::composite_abi")]`. This is the
   right tool for **rich multi-field variants** (they stay ergonomic). See
   `tests/networks/echo/echo-protocol/src/lib.rs`, `.../bank/bank-protocol/src/lib.rs`.
-- **`wit!(from "x.wit")`** — declare the schema in a `.wit`, generate the Rust type on **each**
-  side (SM + executor) from the one file; no shared crate. See `tests/networks/counter/counter.wit`
-  and `hello-system/hello-sm/hello.wit` (the stable exemplars). `chat` and `control` also use
-  this pattern — their `.wit` is the single source and travels with them to their own repos.
+- **`pact!(from "x.pact")`** — declare the schema in a `.pact`, generate the Rust type on **each**
+  side (SM + executor) from the one file; no shared crate. See `tests/networks/counter/counter.pact`
+  and `hello-system/hello-sm/hello.pact` (the stable exemplars). `chat` and `control` also use
+  this pattern — their `.pact` is the single source and travels with them to their own repos.
   Note: a WIT variant case carries **one** payload, so a multi-field kind becomes a case
   wrapping a `record` (`Msg::Command(CommandBody{..})`) — which is exactly what the derive emits
   for a struct-variant, so it round-trips identically.
@@ -73,13 +73,16 @@ Two supported ways, both producing the same Graph value:
 **The derive is `GraphValue`.** There is no `Encode`/`Decode` derive anywhere in packr
 (`packr-derive-*/src/lib.rs:` `#[proc_macro_derive(GraphValue, attributes(graph))]`; re-exported
 `packr_guest::GraphValue`). The `GraphValue` macro path **and its `#[graph(...)]` field
-attributes are identical across 0.15 ↔ 0.16** — the only 0.15→0.16 changes are additive
-(`map<K,V>` in 0.15, `wit!(from …)` in 0.16). So use `GraphValue` regardless of which packr
-version a given crate is pinned to.
+attributes are unchanged across 0.15 → 0.20** — the packr changes over that range are additive
+or renames that don't touch the derive: `map<K,V>` (0.15), the `pact!(from …)` file form (0.16),
+the **`wit!`→`pact!` rename** (`.wit`→`.pact`, 0.18 — no alias), `set<T>` (0.19), cross-file
+imports (0.20). So `GraphValue` is stable; only the *macro name* moved.
 
-**packr version:** **0.16** is canonical for the extraction. `chat-sm`/`control-sm` require it
-(`wit!(from)`); the rest are on 0.15 and compose fine against it (ABI-compatible). New impl
-repos: pin **0.16**.
+**packr version:** **0.20** is canonical, and the whole repo is **uniform** on it. That
+uniformity is not cosmetic: two packr-guest versions statically linked into ONE guest wasm
+collide (`__pack_alloc` multiply-defined), so a driver/executor that links `mesh-client` +
+your app-core must be on the **same** version as mesh-client. Composites are unaffected
+(components link at the ABI, not via LTO). New impl repos: pin **0.20** and use `pact!(from …)`.
 
 ## 4. What the SM sees — event context
 
@@ -139,7 +142,7 @@ pub fn subscribe(&self, my_id: &str) -> Result<(), String>
 ```
 
 There is **no `author<T>` / `DagNode<T>`.** You type it by encoding/decoding with the **same
-GraphValue payload type your SM uses**. With a `wit!`-generated type (no protocol crate — what
+GraphValue payload type your SM uses**. With a `pact!`-generated type (no protocol crate — what
 `counter-system` and `chat` do): `session.author(&packr_guest::encode(&Value::from(Msg::Text(body)))?)`,
 and decode `DagNode.payload` the same way. A protocol crate (echo/bank) just wraps that pair as
 `encode(&Msg)` / `decode(bytes)` one-liners. (Any stale ref claiming a typed `author<T>`/`DagNode<T>`
@@ -172,7 +175,7 @@ Full worked example: **`hello-system/`** (an append-only-log SM in a standalone 
 ## Quick answers to the open threads
 
 - **Derive?** `#[derive(GraphValue)]` + `#[graph(crate = "packr_guest::composite_abi")]`. Not
-  `Encode`/`Decode` (doesn't exist). Identical 0.15↔0.16.
+  `Encode`/`Decode` (does not exist). Stable across 0.15→0.20 (the wit!→pact! rename at 0.18 does not touch the derive).
 - **Node generic mechanism?** packr interface generics `type p/s: serializable`, bound at
   compose by structural unification. Name your own payload/state type; nothing shared to align.
 - **Typed in/out apply?** Yes — SM gets typed `p` + `s`, returns `s`. Not Value-decode-internally.
@@ -183,4 +186,4 @@ Full worked example: **`hello-system/`** (an append-only-log SM in a standalone 
 - **Order/`next_ino`?** Deterministic convergent fold, but a partial order — shared counters are
   a conflict frontier. Derive identity from `event.id`/`(author,seq)`, not a counter.
 - **SDK typed?** No — bytes; type with your GraphValue schema. Typed verbs = custom system.
-- **packr 0.15 or 0.16?** 0.16 canonical; pin it in new repos.
+- **packr version?** 0.20 canonical; pin it in new repos (wit!→pact! renamed at 0.18; one version per guest wasm).

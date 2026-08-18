@@ -25,13 +25,13 @@ use mesh_runtime::{
     run_author, run_current_state, run_init, run_notify, run_on_close, run_on_connect,
     run_on_data, run_tick, run_watch, rpc_err, rpc_ok, rpc_split, Host, NodeApi, SysState,
 };
-use packr_guest::{export, import, import_from, pack_types, wit, Value};
+use packr_guest::{export, import, import_from, pack_types, pact, Value};
 
 packr_guest::setup_guest!();
 
-// Generate Cmd + CounterState from the shared counter.wit (wit/ symlink) — the same schema
+// Generate Cmd + CounterState from the shared counter.pact (shared, via pact!(from …)) — the same schema
 // the SM folds; no protocol crate. The codecs are one-liners over the Graph ABI.
-wit! {}
+pact!(from "../counter.pact");
 
 fn encode(cmd: Cmd) -> Vec<u8> {
     packr_guest::encode(&Value::from(cmd)).unwrap_or_default()

@@ -8,7 +8,7 @@ description = "The counter network's SYSTEM — the theater entry actor that com
 crate-type = ["cdylib"]
 
 [dependencies]
-packr-guest = { version = "0.16", features = ["derive"] }
+packr-guest = { version = "0.20", features = ["derive"] }
 mesh-runtime = { path = "../../../../mesh-runtime" }
 
 [profile.release]

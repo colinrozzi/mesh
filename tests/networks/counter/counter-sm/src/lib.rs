@@ -4,7 +4,7 @@
 //! DESIGN-rsm.md Interface 1 with **typed everything**: the node is generic over the SM's
 //! state `s` AND its payload `p`, so `validate`/`apply` receive a real `CounterState` *and*
 //! a real `Cmd` — no serde, no hand-rolled codec, no `decode` in the SM. `Cmd`/`CounterState`
-//! are the counter's data schema, defined ONCE in `counter.wit` and generated via `wit!`
+//! are the counter's data schema, defined ONCE in `counter.pact` and generated via `pact!`
 //! (shared with `counter-system` — no protocol crate; drift is caught at compose).
 //!
 //! **Conflict-free (admission-final).** `apply` is `count += n`; the only validity rule
@@ -17,13 +17,13 @@ extern crate alloc;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
-use packr_guest::{export, wit};
+use packr_guest::{export, pact};
 
 #[cfg(not(test))]
 packr_guest::setup_guest!();
 
-// Generate `Cmd` + `CounterState` from the shared counter.wit (wit/ symlink).
-wit! {}
+// Generate `Cmd` + `CounterState` from the shared counter.pact (shared, via pact!(from …)).
+pact!(from "../counter.pact");
 
 packr_guest::pack_types! {
     exports {

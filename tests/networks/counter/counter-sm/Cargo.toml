@@ -8,7 +8,7 @@ description = "Reference RSM state-machine component: a replicated counter (DESI
 crate-type = ["cdylib"]
 
 [dependencies]
-packr-guest = { version = "0.16", features = ["derive"] }
+packr-guest = { version = "0.20", features = ["derive"] }
 
 [profile.release]
 opt-level = "s"
