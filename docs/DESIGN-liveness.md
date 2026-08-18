@@ -1,81 +1,81 @@
-# Mesh node liveness signal (for supervision)
+# Mesh node self-watchdog (fail loud on wedges)
 
-mesh-dev's slice of prod mesh-node supervision: **what a node exposes so a supervisor can
-detect a SILENT WEDGE** (process alive, logic stuck, no crash — the smtp-acceptor failure
-class). sentinel owns the poll cadence, the wedge classification, and the restart decision;
-mesh owns exposing a cheap, honest health signal. This is **design-now**; it executes with
-the chat/weft persistent-prod stand-up (no persistent mesh service exists yet).
+mesh-dev's slice of prod supervision, per Colin's re-scope: **make a silent wedge a LOUD
+crash inside the node**, so the existing crash-supervision path catches it and sentinel stays
+loud-deaths-only. No external liveness signal, no cross-team polling — each node owns its own
+liveness and fails loud. Design-now; executes with the chat/weft persistent-prod stand-up.
 
 ## The problem it closes
 
-Crash-supervision catches LOUD deaths (the actor exits, theater/systemd sees it). The
-dangerous case is the SILENT wedge: the process is healthy, the tick/gossip loop is stuck,
-nothing crashes, and it's found only when the node stops answering. Active probing is the
-net-new — not more crash-catching.
+A silent wedge (the smtp-acceptor class): process healthy, logic stuck, nothing crashes,
+found only when it stops answering. The fix: the node **detects its own no-progress and
+panics**, converting the silent wedge into a normal actor crash that theater + sentinel's
+crash-supervision already handle.
 
-## The signal: a cheap `health` query — NO DAG fold
+## The one constraint that shapes the design: the node is single-threaded WASM
 
-A node serves `health()` returning a small fixed struct, computed from the counters in
-`NodeState` (JSON blob sizes + flags) — **not** a `current_state`-style fold. Two liveness
-layers fall out of one query:
+The mail's ideal — "a watchdog that runs INDEPENDENT of the stuck loop and panics" — does not
+fully hold inside a WASM guest. A theater actor is **single-threaded + event-driven**: it runs
+only inside a handler call (`tick` / `on-bytes` / `author`), and nothing else in the guest
+runs while a handler is executing. So there are two wedge classes, and the in-node watchdog
+only covers one:
 
-- **Coarse (does it answer?):** the health query returning at all proves the actor + its
-  message-server/RPC surface are alive. A timeout is itself a wedge signal.
-- **Fine (is the LOGIC progressing?):** the returned counters, sampled across ticks.
+- **SOFT wedge — logic stalls, handlers still RETURN** (frontier stops advancing, WANT never
+  satisfied, store poisoned, deps never resolve). The heartbeat (`tick`) still fires. **This
+  is the smtp-acceptor class, and the in-node pet-or-panic catches it fully.**
+- **HARD wedge — a handler infinite-loops / deadlocks, the thread is STUCK.** No in-guest code
+  can fire to check-and-panic (single-threaded). This genuinely needs a **host-level**
+  watchdog: theater killing an actor whose handler doesn't return within K seconds. That is a
+  **theater-dev dependency**, not something mesh can self-implement. Flagging it.
 
-### Fields
+So: mesh delivers the SOFT-wedge fail-loud (the named failure class); the HARD-loop case is a
+theater host-timeout we should request separately. Being honest about this split matters — a
+"self-watchdog" that silently can't catch a deadlock is worse than one whose scope is stated.
 
-| field | source | what it catches | cost |
-|---|---|---|---|
-| `ready: bool` | `ready_sent` | node finished init and is serving | O(1) |
-| `tick_seq: u64` | **net-new** monotonic counter, bumped every `tick` | **THE crux** — the heartbeat loop is *running*, not just the process alive. Frozen `tick_seq` while the query still answers = logic-wedged tick loop → restart | O(1) |
-| `event_count: u64` | DAG size | DAG is ingesting/growing (gossip alive) | cheap |
-| `finalized_count: u64` | finality map | finality is progressing | cheap |
-| `self_head: hash` | `self_head_hex` | this node is still authoring on its own chain | O(1) |
-| `pending_count: u64` | orphan buffer size | runaway missing-deps storm (can't complete ancestry) | cheap |
-| `connections: u64` | connections map | isolation (0 peers) vs a real wedge — lets sentinel *not* false-positive an idle-but-isolated node | cheap |
+## The mechanism: pet-or-panic in the heartbeat
 
-`event_count`/`finalized_count`/`pending_count` are blob sizes; if parsing them per poll ever
-costs, memoize them as maintained counters in `NodeState` (O(1)). Start with the parse.
+Each `tick`, the node checks a set of **progress invariants** against its `NodeState`
+counters; if any is violated for **K consecutive ticks**, it `panic!()`s — theater traps it
+as an actor crash → loud death → crash-supervision restarts it. The "pet" is normal progress;
+the "panic" is sustained no-progress. Cheap (counters, no DAG fold).
 
-### The one pricier field — membership
+### Pet-or-panic invariants (each with a K-tick tolerance to avoid false crashes)
 
-sentinel also wants "still in `consensus_members`." That needs the `members` projection (a
-fold — already served as `Session::members()`, see the SM contract). Keep it OUT of the hot
-`health()` struct; sentinel polls `members()` at a LOWER cadence and checks `self ∈ members`.
-`health()` stays O(1); membership is a separate, cheaper-than-full-state read.
+| invariant | wedge it catches | why K-tick tolerance |
+|---|---|---|
+| frontier/event-count advances **while peers>0 and WANT outstanding** | gossip/apply loop stalled with work pending | idle/isolated is legitimately no-progress — gate on peers+outstanding-work, not raw stillness |
+| WANT set is **bounded** (not monotonically growing over K ticks) | can't fetch deps → stuck forever | transient WANT churn is normal |
+| pending/orphan buffer is **bounded** | ancestry never completing | short-lived orphans are normal |
+| store reads/writes **succeed** (not a persistent error) | poisoned store | one transient error isn't fatal |
 
-### Why `tick_seq` is the crux
+**Conservative by default:** a false panic = an unnecessary restart, so K and the thresholds
+skew toward "only crash on a clear, sustained stall." The node OWNS these knobs (self-liveness
+policy lives in the node, not sentinel).
 
-The node is I/O-free — the SYSTEM drives it: the timer's `handle-tick` → `node.tick`. Bumping
-`tick_seq` on each `tick` means: if the timer wedges, or the system stops driving, or
-`node.tick` hangs, `tick_seq` FREEZES while the process stays up. That is exactly the silent
-wedge, made observable with one counter. `event_count` frozen alone is ambiguous (could be
-idle/isolated — that's why `connections` is in the struct); `tick_seq` frozen is not — the
-heartbeat itself stopped.
+## Where it lives
 
-## Interface
-
-- Node: a `health` export (like `current-state`, but from counters — no fold) + maintain
-  `tick_seq`.
-- mesh-system: `my:mesh.health` RPC (mirrors `my:mesh.current-state`), and a `tick_seq` bump
-  in its `handle-tick` path.
-- SDK: `Session::health() -> Result<Health, String>` (a GraphValue struct, the fields above).
-- **Boundary:** mesh EXPOSES the signal; sentinel OWNS the poll interval, the
-  frozen-across-N-ticks threshold, the isolation-vs-wedge classification, and restart +
-  context-capture. No policy in the node.
+- The check runs in the node's `tick` path (the heartbeat the system already drives via the
+  timer's `handle-tick` → `node.tick`). It needs a couple of cheap progress markers in
+  `NodeState`: `last_progress_tick`, a monotonic `tick_seq`, and last-seen WANT/pending sizes.
+- On violation: `panic!()` in the node (theater surfaces the trap as a crash). No I/O needed —
+  the crash IS the signal.
+- **Boundary:** the node self-detects + self-crashes; sentinel does nothing new (its
+  crash-supervision already restarts a crashed actor). Zero cross-team coupling — the whole
+  point of the re-scope.
 
 ## Tickets (execute WITH the chat/weft prod stand-up, not now)
 
-1. **node: `tick_seq` + `health` export** — maintain a monotonic tick counter; a `health`
-   export returning the struct from `NodeState` counters (no fold).
-2. **mesh-system: `my:mesh.health` RPC** + bump `tick_seq` in `handle-tick`.
-3. **mesh-client: `Session::health()`** — the GraphValue `Health` struct + one RPC call.
-4. **Doc the contract** — which fields sentinel reads, and the "answer-timeout = wedge,
-   frozen `tick_seq` = wedge, frozen `event_count` + peers>0 + expected-activity = suspect"
-   decision inputs (sentinel owns the actual policy).
+1. **node: progress markers** — `tick_seq`, `last_progress_tick`, last WANT/pending sizes in
+   `NodeState`.
+2. **node: pet-or-panic in `tick`** — evaluate the invariants; `panic!()` on K-consecutive
+   violation. Conservative defaults; the knobs are node config.
+3. **Tuning + a test** — a wedge-injection test (force a stall) asserting the panic fires, and
+   an idle/isolated test asserting it does NOT (no false crash).
+4. **theater-dev dependency (separate):** request a host-level per-handler execution timeout so
+   HARD infinite-loops (which the in-guest watchdog cannot catch) also become loud deaths.
 
 ## Sequencing
 
-Design is locked here so it isn't rediscovered at 2am during an incident. Execution ships
-with the first persistent prod node (chat/weft). Until then: nothing in the node changes.
+Design-locked now so it isn't rediscovered at 2am. Executes with the first persistent prod
+node (chat/weft). Until then the node is unchanged. Supersedes the earlier external
+liveness-signal spec (dropped per the re-scope).
