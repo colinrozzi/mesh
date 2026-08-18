@@ -69,18 +69,24 @@ impl Session {
 
     // ---- actions / questions (RPC) ----
 
-    /// `author(payload) -> hash`. A validation rejection comes back IN-BAND as
-    /// `Err(reason)` (the node stays alive), not as a transport error.
-    pub fn author(&self, payload: &[u8]) -> Result<[u8; 32], String> {
+    /// `author(payload) -> (event-id, ts)`. `ts` is the event's CANONICAL timestamp — the
+    /// wall-clock the node stamped it with — so an optimistic local apply can use the same
+    /// ts every replica will fold. A validation rejection comes back IN-BAND as `Err(reason)`
+    /// (the node stays alive), not as a transport error.
+    pub fn author(&self, payload: &[u8]) -> Result<([u8; 32], u64), String> {
         let ret = self.call("my:mesh.author", Value::from(payload.to_vec()))?;
         match ret {
-            Value::Tuple(items) if items.len() == 2 => {
+            Value::Tuple(items) if items.len() == 3 => {
                 let mut it = items.into_iter();
                 let ok = matches!(it.next(), Some(Value::Bool(true)));
                 let data = Vec::<u8>::try_from(it.next().unwrap())
                     .map_err(|e| format!("author data: {:?}", e))?;
+                let ts = match it.next() {
+                    Some(Value::U64(t)) => t,
+                    other => return Err(format!("author ts: expected u64, got {:?}", other)),
+                };
                 if ok {
-                    hash32(&data)
+                    Ok((hash32(&data)?, ts))
                 } else {
                     Err(String::from_utf8_lossy(&data).into_owned())
                 }

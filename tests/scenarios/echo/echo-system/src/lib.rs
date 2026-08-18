@@ -157,7 +157,7 @@ fn handle_tick(state: SysState, _timer: String) -> Result<(SysState, ()), String
         // ACT: author the request; remember its id to match the reply against.
         let payload = echo_protocol::encode(&Msg::Request { body: state.request_body.clone() });
         match s.author(&payload) {
-            Ok(id) => {
+            Ok((id, _ts)) => {
                 log(format!("[echo/client] sent request id={}", short(&id)));
                 pending = id.to_vec();
             }

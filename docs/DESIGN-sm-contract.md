@@ -135,11 +135,16 @@ from that ancestry-relative `state` (see `chat-sm` remove-observes-ancestry, `ba
 `Session` is **byte-oriented** (`mesh-client/src/lib.rs`):
 
 ```rust
-pub fn author(&self, payload: &[u8]) -> Result<[u8; 32], String>   // authored event id
+pub fn author(&self, payload: &[u8]) -> Result<([u8; 32], u64), String>  // (event id, canonical ts)
 pub fn current_state(&self) -> Result<Vec<u8>, String>
 pub fn subscribe(&self, my_id: &str) -> Result<(), String>
-// finalized stream → Event::Finalized(DagNode { id, author, payload: Vec<u8>, deps, … })
+// finalized stream → Event::Finalized(DagNode { id, author, timestamp, payload: Vec<u8> })
 ```
+
+`author` returns the authored event's **canonical `ts`** synchronously (the wall-clock the
+node stamped it with) — so an optimistic local apply uses the *same* ts every replica will
+fold, no reconcile-on-echo needed. Rejections still come back in-band as `Err(reason)`. Own
+events also echo on the finalized stream carrying that same `timestamp` (§below).
 
 There is **no `author<T>` / `DagNode<T>`.** You type it by encoding/decoding with the **same
 GraphValue payload type your SM uses**. With a `pact!`-generated type (no protocol crate — what

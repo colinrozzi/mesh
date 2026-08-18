@@ -317,12 +317,16 @@ fn author_rpc(input: Value) -> Value {
         Err(e) => return rpc_err(&format!("rpc author: payload not list<u8>: {:?}", e)),
     };
     let SysState { listener_id, node } = state;
-    let (node, ok, data, out) = node_author(node, payload, now());
+    // `ts` is the wall-clock we inject; the node stamps the authored event with exactly it,
+    // so it IS the event's canonical timestamp — returned so a caller can apply optimistically
+    // with the same ts every replica will fold (mesh-client Session::author).
+    let ts = now();
+    let (node, ok, data, out) = node_author(node, payload, ts);
     perform(out);
     let new_state = SysState { listener_id, node };
-    // A validation rejection is carried IN-BAND as tuple<ok, data> (never result::err,
+    // A validation rejection is carried IN-BAND as tuple<ok, data, ts> (never result::err,
     // which theater would treat as a fault). data = hash on success, reason on rejection.
-    rpc_ok(new_state, Value::Tuple(alloc::vec![Value::Bool(ok), Value::from(data)]))
+    rpc_ok(new_state, Value::Tuple(alloc::vec![Value::Bool(ok), Value::from(data), Value::U64(ts)]))
 }
 
 #[export(name = "my:mesh.current-state")]
