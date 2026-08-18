@@ -69,6 +69,12 @@ export   = "current-state"
 
 [[link]]
 consumer = "mesh-system"
+import   = "node.current-members"
+provider = "mesh"
+export   = "current-members"
+
+[[link]]
+consumer = "mesh-system"
 import   = "node.event-status"
 provider = "mesh"
 export   = "event-status"
@@ -91,3 +97,9 @@ consumer = "mesh"
 import   = "state-machine.apply"
 provider = "chat-sm"
 export   = "apply"
+
+[[link]]
+consumer = "mesh"
+import   = "state-machine.members"
+provider = "chat-sm"
+export   = "members"

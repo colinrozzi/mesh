@@ -63,6 +63,7 @@ pack_types! {
             author: func(state: list<u8>, payload: list<u8>, now: u64) -> tuple<list<u8>, bool, list<u8>, list<list<u8>>>,
             subscribe: func(state: list<u8>, app-id: string) -> tuple<list<u8>, list<list<u8>>>,
             current-state: func(state: list<u8>) -> list<u8>,
+            current-members: func(state: list<u8>) -> list<list<u8>>,
             event-status: func(state: list<u8>, id: list<u8>) -> u8,
         }
     }
@@ -76,6 +77,7 @@ pack_types! {
         // result<tuple<state, ret>, string>. Retired in M6 when the executor merges in.
         my:mesh.author: func(input: value) -> value,
         my:mesh.current-state: func(input: value) -> value,
+        my:mesh.members: func(input: value) -> value,
         my:mesh.event-status: func(input: value) -> value,
         my:mesh.subscribe: func(input: value) -> value,
     }
@@ -122,6 +124,8 @@ fn node_author(state: Vec<u8>, payload: Vec<u8>, now: u64) -> (Vec<u8>, bool, Ve
 fn node_subscribe(state: Vec<u8>, app_id: String) -> (Vec<u8>, Vec<Vec<u8>>);
 #[import_from("node", name = "current-state")]
 fn node_current_state(state: Vec<u8>) -> Vec<u8>;
+#[import_from("node", name = "current-members")]
+fn node_current_members(state: Vec<u8>) -> Vec<Vec<u8>>;
 #[import_from("node", name = "event-status")]
 fn node_event_status(state: Vec<u8>, id: Vec<u8>) -> u8;
 
@@ -337,6 +341,16 @@ fn current_state_rpc(input: Value) -> Value {
     };
     let bytes = node_current_state(state.node.clone());
     rpc_ok(state, Value::from(bytes))
+}
+
+#[export(name = "my:mesh.members")]
+fn members_rpc(input: Value) -> Value {
+    let (state, _params) = match rpc_split(input) {
+        Ok(v) => v,
+        Err(e) => return rpc_err(&e),
+    };
+    let members = node_current_members(state.node.clone());
+    rpc_ok(state, Value::from(members))
 }
 
 #[export(name = "my:mesh.event-status")]

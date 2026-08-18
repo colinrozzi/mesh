@@ -149,6 +149,12 @@
 
           [[link]]
           consumer = "mesh-system"
+          import   = "node.current-members"
+          provider = "mesh"
+          export   = "current-members"
+
+          [[link]]
+          consumer = "mesh-system"
           import   = "node.event-status"
           provider = "mesh"
           export   = "event-status"
@@ -170,6 +176,12 @@
           import   = "state-machine.apply"
           provider = "${name}-sm"
           export   = "apply"
+
+          [[link]]
+          consumer = "mesh"
+          import   = "state-machine.members"
+          provider = "${name}-sm"
+          export   = "members"
         '';
 
         # THE external-composition entry point. Give it a network `name` and its SM `sm`

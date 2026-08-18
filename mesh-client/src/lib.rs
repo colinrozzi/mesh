@@ -101,6 +101,15 @@ impl Session {
         Vec::<u8>::try_from(ret).map_err(|e| format!("current-state: {:?}", e))
     }
 
+    /// `members() -> list of member keys` — the SM's OWN `members` read export, run by the
+    /// node over its current folded state. Read the SM's projection instead of re-deriving
+    /// it host-side (the "use what the node computes" rule). Any consumer with an SM that
+    /// exports `members` (RSM Interface 1) gets this for free.
+    pub fn members(&self) -> Result<Vec<Vec<u8>>, String> {
+        let ret = self.call("my:mesh.members", no_arg())?;
+        Vec::<Vec<u8>>::try_from(ret).map_err(|e| format!("members: {:?}", e))
+    }
+
     /// `event-status(hash) -> u8` (unknown / pending / finalized / stranded).
     pub fn event_status(&self, id: &[u8; 32]) -> Result<u8, String> {
         let ret = self.call("my:mesh.event-status", Value::from(id.to_vec()))?;

@@ -74,6 +74,7 @@ pack_types! {
             author: func(state: list<u8>, payload: list<u8>, now: u64) -> tuple<list<u8>, bool, list<u8>, list<list<u8>>>,
             subscribe: func(state: list<u8>, app-id: string) -> tuple<list<u8>, list<list<u8>>>,
             current-state: func(state: list<u8>) -> list<u8>,
+            current-members: func(state: list<u8>) -> list<list<u8>>,
             event-status: func(state: list<u8>, id: list<u8>) -> u8,
         }
     }

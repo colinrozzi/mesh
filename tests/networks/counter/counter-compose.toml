@@ -77,3 +77,9 @@ consumer = "mesh"
 import   = "state-machine.apply"
 provider = "counter-sm"
 export   = "apply"
+
+[[link]]
+consumer = "mesh"
+import   = "state-machine.members"
+provider = "counter-sm"
+export   = "members"

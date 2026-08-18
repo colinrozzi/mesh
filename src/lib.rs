@@ -140,6 +140,7 @@ pack_types! {
             author: func(state: list<u8>, payload: list<u8>, now: u64) -> tuple<list<u8>, bool, list<u8>, list<list<u8>>>,
             subscribe: func(state: list<u8>, app-id: string) -> tuple<list<u8>, list<list<u8>>>,
             current-state: func(state: list<u8>) -> list<u8>,
+            current-members: func(state: list<u8>) -> list<list<u8>>,
             event-status: func(state: list<u8>, id: list<u8>) -> u8,
         }
     }
@@ -302,6 +303,23 @@ fn export_current_state(state: Vec<u8>) -> Vec<u8> {
         Ok(s) => node_current_state(&s).unwrap_or_default(),
         Err(_) => Vec::new(),
     }
+}
+
+/// Serve the SM's own `members` read export over the node's CURRENT folded state — so a
+/// client reads the SM's projection instead of re-deriving it host-side (the "use what the
+/// node computes" rule). Any Interface-1 read export is served this way.
+#[export(name = "current-members")]
+fn export_current_members(state: Vec<u8>) -> Vec<Vec<u8>> {
+    match ns_load(&state) {
+        Ok(s) => node_current_members(&s).unwrap_or_default(),
+        Err(_) => Vec::new(),
+    }
+}
+
+fn node_current_members(state: &NodeState) -> Result<Vec<Vec<u8>>, String> {
+    let dag = load_dag(state)?;
+    let mut finality: BTreeMap<Hash, bool> = finality_from_json(&state.final_json);
+    Ok(sm_members(current_state(&dag, &mut finality)))
 }
 
 #[export(name = "event-status")]
