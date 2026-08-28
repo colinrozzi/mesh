@@ -94,16 +94,18 @@
         "rust-overlay": "rust-overlay"
       },
       "locked": {
-        "dirtyRev": "ea61039dbcecac1e64f5614b2badc710eceb836a-dirty",
-        "dirtyShortRev": "ea61039-dirty",
-        "lastModified": 1786856513,
-        "narHash": "sha256-eOgs+zPl0NfddQVNwG9ETMvZUAFlzTh94+2GNs+H6U0=",
-        "type": "git",
-        "url": "file:///home/colin/work/pack"
+        "lastModified": 1787014585,
+        "narHash": "sha256-8RyaPVP+tLZh3B1dr6S/WRsVUDBwuRk/h1Szfr5UUbc=",
+        "owner": "colinrozzi",
+        "repo": "pack",
+        "rev": "f9bac7e9d85387aae9b6fc2be7a363189eeda163",
+        "type": "github"
       },
       "original": {
-        "type": "git",
-        "url": "file:///home/colin/work/pack"
+        "owner": "colinrozzi",
+        "ref": "release-v0.20.0",
+        "repo": "pack",
+        "type": "github"
       }
     },
     "root": {
@@ -216,16 +218,18 @@
         ]
       },
       "locked": {
-        "lastModified": 1781577164,
-        "narHash": "sha256-hJL/m8xw+Hoj6ZHUBUQgFUD9mL/ctZBGVWfaCA69cqI=",
-        "rev": "307fa35f850f7e21b7df4acc760290cfedeaf5e5",
-        "revCount": 1116,
-        "type": "git",
-        "url": "file:///home/colin/work/theater"
+        "lastModified": 1786430553,
+        "narHash": "sha256-5uiS2X66er91JSUTo1iVGGALtxQ/BV9c5Du+DtDqnfk=",
+        "owner": "colinrozzi",
+        "repo": "theater",
+        "rev": "e8affc40359ee888558173481ed2d9660cfb763f",
+        "type": "github"
       },
       "original": {
-        "type": "git",
-        "url": "file:///home/colin/work/theater"
+        "owner": "colinrozzi",
+        "ref": "release-20260812-e8affc4",
+        "repo": "theater",
+        "type": "github"
       }
     }
   },
