@@ -10,21 +10,21 @@
     };
     crane.url = "github:ipetkov/crane";
 
-    # theater — devShell-only (puts the theater CLI on PATH for local integration runs);
-    # NOT a compose input, so this rev does not affect the composed node's ABI.
-    # release-20260812-e8affc4 == theater 0.3.17.
+    # theater — the fleet-transition host (engine-axis / in-module-state + packr 0.24).
+    # Pinned to the exact rev the website pilot is proven-serving on; this is also the
+    # host every mesh_<sm> composite must spawn on (the encoded matching-host pointer).
     theater = {
-      url = "github:colinrozzi/theater/release-20260812-e8affc4";
+      url = "github:colinrozzi/theater/00b0bf93fe69a231463d3ba918fa435c5f2a517d";
       inputs.nixpkgs.follows = "nixpkgs";
       inputs.rust-overlay.follows = "rust-overlay";
       inputs.crane.follows = "crane";
     };
 
     # packr — the composition CLI. Its flake wraps the binary with binaryen (wasm-merge),
-    # so `packr compose` runs correctly inside the nix sandbox. Pinned to the 0.20 release
-    # to match this repo's packr-guest 0.20 source (the fleet-standard packr line).
+    # so `packr compose` runs correctly inside the nix sandbox. Pinned to the 0.24 release
+    # to match this repo's packr-guest 0.24 source (first-class map/set, CGRF v3).
     pack = {
-      url = "github:colinrozzi/pack/release-v0.20.0";
+      url = "github:colinrozzi/pack/release-v0.24.0";
       inputs.nixpkgs.follows = "nixpkgs";
     };
   };

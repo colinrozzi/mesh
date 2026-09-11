@@ -18,16 +18,24 @@
 extern crate alloc;
 
 use alloc::format;
-use alloc::string::{String, ToString};
+use alloc::string::String;
 use alloc::vec::Vec;
 
 use mesh_runtime::{
     run_author, run_current_state, run_init, run_notify, run_on_close, run_on_connect,
-    run_on_data, run_tick, run_watch, rpc_err, rpc_ok, rpc_split, Host, NodeApi, SysState,
+    run_on_data, run_tick, run_watch, rpc_err, rpc_ok, Host, NodeApi, SysState,
 };
 use packr_guest::{export, import, import_from, pack_types, pact, Value};
+use theater_guest::StateCell;
 
 packr_guest::setup_guest!();
+
+/// In-module-state cell (theater engine-axis). SysState is defined in mesh-runtime and used
+/// via `StateCell` DIRECTLY here in the cdylib: a `#[derive(State)]`-emitted `get-state`
+/// export would be dead-stripped from a dependency rlib, so the cell + the get-state export
+/// must live in this entry crate (theater-dev's ruling). The `run_*` helpers are stateless
+/// over `&mut SysState`; the exports below drive them through the cell.
+static STATE: StateCell<SysState> = StateCell::new();
 
 // Generate Cmd + CounterState from the shared counter.pact (shared, via pact!(from …)) — the same schema
 // the SM folds; no protocol crate. The codecs are one-liners over the Graph ABI.
@@ -45,7 +53,7 @@ fn encode_count(n: i64) -> Vec<u8> {
 
 pack_types! {
     imports {
-        theater:simple/runtime {
+        theater:simple/self {
             log: func(msg: string),
         }
         theater:simple/tcp {
@@ -79,11 +87,13 @@ pack_types! {
         }
     }
     exports {
-        theater:simple/actor.init: func(state: value) -> result<sys-state, string>,
-        theater:simple/tcp-client.handle-connection: func(state: sys-state, connection-id: string) -> result<sys-state, string>,
-        theater:simple/tcp-client.on-data: func(state: sys-state, connection-id: string, data: list<u8>) -> result<sys-state, string>,
-        theater:simple/tcp-client.on-close: func(state: sys-state, connection-id: string, reason: string) -> result<sys-state, string>,
-        theater:simple/timer.handle-tick: func(state: sys-state, timer-name: string) -> result<sys-state, string>,
+        // In-module-state model: theater-facing exports take own args only, no state slot.
+        theater:simple/actor.init: func(config: value) -> result<_, string>,
+        theater:simple/actor.get-state: func() -> value,
+        theater:simple/tcp-client.handle-connection: func(connection-id: string) -> result<_, string>,
+        theater:simple/tcp-client.on-data: func(connection-id: string, data: list<u8>) -> result<_, string>,
+        theater:simple/tcp-client.on-close: func(connection-id: string, reason: string) -> result<_, string>,
+        theater:simple/timer.handle-tick: func(timer-name: string) -> result<_, string>,
         // The counter's domain interface — the ONLY surface a caller sees.
         my:counter.increment: func(input: value) -> value,
         my:counter.reset: func(input: value) -> value,
@@ -92,7 +102,7 @@ pack_types! {
     }
 }
 
-#[import(module = "theater:simple/runtime", name = "log")]
+#[import(module = "theater:simple/self", name = "log")]
 fn log(msg: String);
 #[import(module = "theater:simple/timer", name = "now")]
 fn now() -> u64;
@@ -166,47 +176,73 @@ fn node_api() -> NodeApi {
 }
 
 /// The current counter value, decoded from the node's folded state.
-fn current_count(state: &SysState) -> i64 {
-    decode_state(&run_current_state(state, &node_api())).map(|s| s.count).unwrap_or(0)
+fn current_count(s: &SysState) -> i64 {
+    decode_state(&run_current_state(s, &node_api())).map(|st| st.count).unwrap_or(0)
 }
 
 /// Push the current count to watchers if it changed (deduped by `run_notify`).
-fn notify(state: SysState) -> SysState {
-    let c = current_count(&state);
-    run_notify(state, encode_count(c), &host())
+fn notify(s: &mut SysState) {
+    let c = current_count(s);
+    run_notify(s, encode_count(c), &host());
 }
 
-// ---- theater lifecycle (delegate to the framework, then notify watchers) ----
+/// `result<_, string>::ok(())` — success with no payload (theater lifecycle handlers).
+fn ok_unit() -> Value {
+    rpc_ok(Value::Tuple(Vec::new()))
+}
+
+// ---- theater lifecycle (drive the framework through the state cell, then notify) ----
 
 #[export(name = "theater:simple/actor.init")]
-fn init(state: Value) -> Result<(SysState, ()), String> {
-    let config = match state {
+fn init(config: Value) -> Value {
+    let config = match config {
         Value::String(s) if !s.is_empty() => s,
-        _ => return Err("missing init_state (need {\"node_seed\":\"...\"})".to_string()),
+        _ => return rpc_err("missing init_state (need {\"node_seed\":\"...\"})"),
     };
-    Ok((run_init(config, &node_api(), &host())?, ()))
+    match run_init(config, &node_api(), &host()) {
+        Ok(state) => {
+            STATE.set(state);
+            ok_unit()
+        }
+        Err(e) => rpc_err(&e),
+    }
+}
+
+/// Hand-written get-state (SysState lives in mesh-runtime, so no `#[derive(State)]` here);
+/// keeps the actor inspectable via `get-actor-state`.
+#[export(name = "theater:simple/actor.get-state")]
+fn get_state() -> Value {
+    STATE.with(|s| Value::from(s.clone()))
 }
 
 #[export(name = "theater:simple/tcp-client.handle-connection")]
-fn handle_connection(state: SysState, conn_id: String) -> Result<(SysState, ()), String> {
-    Ok((run_on_connect(state, conn_id, &host(), &node_api()), ()))
+fn handle_connection(conn_id: String) -> Value {
+    STATE.with_mut(|s| run_on_connect(s, conn_id, &host(), &node_api()));
+    ok_unit()
 }
 
 #[export(name = "theater:simple/tcp-client.on-data")]
-fn on_data(state: SysState, conn_id: String, data: Vec<u8>) -> Result<(SysState, ()), String> {
-    let state = run_on_data(state, conn_id, data, &host(), &node_api());
-    Ok((notify(state), ()))
+fn on_data(conn_id: String, data: Vec<u8>) -> Value {
+    STATE.with_mut(|s| {
+        run_on_data(s, conn_id, data, &host(), &node_api());
+        notify(s);
+    });
+    ok_unit()
 }
 
 #[export(name = "theater:simple/tcp-client.on-close")]
-fn on_close(state: SysState, conn_id: String, _reason: String) -> Result<(SysState, ()), String> {
-    Ok((run_on_close(state, conn_id, &node_api()), ()))
+fn on_close(conn_id: String, _reason: String) -> Value {
+    STATE.with_mut(|s| run_on_close(s, conn_id, &node_api()));
+    ok_unit()
 }
 
 #[export(name = "theater:simple/timer.handle-tick")]
-fn handle_tick(state: SysState, _timer_name: String) -> Result<(SysState, ()), String> {
-    let state = run_tick(state, &host(), &node_api());
-    Ok((notify(state), ()))
+fn handle_tick(_timer_name: String) -> Value {
+    STATE.with_mut(|s| {
+        run_tick(s, &host(), &node_api());
+        notify(s);
+    });
+    ok_unit()
 }
 
 // ---- the counter's domain interface ----
@@ -215,57 +251,47 @@ fn handle_tick(state: SysState, _timer_name: String) -> Result<(SysState, ()), S
 /// A non-positive `n` is rejected by the SM, so the count is unchanged.
 #[export(name = "my:counter.increment")]
 fn increment(input: Value) -> Value {
-    let (state, params) = match rpc_split(input) {
-        Ok(v) => v,
-        Err(e) => return rpc_err(&e),
-    };
-    let n = match i64::try_from(params) {
+    let n = match i64::try_from(input) {
         Ok(n) => n,
         Err(e) => return rpc_err(&format!("increment: expected s64: {:?}", e)),
     };
-    let (state, _ok, _data) = run_author(state, encode(Cmd::Inc(n)), &host(), &node_api());
-    let state = notify(state);
-    let c = current_count(&state);
-    rpc_ok(state, Value::from(c))
+    let c = STATE.with_mut(|s| {
+        let _ = run_author(s, encode(Cmd::Inc(n)), &host(), &node_api());
+        notify(s);
+        current_count(s)
+    });
+    rpc_ok(Value::from(c))
 }
 
 /// `reset()` — author a `Cmd::Reset`, notify watchers, return the new count (0).
 #[export(name = "my:counter.reset")]
-fn reset(input: Value) -> Value {
-    let (state, _params) = match rpc_split(input) {
-        Ok(v) => v,
-        Err(e) => return rpc_err(&e),
-    };
-    let (state, _ok, _data) = run_author(state, encode(Cmd::Reset), &host(), &node_api());
-    let state = notify(state);
-    let c = current_count(&state);
-    rpc_ok(state, Value::from(c))
+fn reset(_input: Value) -> Value {
+    let c = STATE.with_mut(|s| {
+        let _ = run_author(s, encode(Cmd::Reset), &host(), &node_api());
+        notify(s);
+        current_count(s)
+    });
+    rpc_ok(Value::from(c))
 }
 
 /// `count() -> i64` — the current value.
 #[export(name = "my:counter.count")]
-fn count(input: Value) -> Value {
-    let (state, _params) = match rpc_split(input) {
-        Ok(v) => v,
-        Err(e) => return rpc_err(&e),
-    };
-    let c = current_count(&state);
-    rpc_ok(state, Value::from(c))
+fn count(_input: Value) -> Value {
+    let c = STATE.with(current_count);
+    rpc_ok(Value::from(c))
 }
 
 /// `watch(actor-id)` — register for typed count updates; the current value is pushed now,
 /// and each subsequent change is pushed as it happens.
 #[export(name = "my:counter.watch")]
 fn watch(input: Value) -> Value {
-    let (state, params) = match rpc_split(input) {
-        Ok(v) => v,
-        Err(e) => return rpc_err(&e),
-    };
-    let actor = match String::try_from(params) {
+    let actor = match String::try_from(input) {
         Ok(s) => s,
         Err(e) => return rpc_err(&format!("watch: expected actor-id string: {:?}", e)),
     };
-    let c = current_count(&state);
-    let state = run_watch(state, actor, encode_count(c), &host());
-    rpc_ok(state, Value::Bool(true))
+    STATE.with_mut(|s| {
+        let c = current_count(s);
+        run_watch(s, actor, encode_count(c), &host());
+    });
+    rpc_ok(Value::Bool(true))
 }

@@ -63,3 +63,20 @@ Pairs with **stable-ids**: persisting `self_head` is what makes a node's identit
 restarts (no re-genesis), which stable-ids builds on. Persistence is the substrate mechanism;
 the manager owns wiring the store handler + data-dir into the standup and sequencing the fleet
 impact. Cold-start durability = 1+2+3 together; the keeper-node bridges until then.
+
+## Constraint: packr first-class map/set vs a folded-state snapshot
+
+The coming packr wire break (first-class `Value::Map`/`Value::Set`, new node kinds, **no
+dual-read** — see memory `mapset-wire-break`) does **not** touch v0 or the v1 log: the persist
+target is the `NodeState` JSON blob (admitted DAG + finality + self_head + delivered), which is
+`list<>`/opaque-payload-bytes + serde_json framing — zero packr map/set, so it re-decodes across
+the break untouched. `resume` re-**folds** SM state from those persisted events; it never reads a
+persisted folded state.
+
+The one exposure to guard: **never cache the folded SM state on disk.** A folded state (e.g.
+chat's `ChatState`) is full of map/set, so a cached-folded-state snapshot would be a packr-encoded
+map/set blob subject to the break (old-format snapshots stop decoding). This also re-introduces the
+certified-checkpoint complexity v0.4 deliberately shed (full retention). Both push the same way:
+the persist unit is **events**, and resume **re-folds**. If a folded-state checkpoint is ever added
+as a cold-start fold-cost optimization, it MUST be packr-format-versioned and land after/with
+first-class map/set — not before. (Flagged by chat-dev 2026-08-29.)

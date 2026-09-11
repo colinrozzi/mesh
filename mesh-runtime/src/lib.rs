@@ -16,10 +16,11 @@
 #![no_std]
 extern crate alloc;
 
+use alloc::boxed::Box;
 use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
-use packr_guest::{GraphValue, Value};
+use packr_guest::{GraphValue, Value, ValueType};
 
 /// The system's persisted actor state: the host socket handle + the node's opaque bytes.
 /// Shared by every network's entry (referenced as `sys-state` in its `pack_types!`).
@@ -185,68 +186,66 @@ pub fn run_init(config: String, node: &NodeApi, host: &Host) -> Result<SysState,
 
 /// Register `actor` as a watcher and push it the current typed notification now (so a
 /// fresh watcher gets the current value immediately, then subsequent changes via `run_notify`).
-pub fn run_watch(mut s: SysState, actor: String, notify_now: Vec<u8>, host: &Host) -> SysState {
+pub fn run_watch(s: &mut SysState, actor: String, notify_now: Vec<u8>, host: &Host) {
     let _ = (host.ms_send)(actor.clone(), notify_now.clone());
     if !s.watchers.contains(&actor) {
         s.watchers.push(actor);
     }
     s.last_notify = notify_now;
-    s
 }
 
 /// Push a typed notification to every watcher — but only if it actually changed. The
 /// entry computes the notification (its domain projection); the substrate never leaks.
-pub fn run_notify(mut s: SysState, notify: Vec<u8>, host: &Host) -> SysState {
+pub fn run_notify(s: &mut SysState, notify: Vec<u8>, host: &Host) {
     if notify != s.last_notify {
         for w in &s.watchers {
             let _ = (host.ms_send)(w.clone(), notify.clone());
         }
         s.last_notify = notify;
     }
-    s
 }
 
 /// `tcp-client.handle-connection`: an inbound peer connected.
-pub fn run_on_connect(s: SysState, conn: String, host: &Host, node: &NodeApi) -> SysState {
+pub fn run_on_connect(s: &mut SysState, conn: String, host: &Host, node: &NodeApi) {
     if (host.tcp_activate)(conn.clone()).is_err()
         || (host.tcp_set_active)(conn.clone(), alloc::string::ToString::to_string("active")).is_err()
     {
         let _ = (host.tcp_close)(conn);
-        return s;
+        return;
     }
-    let (n, out) = (node.on_connect)(s.node, conn, false, String::new());
+    let (n, out) = (node.on_connect)(core::mem::take(&mut s.node), conn, false, String::new());
+    s.node = n;
     perform(out, host);
-    SysState { node: n, ..s }
 }
 
 /// `tcp-client.on-data`: inbound gossip/handshake bytes.
-pub fn run_on_data(s: SysState, conn: String, data: Vec<u8>, host: &Host, node: &NodeApi) -> SysState {
-    let (n, out) = (node.on_bytes)(s.node, conn, data, (host.now)());
+pub fn run_on_data(s: &mut SysState, conn: String, data: Vec<u8>, host: &Host, node: &NodeApi) {
+    let (n, out) = (node.on_bytes)(core::mem::take(&mut s.node), conn, data, (host.now)());
+    s.node = n;
     perform(out, host);
-    SysState { node: n, ..s }
 }
 
 /// `tcp-client.on-close`: a connection dropped.
-pub fn run_on_close(s: SysState, conn: String, node: &NodeApi) -> SysState {
-    let n = (node.on_close)(s.node, conn);
-    SysState { node: n, ..s }
+pub fn run_on_close(s: &mut SysState, conn: String, node: &NodeApi) {
+    s.node = (node.on_close)(core::mem::take(&mut s.node), conn);
 }
 
 /// `timer.handle-tick`: delivery + anti-entropy.
-pub fn run_tick(s: SysState, host: &Host, node: &NodeApi) -> SysState {
-    let (n, out) = (node.tick)(s.node);
+pub fn run_tick(s: &mut SysState, host: &Host, node: &NodeApi) {
+    let (n, out) = (node.tick)(core::mem::take(&mut s.node));
+    s.node = n;
     perform(out, host);
-    SysState { node: n, ..s }
 }
 
 // ---- action helpers the entry's typed verbs build on ----
 
 /// Author a payload and perform the resulting effects. Returns (new state, ok, data)
 /// where data is the 32-byte hash on success or the SM's reason bytes on rejection.
-pub fn run_author(s: SysState, payload: Vec<u8>, host: &Host, node: &NodeApi) -> (SysState, bool, Vec<u8>) {
-    let (n, ok, data, out) = (node.author)(s.node, payload, (host.now)());
+pub fn run_author(s: &mut SysState, payload: Vec<u8>, host: &Host, node: &NodeApi) -> (bool, Vec<u8>) {
+    let (n, ok, data, out) = (node.author)(core::mem::take(&mut s.node), payload, (host.now)());
+    s.node = n;
     perform(out, host);
-    (SysState { node: n, ..s }, ok, data)
+    (ok, data)
 }
 
 /// The folded SM state bytes at the current frontier.
@@ -260,43 +259,33 @@ pub fn run_event_status(s: &SysState, id: Vec<u8>, node: &NodeApi) -> u8 {
 }
 
 /// Register/replace the subscribed app; replays the finalized history to it.
-pub fn run_subscribe(s: SysState, app_id: String, host: &Host, node: &NodeApi) -> SysState {
-    let (n, out) = (node.subscribe)(s.node, app_id);
+pub fn run_subscribe(s: &mut SysState, app_id: String, host: &Host, node: &NodeApi) {
+    let (n, out) = (node.subscribe)(core::mem::take(&mut s.node), app_id);
+    s.node = n;
     perform(out, host);
-    SysState { node: n, ..s }
 }
 
-// ---- RPC marshaling helpers (the theater rpc value convention) ----
+// ---- RPC marshaling helpers (in-module-state: no state slot; the cdylib owns the cell) ----
+//
+// The entry's typed verbs read/mutate the cell (`STATE.with_mut(|s| run_x(s, ..))`) and
+// wrap their own return here. packr-abi 0.24 encodes result<T,E> as `Value::Result` (NOT a
+// Variant); the caller peels the transport wrapper + this result to get the bare `ret`.
 
-/// Split an RPC input `tuple<state, params>` into the typed state + raw params.
-pub fn rpc_split(input: Value) -> Result<(SysState, Value), String> {
-    match input {
-        Value::Tuple(mut items) if !items.is_empty() => {
-            let state = SysState::try_from(items.remove(0))
-                .map_err(|e| format!("rpc: undecodable sys state: {:?}", e))?;
-            let params = if items.is_empty() { Value::Tuple(Vec::new()) } else { items.remove(0) };
-            Ok((state, params))
-        }
-        _ => Err(alloc::string::ToString::to_string("rpc: expected input tuple<state, ...>")),
+/// `result<ret, string>::ok(ret)` — no state slot.
+pub fn rpc_ok(ret: Value) -> Value {
+    Value::Result {
+        ok_type: ret.infer_type(),
+        err_type: ValueType::String,
+        value: Ok(Box::new(ret)),
     }
 }
 
-/// `result::ok((state, ret))` — theater persists `state`, the caller receives `ret`.
-pub fn rpc_ok(state: SysState, ret: Value) -> Value {
-    Value::Variant {
-        type_name: alloc::string::ToString::to_string("result"),
-        case_name: alloc::string::ToString::to_string("ok"),
-        tag: 0,
-        payload: alloc::vec![Value::Tuple(alloc::vec![Value::from(state), ret])],
-    }
-}
-
-/// `result::err(msg)`.
+/// `result<_, string>::err(msg)`.
 pub fn rpc_err(msg: &str) -> Value {
-    Value::Variant {
-        type_name: alloc::string::ToString::to_string("result"),
-        case_name: alloc::string::ToString::to_string("err"),
-        tag: 1,
-        payload: alloc::vec![Value::String(alloc::string::ToString::to_string(msg))],
+    let unit = Value::Tuple(Vec::new());
+    Value::Result {
+        ok_type: unit.infer_type(),
+        err_type: ValueType::String,
+        value: Err(Box::new(Value::String(alloc::string::ToString::to_string(msg)))),
     }
 }

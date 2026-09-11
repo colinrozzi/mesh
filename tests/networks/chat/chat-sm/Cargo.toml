@@ -8,7 +8,7 @@ description = "The messaging chat plane as an RSM `state-machine` component (DES
 crate-type = ["cdylib"]
 
 [dependencies]
-packr-guest = "0.20"
+packr-guest = "0.24"
 serde = { version = "1", default-features = false, features = ["alloc", "derive"] }
 serde_json = { version = "1", default-features = false, features = ["alloc"] }
 

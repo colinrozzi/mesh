@@ -94,16 +94,16 @@
         "rust-overlay": "rust-overlay"
       },
       "locked": {
-        "lastModified": 1787014585,
-        "narHash": "sha256-8RyaPVP+tLZh3B1dr6S/WRsVUDBwuRk/h1Szfr5UUbc=",
+        "lastModified": 1788916342,
+        "narHash": "sha256-KjIPEMnE9MXuGHvAiEWoI4WK+99ajspOt8GR3iGoDTc=",
         "owner": "colinrozzi",
         "repo": "pack",
-        "rev": "f9bac7e9d85387aae9b6fc2be7a363189eeda163",
+        "rev": "31188bf47337df05958290bd6307eca72cc623b9",
         "type": "github"
       },
       "original": {
         "owner": "colinrozzi",
-        "ref": "release-v0.20.0",
+        "ref": "release-v0.24.0",
         "repo": "pack",
         "type": "github"
       }
@@ -218,17 +218,17 @@
         ]
       },
       "locked": {
-        "lastModified": 1786430553,
-        "narHash": "sha256-5uiS2X66er91JSUTo1iVGGALtxQ/BV9c5Du+DtDqnfk=",
+        "lastModified": 1789045619,
+        "narHash": "sha256-3NnRT/038Qd15GOsP1LEjphIsqLKIJsW15ja+W34epU=",
         "owner": "colinrozzi",
         "repo": "theater",
-        "rev": "e8affc40359ee888558173481ed2d9660cfb763f",
+        "rev": "00b0bf93fe69a231463d3ba918fa435c5f2a517d",
         "type": "github"
       },
       "original": {
         "owner": "colinrozzi",
-        "ref": "release-20260812-e8affc4",
         "repo": "theater",
+        "rev": "00b0bf93fe69a231463d3ba918fa435c5f2a517d",
         "type": "github"
       }
     }
