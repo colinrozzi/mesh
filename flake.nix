@@ -111,6 +111,12 @@
 
           [[link]]
           consumer = "mesh-system"
+          import   = "node.resume"
+          provider = "mesh"
+          export   = "resume"
+
+          [[link]]
+          consumer = "mesh-system"
           import   = "node.on-connect"
           provider = "mesh"
           export   = "on-connect"
