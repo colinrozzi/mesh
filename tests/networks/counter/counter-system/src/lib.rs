@@ -75,6 +75,9 @@ pack_types! {
         // The composed pure core (node.pact) — declared in FULL (interface hash).
         node {
             init: func(config: string, now: u64) -> result<tuple<list<u8>, list<u8>>, string>,
+            // Declared for interface-hash completeness (the node exports it); counter-system
+            // doesn't drive persistence, so it's unlinked + uncalled (a dead import).
+            resume: func(bytes: list<u8>, config: string) -> result<tuple<list<u8>, list<u8>>, string>,
             on-connect: func(state: list<u8>, conn: string, dialed: bool, peer: string) -> tuple<list<u8>, list<list<u8>>>,
             on-bytes: func(state: list<u8>, conn: string, data: list<u8>, now: u64) -> tuple<list<u8>, list<list<u8>>>,
             on-close: func(state: list<u8>, conn: string) -> list<u8>,

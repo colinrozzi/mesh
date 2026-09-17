@@ -35,6 +35,16 @@ interface node {
         // For each planned dial the system `connect`s, then calls `on-connect(dialed=true)`.
         init: func(config: string, now: u64) -> result<tuple<list<u8>, list<u8>>, string>
 
+        // Cold-start rehydrate: rebuild the node from PERSISTED node-state bytes instead of
+        // re-authoring genesis. `bytes` is a prior `node-state` blob (the system read it back
+        // from its durable store); `config` supplies the INIT PLAN (listen/tick/dials) the
+        // same way `init` does. Validates the blob + that its identity matches config's
+        // node_seed, resets transient fields (connections + subscriber don't survive a
+        // restart), and KEEPS the persisted chain (self_head + DAG + finality) so identity +
+        // frontier are intact and the node reconciles with peers on rejoin. Returns the
+        // rehydrated `node-state` + the encoded init plan (same shape as `init`).
+        resume: func(bytes: list<u8>, config: string) -> result<tuple<list<u8>, list<u8>>, string>
+
         // A raw connection now exists: `dialed`=true for a peer WE dialed (the system
         // just `connect`ed it), false for an inbound accept. `peer` is the expected peer
         // pubkey hex for a dial (empty for inbound). Returns new state + effects (a dial
@@ -67,6 +77,8 @@ interface node {
         // the SM at the current frontier; `event-status` is unknown/pending/finalized/
         // stranded (0/1/2/3).
         current-state: func(state: list<u8>) -> list<u8>
+        // The SM's `members` projection over the current folded state (RSM Interface 1).
+        current-members: func(state: list<u8>) -> list<list<u8>>
         event-status: func(state: list<u8>, id: list<u8>) -> u8
     }
 }

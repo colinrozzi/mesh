@@ -133,6 +133,7 @@ pack_types! {
         // boundary. Pure: state in/out is opaque bytes, effects come back as data.
         node {
             init: func(config: string, now: u64) -> result<tuple<list<u8>, list<u8>>, string>,
+            resume: func(bytes: list<u8>, config: string) -> result<tuple<list<u8>, list<u8>>, string>,
             on-connect: func(state: list<u8>, conn: string, dialed: bool, peer: string) -> tuple<list<u8>, list<list<u8>>>,
             on-bytes: func(state: list<u8>, conn: string, data: list<u8>, now: u64) -> tuple<list<u8>, list<list<u8>>>,
             on-close: func(state: list<u8>, conn: string) -> list<u8>,
@@ -205,6 +206,12 @@ struct PeerEntry {
 #[export(name = "init")]
 fn export_init(config: String, now: u64) -> Result<(Vec<u8>, Vec<u8>), String> {
     let (state, plan) = node_init(&config, now)?;
+    Ok((ns_save(&state), encode_init_plan(&plan)))
+}
+
+#[export(name = "resume")]
+fn export_resume(bytes: Vec<u8>, config: String) -> Result<(Vec<u8>, Vec<u8>), String> {
+    let (state, plan) = node_resume(&bytes, &config)?;
     Ok((ns_save(&state), encode_init_plan(&plan)))
 }
 
@@ -403,6 +410,45 @@ fn node_init(config: &str, now: u64) -> Result<(NodeState, InitPlan), String> {
         app_id: String::new(),
         ready_sent: false,
     };
+    Ok((state, InitPlan { listen_addr, tick_ms, dials }))
+}
+
+/// Cold-start rehydrate (node.pact `resume`): rebuild from PERSISTED node-state bytes instead
+/// of re-authoring genesis. The init plan (listen/tick/dials) comes from `config` exactly like
+/// `init` — the system re-establishes sockets — but the node-state is the persisted blob, so
+/// identity + chain + finality frontier are kept intact (the node reconciles with peers on
+/// rejoin). Validates the blob, checks its identity matches config's node_seed, and resets the
+/// transient fields (connections + subscriber don't survive a restart).
+fn node_resume(bytes: &[u8], config: &str) -> Result<(NodeState, InitPlan), String> {
+    let cfg: InitConfig =
+        serde_json::from_str(config).map_err(|e| format!("parse resume config: {}", e))?;
+    let tick_ms = cfg.tick_ms.unwrap_or(DEFAULT_INTERVAL_MS);
+    let listen_addr = cfg.listen_addr.clone().unwrap_or_else(|| LISTEN_ADDR.to_string());
+    let dials = cfg.dial.iter().map(|p| (p.pubkey.clone(), p.address.clone())).collect();
+
+    let mut state = ns_load(bytes)?;
+
+    // Identity integrity: the persisted signing key MUST match config's node_seed. A mismatch
+    // means a wrong data-dir / seed pairing, which would silently fork the identity — fail loud.
+    let mut h = Sha256::new();
+    h.update(cfg.node_seed.as_bytes());
+    let key_bytes: [u8; 32] = h.finalize().into();
+    if state.signing_key_hex != hex(&key_bytes) {
+        return Err("resume: persisted signing key != config node_seed (wrong data-dir or seed?)".to_string());
+    }
+    // Fail loud on a corrupt blob: the persisted DAG must decode and carry a head.
+    dag_from_json(&state.dag_json)?;
+    if state.self_head_hex.is_empty() {
+        return Err("resume: persisted state has no self_head".to_string());
+    }
+
+    // Reset transient fields — the sockets and the subscribed app are gone across a restart;
+    // the system re-dials the plan's peers and the app re-subscribes.
+    state.connections_json = connections_to_json(&BTreeMap::new());
+    state.app_id = String::new();
+    state.ready_sent = false;
+
+    log(format!("[mesh] resume self_head={}", state.self_head_hex));
     Ok((state, InitPlan { listen_addr, tick_ms, dials }))
 }
 

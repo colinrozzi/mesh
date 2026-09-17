@@ -37,6 +37,10 @@ packr_guest::setup_guest!();
 #[graph(crate = "packr_guest::composite_abi")]
 pub struct SysState {
     pub listener_id: String,
+    /// Durable content-store id (from `store.new()`), where the node blob is persisted for
+    /// cold-boot recovery. Manifest pins the store's id + base-path so it's stable across
+    /// restarts; empty = no store handler (persistence off, in-memory only).
+    pub store_id: String,
     /// The node component's opaque state (see node.pact) — we persist it, never inspect it.
     pub node: Vec<u8>,
 }
@@ -62,6 +66,14 @@ pack_types! {
             register: func() -> result<_, string>,
             send: func(actor-id: string, msg: list<u8>) -> result<_, string>,
         }
+        // Durable store for cold-boot recovery: persist the node blob on mutate, read it back
+        // on init. Optional — absent handler => store.new() errors => persistence stays off.
+        theater:simple/store {
+            new: func() -> result<string, string>,
+            get: func(store-id: string, content-ref: string) -> result<list<u8>, string>,
+            get-by-label: func(store-id: string, label: string) -> result<option<string>, string>,
+            store-at-label: func(store-id: string, label: string, content: list<u8>) -> result<string, string>,
+        }
         // The composed pure core (node.pact / DESIGN-dx.md Interface 0). Declared in FULL
         // (the interface hash covers every function) even though a few are only reached via
         // the RPC surface. State is opaque bytes; effects come back as self-framed blobs.
@@ -69,6 +81,7 @@ pack_types! {
         // so it KEEPS its state-threaded shape through the in-module-state migration.
         node {
             init: func(config: string, now: u64) -> result<tuple<list<u8>, list<u8>>, string>,
+            resume: func(bytes: list<u8>, config: string) -> result<tuple<list<u8>, list<u8>>, string>,
             on-connect: func(state: list<u8>, conn: string, dialed: bool, peer: string) -> tuple<list<u8>, list<list<u8>>>,
             on-bytes: func(state: list<u8>, conn: string, data: list<u8>, now: u64) -> tuple<list<u8>, list<list<u8>>>,
             on-close: func(state: list<u8>, conn: string) -> list<u8>,
@@ -122,10 +135,20 @@ fn tcp_close(conn_id: String) -> Result<(), String>;
 fn message_server_register() -> Result<(), String>;
 #[import(module = "theater:simple/message-server-host", name = "send")]
 fn message_server_send(actor_id: String, msg: Vec<u8>) -> Result<(), String>;
+#[import(module = "theater:simple/store", name = "new")]
+fn store_new() -> Result<String, String>;
+#[import(module = "theater:simple/store", name = "get")]
+fn store_get(store_id: String, content_ref: String) -> Result<Vec<u8>, String>;
+#[import(module = "theater:simple/store", name = "get-by-label")]
+fn store_get_by_label(store_id: String, label: String) -> Result<Option<String>, String>;
+#[import(module = "theater:simple/store", name = "store-at-label")]
+fn store_at_label(store_id: String, label: String, content: Vec<u8>) -> Result<String, String>;
 
 // ---- the composed pure node (node.pact) ----
 #[import_from("node", name = "init")]
 fn node_init(config: String, now: u64) -> Result<(Vec<u8>, Vec<u8>), String>;
+#[import_from("node", name = "resume")]
+fn node_resume(bytes: Vec<u8>, config: String) -> Result<(Vec<u8>, Vec<u8>), String>;
 #[import_from("node", name = "on-connect")]
 fn node_on_connect(state: Vec<u8>, conn: String, dialed: bool, peer: String) -> (Vec<u8>, Vec<Vec<u8>>);
 #[import_from("node", name = "on-bytes")]
@@ -244,6 +267,33 @@ fn decode_init_plan(b: &[u8]) -> (String, u64, alloc::vec::Vec<(String, String)>
     (listen, tick, dials)
 }
 
+// ---- durable persistence (cold-boot recovery) ----
+
+/// The store label under which this node's state blob lives.
+const NODE_STATE_LABEL: &str = "node-state";
+
+/// Write the node blob to the durable store. No-op if persistence is off (store_id empty).
+/// Content-addressed store: store-at-label stores the new bytes + repoints the label at them.
+fn persist(store_id: &str, node: &[u8]) {
+    if store_id.is_empty() {
+        return;
+    }
+    if let Err(e) = store_at_label(store_id.to_string(), NODE_STATE_LABEL.to_string(), node.to_vec()) {
+        log(format!("[mesh-system] persist failed: {}", e));
+    }
+}
+
+/// Read a previously-persisted node blob, if any. None on first boot or persistence-off.
+fn load_persisted(store_id: &str) -> Option<Vec<u8>> {
+    if store_id.is_empty() {
+        return None;
+    }
+    match store_get_by_label(store_id.to_string(), NODE_STATE_LABEL.to_string()) {
+        Ok(Some(content_ref)) => store_get(store_id.to_string(), content_ref).ok(),
+        _ => None,
+    }
+}
+
 // ---- theater lifecycle handlers (the entry: own I/O, drive the node) ----
 
 #[export(name = "theater:simple/actor.init")]
@@ -252,9 +302,26 @@ fn init(config: Value) -> Value {
         Value::String(s) if !s.is_empty() => s,
         _ => return err_result("missing init_state (need {\"node_seed\":\"...\"})"),
     };
-    let (mut node, plan) = match node_init(config, now()) {
-        Ok(v) => v,
-        Err(e) => return err_result(&e),
+
+    // Durable store (optional): a store handler in the manifest gives a stable id via new();
+    // absent/denied => store_id="" => persistence off (in-memory, warm-restart via replay only).
+    let store_id = store_new().unwrap_or_default();
+
+    // Cold-boot recovery: resume from the persisted blob if present (keeps identity + chain +
+    // frontier), else first-boot init (fresh genesis).
+    let (mut node, plan) = match load_persisted(&store_id) {
+        Some(bytes) => match node_resume(bytes, config.clone()) {
+            Ok(v) => {
+                log("[mesh-system] resumed from persisted node-state".to_string());
+                v
+            }
+            // A corrupt / seed-mismatched blob is a hard error — fail loud, don't silently re-genesis.
+            Err(e) => return err_result(&format!("resume failed: {}", e)),
+        },
+        None => match node_init(config, now()) {
+            Ok(v) => v,
+            Err(e) => return err_result(&e),
+        },
     };
     let (listen_addr, tick_ms, dials) = decode_init_plan(&plan);
 
@@ -286,7 +353,9 @@ fn init(config: Value) -> Value {
         }
     }
 
-    SysState::set(SysState { listener_id, node });
+    // Persist the initial/rehydrated state so a subsequent cold boot finds it.
+    persist(&store_id, &node);
+    SysState::set(SysState { listener_id, store_id, node });
     ok_unit()
 }
 
@@ -315,6 +384,8 @@ fn on_data(conn_id: String, data: Vec<u8>) -> Value {
         let node = core::mem::take(&mut s.node);
         let (node, out) = node_on_bytes(node, conn_id, data, now);
         s.node = node;
+        // Ingested gossip grows the DAG — persist so a cold boot has the synced events.
+        persist(&s.store_id, &s.node);
         out
     });
     perform(out);
@@ -358,6 +429,8 @@ fn author_rpc(input: Value) -> Value {
         let node = core::mem::take(&mut s.node);
         let (node, ok, data, out) = node_author(node, payload, ts);
         s.node = node;
+        // A new local event advanced self_head + the DAG — persist for cold-boot durability.
+        persist(&s.store_id, &s.node);
         (ok, data, out)
     });
     perform(out);
