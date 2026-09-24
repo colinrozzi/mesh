@@ -119,6 +119,57 @@ from that ancestry-relative `state` (see `chat-sm` remove-observes-ancestry, `ba
   Admission-final finality is consistent, **not** mutually-exclusive; witness/quorum finality
   for conflict-prone SMs is deferred (see `double-spend`).
 
+## 5b. Validity, convergence & the consensus boundary (when do you ACTUALLY need consensus?)
+
+The most-misunderstood part of the model; it decides whether your SM is a register, a CRDT, or
+needs consensus.
+
+- **Admission ≠ acceptance.** The mesh admits every event (admission-final, no quorum). The SM's
+  `validate` is the ACCEPTANCE gate — per-event "should this be allowed" is decidable at the SM
+  layer, and rejection is deterministic.
+- **Validity is ANCESTRY-RELATIVE + judged once — never re-validated against the merged state.**
+  An event is final iff it validates against its OWN causal ancestry (deps), judged once +
+  memoized; the fold then applies every final event UNCONDITIONALLY in topo order (`src/lib.rs`
+  `fold_state_at`). So you get **deterministic convergence-WITH-rejection** — replicas converge on
+  the validity *decision* itself (which events were cut), not just on pre-filtered ops.
+- **Causal-chain validity is SAFE; concurrent validity must be METADATA-determined.** Validating
+  an event against events it causally follows (authz: author-in-allowlist; well-formedness; "spend
+  ≤ the balance I causally know") → the same reject on every replica. But two CONCURRENT events
+  (neither in the other's ancestry) each pass their own ancestry-relative validate, both finalize,
+  and both apply. The fold's concurrent tiebreak is deterministic but **swappable / not part of
+  the contract** (`src/dag.rs`) — so an SM must NOT derive accept/reject-among-concurrents from
+  it. Concurrent resolution must be a pure function of the ops' OWN metadata (LWW's `(ts,author,
+  id)`; a CRDT's position-ids) so it's identical on every replica regardless of fold order.
+- **So the balance example is exactly what does NOT work:** two concurrent spends each validate
+  against their own past (both see funds; neither sees the other) → both final → both apply →
+  NEGATIVE balance. Convergence gives a *consistent* state, not an *invariant-preserving* one —
+  every replica agrees on the wrong number. That's the conflict frontier / double-spend.
+
+**When you need consensus — the boundary.** Whenever CONCURRENT, each-individually-valid events
+can JOINTLY violate a cross-event invariant. Two escapes, preferred first:
+1. **Confluent-tolerable design (preferred, no consensus):** make the invariant converge to a
+   defined acceptable outcome under concurrency — LWW register (store index), CRDT (wiki sequence,
+   OR-Set membership), commutative ops (counter), content/author-derived identity (Dots, not a
+   shared `next_ino`). Concurrency is semantically fine by construction. THIS is what widens what's
+   safely buildable on gossip — **not validity**.
+2. **Real consensus (deferred witness/quorum finality, CP):** only when the invariant is HARD +
+   INTOLERABLE (`balance ≥ 0`, unique assignment, no-double-spend) — convergence gives a consistent
+   *violation*, and only consensus can PREVENT both conflicting events from finalizing. Needed
+   whether the harm is INTERNAL (a negative balance is already invalid state) or EXTERNAL; the
+   IRREVERSIBLE-EXTERNAL-EFFECT case (ship a good / release funds / tell a user "confirmed" on a
+   locally-valid judgment before global finality — the later merge can't retract it) is the
+   sharpest, non-negotiable sub-case, but not the only one.
+
+**Rule of thumb:** the "needs consensus" instinct is usually wrong for in-SM state — but the escape
+is *design the invariant confluent-tolerable*, not *validity will catch it*. Validity handles
+per-event/causal-chain rejection; concurrent conflicts need a confluent design or (rarely) consensus.
+
+**Subtleties:** (a) `validate` sees ONLY its own SM's folded state — no cross-SM reads in-fold (put
+anything it must check into its own events); (b) finality is memoized (judged once/event) so it's
+incremental, not a full re-scan per fold — but a very large / high-churn DAG bears watching; (c)
+CRDT tombstones accumulate under full retention — a GC-of-SM-state concern for long-lived
+high-churn CRDT SMs (distinct from the store's content GC).
+
 ## 6. State custody & membership
 
 - **The SM owns its state's bytes.** State crosses the boundary as *your* type — a typed
