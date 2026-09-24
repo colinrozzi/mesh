@@ -75,6 +75,17 @@ pub struct NodeState {
     pub app_id: String,
     /// True once the one-shot Ready signal has been sent to the app.
     pub ready_sent: bool,
+    /// Configured dial peers as JSON `[{"pubkey","address"}]` — PERSISTED (unlike the old
+    /// InitPlan dials, which were dropped after init) so re-dial survives across ticks and
+    /// rehydrates on resume. Populated from config at init/resume. Empty = no self-healing dial.
+    #[serde(default)]
+    pub dials_json: String,
+    /// Per-peer last re-dial attempt, JSON map `pubkey -> tick_count`, for storm-safe backoff.
+    #[serde(default)]
+    pub redial_json: String,
+    /// Monotonic tick counter — re-dial rate-limiting is tick-relative (node_tick has no clock).
+    #[serde(default)]
+    pub tick_count: u64,
 }
 
 fn ns_load(bytes: &[u8]) -> Result<NodeState, String> {
@@ -398,7 +409,9 @@ fn node_init(config: &str, now: u64) -> Result<(NodeState, InitPlan), String> {
     let self_head = author_genesis(&mut dag, &signing_key, now).event_hash();
     log(format!("[mesh] init self={}", hex(&self_pubkey)));
 
-    let dials = cfg.dial.iter().map(|p| (p.pubkey.clone(), p.address.clone())).collect();
+    let dials: Vec<(String, String)> =
+        cfg.dial.iter().map(|p| (p.pubkey.clone(), p.address.clone())).collect();
+    let dials_json = serde_json::to_string(&dials).unwrap_or_else(|_| "[]".to_string());
     let state = NodeState {
         signing_key_hex: hex(&key_bytes),
         self_head_hex: hex(&self_head),
@@ -409,6 +422,9 @@ fn node_init(config: &str, now: u64) -> Result<(NodeState, InitPlan), String> {
         connections_json: connections_to_json(&BTreeMap::new()),
         app_id: String::new(),
         ready_sent: false,
+        dials_json,
+        redial_json: "{}".to_string(),
+        tick_count: 0,
     };
     Ok((state, InitPlan { listen_addr, tick_ms, dials }))
 }
@@ -424,7 +440,8 @@ fn node_resume(bytes: &[u8], config: &str) -> Result<(NodeState, InitPlan), Stri
         serde_json::from_str(config).map_err(|e| format!("parse resume config: {}", e))?;
     let tick_ms = cfg.tick_ms.unwrap_or(DEFAULT_INTERVAL_MS);
     let listen_addr = cfg.listen_addr.clone().unwrap_or_else(|| LISTEN_ADDR.to_string());
-    let dials = cfg.dial.iter().map(|p| (p.pubkey.clone(), p.address.clone())).collect();
+    let dials: Vec<(String, String)> =
+        cfg.dial.iter().map(|p| (p.pubkey.clone(), p.address.clone())).collect();
 
     let mut state = ns_load(bytes)?;
 
@@ -447,6 +464,11 @@ fn node_resume(bytes: &[u8], config: &str) -> Result<(NodeState, InitPlan), Stri
     state.connections_json = connections_to_json(&BTreeMap::new());
     state.app_id = String::new();
     state.ready_sent = false;
+    // Refresh the dial set from config (authoritative for peers) + reset the tick-relative
+    // re-dial timing, so self-healing dial re-establishes the mesh cleanly after a restart.
+    state.dials_json = serde_json::to_string(&dials).unwrap_or_else(|_| "[]".to_string());
+    state.redial_json = "{}".to_string();
+    state.tick_count = 0;
 
     log(format!("[mesh] resume self_head={}", state.self_head_hex));
     Ok((state, InitPlan { listen_addr, tick_ms, dials }))
