@@ -170,6 +170,43 @@ incremental, not a full re-scan per fold — but a very large / high-churn DAG b
 CRDT tombstones accumulate under full retention — a GC-of-SM-state concern for long-lived
 high-churn CRDT SMs (distinct from the store's content GC).
 
+### SM-designer checklist — register / CRDT / consensus?
+
+A scannable form of the above, worked against a live SM (store-dev's mesh index — a name→hash
+map with an author allow-list). Run it top-down; most SMs stop at step 1.
+
+1. **Is the invariant CONFLUENT-TOLERABLE? (do this FIRST — it covers most cases.)** Design so
+   concurrent conflicts converge to a defined, VALID outcome, resolved in `apply` by op METADATA:
+   LWW register (highest `(ts,author,id)` wins), CRDT (sequence/set/counter), commutative/
+   idempotent ops (max/union/add). Concurrency is then semantically fine by construction — no
+   consensus. *(index SM: Put/Remove = LWW idempotent-max; AddWriter = pure set-add — concurrent
+   writes converge regardless of fold order.)*
+2. **Validity is ANCESTRY-RELATIVE, judged once.** `validate` may reject on authorization (author
+   in the folded allow-list), well-formedness, and checks against THIS SM's own ancestry-folded
+   state (e.g. `spend ≤ my-known-balance-in-ancestry`). It CANNOT see concurrent siblings; the
+   fold applies every final event unconditionally — never assume validity re-checks against a
+   merged running state.
+3. **Don't lean on the fold tiebreak.** Topo-sort is contract-safe (ancestry-respecting); the
+   tiebreak among CONCURRENT events is swappable / not part of the contract. Resolve concurrent
+   outcomes (which write wins, uniqueness) from op METADATA, never fold position. *(Anti-pattern,
+   live: the index SM's Genesis does `if !genesis_done { set allow_list }` = first-in-fold-order
+   wins → among concurrent genesis events the winner is tiebreak-determined, not metadata. Benign
+   here — genesis is a single controlled op — but exactly the trap; metadata-clean = pick by
+   `(ts,author,id)`.)*
+4. **No cross-SM reads in-fold.** `validate`/`apply` see ONLY this SM's folded state + the event.
+   If a decision needs another SM's state, model it as an event INTO this SM — cross-SM invariants
+   aren't enforceable in-fold (each SM is its own DAG/state).
+5. **HARD + INTOLERABLE invariant → consensus (the only case).** If concurrent-jointly-invalid
+   genuinely can't be made confluent-tolerable (`balance ≥ 0`, unique assignment, no-double-spend),
+   convergence gives a consistent VIOLATION, not prevention — only real consensus (deferred
+   witness-finality, CP) prevents both from finalizing. Applies to INTERNAL hard invariants too,
+   not just external; irreversible-external-effect-before-finality (shipped good / released funds /
+   "confirmed" to a user) is the sharpest, non-negotiable sub-case.
+6. **Bound the re-fold + tombstones.** Finality is memoized (each event judged once), but a late
+   CONCURRENT event can force an ancestry re-fold → snapshot to bound the cost at large DAGs.
+   Long-lived, high-churn CRDT SMs accumulate delete tombstones (own state, separate from content
+   GC) → plan tombstone-GC.
+
 ## 6. State custody & membership
 
 - **The SM owns its state's bytes.** State crosses the boundary as *your* type — a typed
