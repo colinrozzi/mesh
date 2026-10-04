@@ -905,8 +905,13 @@ fn step_accepted(
         out.push(Effect::Close(conn_id.to_string()));
         return Step::Close;
     }
-    for want in decode_hashes(&frame.payload).into_iter().filter(|h| !dag.has(h)) {
-        out.push(Effect::Send(conn_id.to_string(), encode_hashes(FRAME_WANT, &[want])));
+    // Batch the initial head-WANT into one frame (the peer frontier the server sent in
+    // ACCEPTED); the full catch-up then arrives as the server's frontier-delta stream once it
+    // sees our frontier below.
+    let want: Vec<Hash> =
+        decode_hashes(&frame.payload).into_iter().filter(|h| !dag.has(h)).collect();
+    if !want.is_empty() {
+        out.push(Effect::Send(conn_id.to_string(), encode_hashes(FRAME_WANT, &want)));
     }
     out.push(Effect::Send(conn_id.to_string(), encode_hashes(FRAME_FRONTIER, &all_heads(dag))));
     log(format!("[mesh] conn {} authed to {}", conn_id, peer_pubkey_hex));
@@ -962,12 +967,27 @@ fn handle_authed_frame(
             self_head
         }
         FRAME_FRONTIER => {
-            let missing: Vec<Hash> = decode_hashes(&frame.payload)
-                .into_iter()
-                .filter(|h| !dag.has(h))
-                .collect();
-            if !missing.is_empty() {
-                out.push(Effect::Send(conn_id.to_string(), encode_hashes(FRAME_WANT, &missing)));
+            // The peer advertised its heads. Everything reachable from them is what it already
+            // has; stream the COMPLEMENT (our events it lacks) in topological order so it
+            // ingests deps-first in ONE burst — collapsing the old O(depth) backward
+            // WANT-per-layer catch-up walk to ~1 round trip. Pruned by the peer's frontier, so
+            // a warm re-sync (routine under self-healing dial) ships only the genuinely-new
+            // events, not the whole history; a cold join (peer frontier = just its genesis)
+            // gets the whole room at once. Safe because the peer buffers out-of-order and the
+            // SM apply is confluent, so a bulk topological stream folds to identical state.
+            let peer_frontier = decode_hashes(&frame.payload);
+            let peer_set: BTreeSet<Hash> = peer_frontier.iter().copied().collect();
+            // Skip the full ancestry walk when the peer already holds all our heads (the
+            // steady-state synced case — every 2s tick) so anti-entropy stays cheap.
+            if !all_heads(dag).iter().all(|h| peer_set.contains(h)) {
+                let peer_has = dag.ancestors_of(&peer_frontier);
+                let missing: BTreeSet<Hash> =
+                    dag.events.keys().copied().filter(|h| !peer_has.contains(h)).collect();
+                for h in dag.topo_sort(&missing) {
+                    if let Some(ev) = dag.events.get(&h) {
+                        out.push(Effect::Send(conn_id.to_string(), encode_deliver(&ev.encode())));
+                    }
+                }
             }
             self_head
         }

@@ -278,6 +278,39 @@ mod tests {
     }
 
     #[test]
+    fn frontier_delta_is_the_complement_of_peer_ancestry() {
+        // Linear chain g <- e1 <- e2 <- e3. This is the computation the FRAME_FRONTIER
+        // handler does: stream {my events} \ ancestors_of(peer_frontier), topo-ordered.
+        let a = key(1);
+        let mut dag = Dag::new();
+        let g = ev(&a, None, Vec::new(), Vec::new());
+        let gh = g.event_hash();
+        dag.ingest(g).unwrap();
+        let e1 = ev(&a, Some(gh), Vec::new(), b"1".to_vec());
+        let e1h = e1.event_hash();
+        dag.ingest(e1).unwrap();
+        let e2 = ev(&a, Some(e1h), Vec::new(), b"2".to_vec());
+        let e2h = e2.event_hash();
+        dag.ingest(e2).unwrap();
+        let e3 = ev(&a, Some(e2h), Vec::new(), b"3".to_vec());
+        let e3h = e3.event_hash();
+        dag.ingest(e3).unwrap();
+
+        // ancestors_of a mid head = that event + everything before it.
+        assert_eq!(dag.ancestors_of(&[e1h]), [gh, e1h].into_iter().collect());
+
+        let delta = |frontier: &[Hash]| {
+            let peer_has = dag.ancestors_of(frontier);
+            let missing: BTreeSet<Hash> =
+                dag.events.keys().copied().filter(|h| !peer_has.contains(h)).collect();
+            dag.topo_sort(&missing)
+        };
+        assert_eq!(delta(&[e1h]), vec![e2h, e3h], "behind peer gets exactly the newer events, deps-first");
+        assert_eq!(delta(&[]).len(), 4, "cold peer (empty frontier) gets the whole DAG at once");
+        assert!(delta(&[e3h]).is_empty(), "synced peer (frontier=head) gets nothing");
+    }
+
+    #[test]
     fn admits_any_signed_author() {
         // No membership gate in the dumb core: a "stranger" is admitted
         // structurally (the SM's validate is what would strand a non-member).
