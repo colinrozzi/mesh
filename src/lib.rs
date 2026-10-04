@@ -105,6 +105,11 @@ enum Effect {
     App(String, Vec<u8>),
     /// tcp `close` of connection `conn`.
     Close(String),
+    /// tcp re-dial a configured peer we've lost the connection to: `Dial(peer_pubkey_hex,
+    /// address)`. Unlike the others this is NOT pure host-I/O — the system runs the full
+    /// init-style dial sequence (connect → `on-connect(dialed=true)` → HELLO) so the node
+    /// re-enters the handshake. Emitted by `node_tick` for self-healing reconnect.
+    Dial(String, String),
 }
 
 type Outbox = Vec<Effect>;
@@ -351,12 +356,15 @@ fn export_event_status(state: Vec<u8>, id: Vec<u8>) -> u8 {
 // ---- effect + init-plan codecs (the `node` interface wire) ----
 
 /// One effect as `[kind:u8][id-len:u16 BE][id utf8][payload...]` (kind 0=Send, 1=App,
-/// 2=Close). The system decodes and performs.
+/// 2=Close, 3=Dial). For Dial the `id` is the dial address and the payload is the peer's
+/// expected pubkey hex (so the system can `connect(address)` then `on-connect(dialed=true,
+/// peer=pubkey)`).
 fn encode_effect(e: &Effect) -> Vec<u8> {
     let (kind, id, payload): (u8, &str, &[u8]) = match e {
         Effect::Send(c, b) => (0, c.as_str(), b),
         Effect::App(i, b) => (1, i.as_str(), b),
         Effect::Close(c) => (2, c.as_str(), &[]),
+        Effect::Dial(pk, addr) => (3, addr.as_str(), pk.as_bytes()),
     };
     let mut v = Vec::with_capacity(3 + id.len() + payload.len());
     v.push(kind);
@@ -626,8 +634,60 @@ fn node_on_close(mut state: NodeState, conn_id: String) -> NodeState {
     state
 }
 
+/// Re-dial backoff: a configured peer with no live/in-flight connection is re-dialed at
+/// most once per this many ticks (storm-safe — never a reconnect hot-loop; see the
+/// conn-churn incident). At a typical 2s tick this is ~16s between attempts per peer.
+const REDIAL_INTERVAL_TICKS: u64 = 8;
+
+/// The peer pubkey a connection is for, across every handshake phase — `None` only for a
+/// just-accepted inbound conn whose peer hasn't sent its pubkey yet (`AwaitingHello`). Used
+/// to decide whether a configured dial peer already has a live OR in-flight connection, so
+/// re-dial never duplicates an existing/handshaking link.
+fn conn_peer(cs: &ConnState) -> Option<&str> {
+    match &cs.phase {
+        Phase::Authed { pubkey_hex } => Some(pubkey_hex),
+        Phase::AwaitingAuth { pubkey_hex, .. } => Some(pubkey_hex),
+        Phase::AwaitingChallenge { peer_pubkey_hex } => Some(peer_pubkey_hex),
+        Phase::AwaitingAccepted { peer_pubkey_hex } => Some(peer_pubkey_hex),
+        Phase::AwaitingHello => None,
+    }
+}
+
+/// Do we already have a connection (live or mid-handshake) to this peer pubkey?
+fn has_conn_to(conns: &BTreeMap<String, ConnState>, pubkey_hex: &str) -> bool {
+    conns.values().any(|cs| conn_peer(cs) == Some(pubkey_hex))
+}
+
+/// Decide which configured peers to re-dial this tick: those with no live/in-flight
+/// connection, rate-limited to once per `REDIAL_INTERVAL_TICKS` per peer (storm-safe).
+/// Returns the Dial effects plus the updated per-peer last-attempt map. Pure — this is the
+/// re-dial logic, factored out of `node_tick` so it's unit-testable without a composed SM.
+fn redial_plan(
+    dials: &[(String, String)],
+    conns: &BTreeMap<String, ConnState>,
+    mut redial: BTreeMap<String, u64>,
+    tick_count: u64,
+) -> (Vec<Effect>, BTreeMap<String, u64>) {
+    let mut effects = Vec::new();
+    for (pubkey, address) in dials {
+        if has_conn_to(conns, pubkey) {
+            continue;
+        }
+        let due = redial
+            .get(pubkey)
+            .is_none_or(|&last| tick_count.wrapping_sub(last) >= REDIAL_INTERVAL_TICKS);
+        if due {
+            log(format!("[mesh] re-dial {} @ {}", &pubkey[..pubkey.len().min(8)], address));
+            effects.push(Effect::Dial(pubkey.clone(), address.clone()));
+            redial.insert(pubkey.clone(), tick_count);
+        }
+    }
+    (effects, redial)
+}
+
 /// Periodic tick: delivery safety-net + anti-entropy (re-advertise frontier to authed
-/// peers so a one-shot gossip miss or partition heal reconciles within a few ticks).
+/// peers so a one-shot gossip miss or partition heal reconciles within a few ticks) +
+/// self-healing re-dial of any configured peer whose connection we've lost.
 fn node_tick(state: NodeState) -> Result<(NodeState, Outbox), String> {
     let mut dag = dag_from_json(&state.dag_json)?;
     for ev in events_from_json(&state.pending_json) {
@@ -651,6 +711,23 @@ fn node_tick(state: NodeState) -> Result<(NodeState, Outbox), String> {
     }
     let ready_sent = maybe_emit_ready(&state.app_id, state.ready_sent, &mut out);
 
+    // Self-healing re-dial: for every configured peer with no live/in-flight connection,
+    // emit a Dial (rate-limited per peer so a persistently-unreachable peer never hot-loops).
+    let tick_count = state.tick_count.wrapping_add(1);
+    let dials: Vec<(String, String)> = if state.dials_json.is_empty() {
+        Vec::new()
+    } else {
+        serde_json::from_str(&state.dials_json).unwrap_or_default()
+    };
+    let redial: BTreeMap<String, u64> = if state.redial_json.is_empty() {
+        BTreeMap::new()
+    } else {
+        serde_json::from_str(&state.redial_json).unwrap_or_default()
+    };
+    let (dial_effects, redial) = redial_plan(&dials, &conns, redial, tick_count);
+    out.extend(dial_effects);
+    let redial_json = serde_json::to_string(&redial).unwrap_or_else(|_| "{}".to_string());
+
     let delivered_vec: Vec<Hash> = delivered.iter().copied().collect();
     Ok((
         NodeState {
@@ -659,6 +736,8 @@ fn node_tick(state: NodeState) -> Result<(NodeState, Outbox), String> {
             delivered_json: hashes_to_json(&delivered_vec),
             final_json: finality_to_json(&finality),
             ready_sent,
+            tick_count,
+            redial_json,
             ..state
         },
         out,
@@ -1257,4 +1336,119 @@ fn challenge_nonce(conn_id: &str, now: u64) -> [u8; 32] {
     h.update(now.to_be_bytes());
     h.update(conn_id.as_bytes());
     h.finalize().into()
+}
+
+#[cfg(test)]
+mod redial_tests {
+    use super::*;
+
+    fn cfg(dials: &[(&str, &str)]) -> String {
+        let dial: Vec<String> = dials
+            .iter()
+            .map(|(pk, addr)| format!(r#"{{"pubkey":"{}","address":"{}"}}"#, pk, addr))
+            .collect();
+        format!(r#"{{"node_seed":"test-seed","dial":[{}]}}"#, dial.join(","))
+    }
+
+    fn d(pk: &str, addr: &str) -> (String, String) {
+        (pk.to_string(), addr.to_string())
+    }
+
+    fn authed(pubkey: &str) -> ConnState {
+        ConnState { phase: Phase::Authed { pubkey_hex: pubkey.to_string() }, buf: Vec::new() }
+    }
+
+    fn dialed(effects: &[Effect]) -> Vec<(String, String)> {
+        effects
+            .iter()
+            .filter_map(|e| match e {
+                Effect::Dial(pk, addr) => Some((pk.clone(), addr.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    // The re-dial decision is tested directly against `redial_plan` (pure) rather than
+    // through `node_tick`, which pulls in the composed SM imports (not present in a host
+    // build). The full drop-then-reconnect path is covered by integration (self-spawn).
+
+    #[test]
+    fn redials_unconnected_peers_then_backs_off() {
+        let dials = vec![d("aa", "1.1.1.1:9"), d("bb", "2.2.2.2:9")];
+        let conns = BTreeMap::new();
+
+        // Tick 1: neither peer connected -> both re-dialed, both stamped at tick 1.
+        let (eff, redial) = redial_plan(&dials, &conns, BTreeMap::new(), 1);
+        let got = dialed(&eff);
+        assert_eq!(got.len(), 2, "both unconnected peers re-dialed on the first tick");
+        assert!(got.contains(&d("aa", "1.1.1.1:9")) && got.contains(&d("bb", "2.2.2.2:9")));
+
+        // Within the backoff window (up to tick REDIAL_INTERVAL_TICKS) -> no re-dials.
+        let (eff, redial) = redial_plan(&dials, &conns, redial, REDIAL_INTERVAL_TICKS);
+        assert!(dialed(&eff).is_empty(), "storm-safe: no re-dial inside the backoff window");
+
+        // One tick past the interval (last=1, now=1+INTERVAL) -> re-dial fires again.
+        let (eff, _) = redial_plan(&dials, &conns, redial, 1 + REDIAL_INTERVAL_TICKS);
+        assert_eq!(dialed(&eff).len(), 2, "re-dial resumes after the backoff interval");
+    }
+
+    #[test]
+    fn skips_peers_with_a_live_or_inflight_conn() {
+        let dials = vec![d("aa", "1.1.1.1:9"), d("bb", "2.2.2.2:9")];
+        // aa is live (Authed), bb is mid-handshake (dialing) -> neither re-dialed.
+        let mut conns: BTreeMap<String, ConnState> = BTreeMap::new();
+        conns.insert("c1".to_string(), authed("aa"));
+        conns.insert("c2".to_string(), ConnState::dialing("bb".to_string()));
+
+        let (eff, _) = redial_plan(&dials, &conns, BTreeMap::new(), 1);
+        assert!(dialed(&eff).is_empty(), "no re-dial when every peer has a live/in-flight conn");
+    }
+
+    #[test]
+    fn redials_only_the_disconnected_peer() {
+        let dials = vec![d("aa", "1.1.1.1:9"), d("bb", "2.2.2.2:9")];
+        let mut conns: BTreeMap<String, ConnState> = BTreeMap::new();
+        conns.insert("c1".to_string(), authed("aa")); // aa connected, bb not
+
+        let (eff, _) = redial_plan(&dials, &conns, BTreeMap::new(), 1);
+        assert_eq!(dialed(&eff), vec![d("bb", "2.2.2.2:9")], "only the disconnected peer re-dialed");
+    }
+
+    #[test]
+    fn has_conn_to_matches_every_handshake_phase() {
+        let mut conns: BTreeMap<String, ConnState> = BTreeMap::new();
+        conns.insert("a".to_string(), authed("live"));
+        conns.insert("b".to_string(), ConnState::dialing("outbound".to_string()));
+        conns.insert(
+            "c".to_string(),
+            ConnState {
+                phase: Phase::AwaitingAuth { pubkey_hex: "inbound".to_string(), nonce_hex: String::new() },
+                buf: Vec::new(),
+            },
+        );
+        conns.insert("d".to_string(), ConnState::awaiting_hello()); // peer unknown yet
+
+        assert!(has_conn_to(&conns, "live"));
+        assert!(has_conn_to(&conns, "outbound"));
+        assert!(has_conn_to(&conns, "inbound"));
+        assert!(!has_conn_to(&conns, "nobody"));
+    }
+
+    #[test]
+    fn resume_rehydrates_the_dial_set() {
+        // init with one dial peer, persist, then resume (same seed) with the same config:
+        // the dial-set must be rehydrated + the redial timing reset, so re-dial still works.
+        let (state, _) = node_init(&cfg(&[("aa", "1.1.1.1:9")]), 1).unwrap();
+        let persisted = ns_save(&state);
+        let (resumed, _) = node_resume(&persisted, &cfg(&[("aa", "1.1.1.1:9")])).unwrap();
+
+        let dials: Vec<(String, String)> = serde_json::from_str(&resumed.dials_json).unwrap();
+        assert_eq!(dials, vec![d("aa", "1.1.1.1:9")], "resume rehydrated the dial-set");
+        assert_eq!(resumed.redial_json, "{}", "resume reset per-peer redial timing");
+        assert_eq!(resumed.tick_count, 0, "resume reset the tick counter");
+
+        // And the rehydrated set drives a re-dial on the next tick.
+        let (eff, _) = redial_plan(&dials, &BTreeMap::new(), BTreeMap::new(), 1);
+        assert_eq!(dialed(&eff), vec![d("aa", "1.1.1.1:9")], "rehydrated dial-set re-dials");
+    }
 }

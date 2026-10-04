@@ -226,6 +226,48 @@ fn perform(effects: Vec<Vec<u8>>) {
     }
 }
 
+/// Split the node's tick effects into (re-dials, rest). A Dial (kind 3) can't go through
+/// `perform` — it re-enters the node (`on-connect`) and mutates the cell — so pull those
+/// out and run them via `execute_dial`; everything else passes through unchanged. A Dial is
+/// `[3][addr-len:u16 BE][addr][pubkey]`: id = dial address, payload = peer pubkey hex.
+fn take_dials(effects: Vec<Vec<u8>>) -> (Vec<(String, String)>, Vec<Vec<u8>>) {
+    let mut dials = Vec::new();
+    let mut rest = Vec::new();
+    for e in effects {
+        if e.len() >= 3 && e[0] == 3 {
+            let id_len = u16::from_be_bytes([e[1], e[2]]) as usize;
+            if e.len() >= 3 + id_len {
+                let address = String::from_utf8_lossy(&e[3..3 + id_len]).into_owned();
+                let pubkey = String::from_utf8_lossy(&e[3 + id_len..]).into_owned();
+                dials.push((pubkey, address));
+                continue;
+            }
+        }
+        rest.push(e);
+    }
+    (dials, rest)
+}
+
+/// Execute a self-healing re-dial the node asked for on tick: connect, then let the node
+/// emit its HELLO via `on-connect(dialed=true)`. Mirrors the init dial sequence; not
+/// expressible as a `perform` effect because it re-enters the node and mutates the cell.
+fn execute_dial(pubkey: String, address: String) {
+    match tcp_connect(address.clone()) {
+        Ok(conn_id) => {
+            let _ = tcp_activate(conn_id.clone());
+            let _ = tcp_set_active(conn_id.clone(), "active".to_string());
+            let out = SysState::with_mut(|s| {
+                let node = core::mem::take(&mut s.node);
+                let (node, out) = node_on_connect(node, conn_id, true, pubkey);
+                s.node = node;
+                out
+            });
+            perform(out);
+        }
+        Err(e) => log(format!("[mesh-system] re-dial {} failed: {}", address, e)),
+    }
+}
+
 /// Decode the node's init plan: `[listen-len:u16][listen][tick_ms:u64][ndials:u16]` then
 /// per dial `[pk-len:u16][pk][addr-len:u16][addr]`. Returns (listen_addr, tick_ms, dials).
 fn decode_init_plan(b: &[u8]) -> (String, u64, alloc::vec::Vec<(String, String)>) {
@@ -409,7 +451,12 @@ fn handle_tick(_timer_name: String) -> Value {
         s.node = node;
         out
     });
-    perform(out);
+    // Re-dials re-enter the node, so they can't ride `perform` — split and run them after.
+    let (dials, rest) = take_dials(out);
+    perform(rest);
+    for (pubkey, address) in dials {
+        execute_dial(pubkey, address);
+    }
     ok_unit()
 }
 

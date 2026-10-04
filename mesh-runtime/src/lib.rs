@@ -230,11 +230,51 @@ pub fn run_on_close(s: &mut SysState, conn: String, node: &NodeApi) {
     s.node = (node.on_close)(core::mem::take(&mut s.node), conn);
 }
 
-/// `timer.handle-tick`: delivery + anti-entropy.
+/// Split the node's tick effects into (re-dials, rest). A Dial (kind 3) re-enters the node
+/// (`on-connect`) so it can't ride `perform`; pull those out. `[3][addr-len:u16][addr][pubkey]`:
+/// id = dial address, payload = peer pubkey hex.
+fn take_dials(effects: Vec<Vec<u8>>) -> (Vec<(String, String)>, Vec<Vec<u8>>) {
+    let mut dials = Vec::new();
+    let mut rest = Vec::new();
+    for e in effects {
+        if e.len() >= 3 && e[0] == 3 {
+            let id_len = u16::from_be_bytes([e[1], e[2]]) as usize;
+            if e.len() >= 3 + id_len {
+                let address = String::from_utf8_lossy(&e[3..3 + id_len]).into_owned();
+                let pubkey = String::from_utf8_lossy(&e[3 + id_len..]).into_owned();
+                dials.push((pubkey, address));
+                continue;
+            }
+        }
+        rest.push(e);
+    }
+    (dials, rest)
+}
+
+/// Execute a self-healing re-dial: connect, then let the node emit HELLO via on-connect
+/// (mirrors the init dial sequence; re-enters the node, so not a `perform` effect).
+fn execute_dial(s: &mut SysState, pubkey: String, address: String, host: &Host, node: &NodeApi) {
+    match (host.tcp_connect)(address.clone()) {
+        Ok(conn) => {
+            let _ = (host.tcp_activate)(conn.clone());
+            let _ = (host.tcp_set_active)(conn.clone(), alloc::string::ToString::to_string("active"));
+            let (n, out) = (node.on_connect)(core::mem::take(&mut s.node), conn, true, pubkey);
+            s.node = n;
+            perform(out, host);
+        }
+        Err(e) => (host.log)(format!("[mesh-system] re-dial {} failed: {}", address, e)),
+    }
+}
+
+/// `timer.handle-tick`: delivery + anti-entropy + self-healing re-dial.
 pub fn run_tick(s: &mut SysState, host: &Host, node: &NodeApi) {
     let (n, out) = (node.tick)(core::mem::take(&mut s.node));
     s.node = n;
-    perform(out, host);
+    let (dials, rest) = take_dials(out);
+    perform(rest, host);
+    for (pubkey, address) in dials {
+        execute_dial(s, pubkey, address, host, node);
+    }
 }
 
 // ---- action helpers the entry's typed verbs build on ----
