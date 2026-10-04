@@ -86,6 +86,14 @@ pub struct NodeState {
     /// Monotonic tick counter — re-dial rate-limiting is tick-relative (node_tick has no clock).
     #[serde(default)]
     pub tick_count: u64,
+    /// The frontier (sorted head hashes, JSON) last re-advertised on tick. The tick
+    /// re-advertises FRAME_FRONTIER only when the local frontier CHANGES vs this — push-on-
+    /// change, not every tick — so a stable/forked/idle frontier is never re-advertised, which
+    /// stops the receiving peers from recomputing + re-streaming their catch-up delta each
+    /// tick (the 9c9b44a CPU-peg loop). Connect-time frontier exchange is separate + unconditional,
+    /// so cold-join is unaffected.
+    #[serde(default)]
+    pub last_adv_frontier_json: String,
 }
 
 fn ns_load(bytes: &[u8]) -> Result<NodeState, String> {
@@ -433,6 +441,7 @@ fn node_init(config: &str, now: u64) -> Result<(NodeState, InitPlan), String> {
         dials_json,
         redial_json: "{}".to_string(),
         tick_count: 0,
+        last_adv_frontier_json: String::new(),
     };
     Ok((state, InitPlan { listen_addr, tick_ms, dials }))
 }
@@ -477,6 +486,9 @@ fn node_resume(bytes: &[u8], config: &str) -> Result<(NodeState, InitPlan), Stri
     state.dials_json = serde_json::to_string(&dials).unwrap_or_else(|_| "[]".to_string());
     state.redial_json = "{}".to_string();
     state.tick_count = 0;
+    // Force a fresh frontier re-advertise on the first post-resume tick (connections were just
+    // reset, so the reconnected peers should hear our frontier again).
+    state.last_adv_frontier_json = String::new();
 
     log(format!("[mesh] resume self_head={}", state.self_head_hex));
     Ok((state, InitPlan { listen_addr, tick_ms, dials }))
@@ -701,14 +713,23 @@ fn node_tick(state: NodeState) -> Result<(NodeState, Outbox), String> {
 
     deliver_committed(&dag, &conns, &state.app_id, &mut delivered, &mut finality, &mut out);
 
-    let frontier = all_heads(&dag);
-    if !frontier.is_empty() {
+    // Anti-entropy: re-advertise our frontier ONLY when it changed since the last tick
+    // (push-on-change). Re-advertising a stable frontier every tick is what let a forked/behind
+    // peer recompute + re-stream its full catch-up delta every tick — the CPU-peg loop. New
+    // peers still get the frontier unconditionally at connect, so cold-join is unaffected.
+    let mut frontier = all_heads(&dag);
+    frontier.sort_unstable();
+    let frontier_json = hashes_to_json(&frontier);
+    let frontier_changed = frontier_json != state.last_adv_frontier_json;
+    if !frontier.is_empty() && frontier_changed {
         for (cid, cs) in &conns {
             if matches!(cs.phase, Phase::Authed { .. }) {
                 out.push(Effect::Send(cid.clone(), encode_hashes(FRAME_FRONTIER, &frontier)));
             }
         }
     }
+    let last_adv_frontier_json =
+        if frontier_changed { frontier_json } else { state.last_adv_frontier_json.clone() };
     let ready_sent = maybe_emit_ready(&state.app_id, state.ready_sent, &mut out);
 
     // Self-healing re-dial: for every configured peer with no live/in-flight connection,
@@ -738,6 +759,7 @@ fn node_tick(state: NodeState) -> Result<(NodeState, Outbox), String> {
             ready_sent,
             tick_count,
             redial_json,
+            last_adv_frontier_json,
             ..state
         },
         out,
