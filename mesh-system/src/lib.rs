@@ -81,7 +81,7 @@ pack_types! {
         // so it KEEPS its state-threaded shape through the in-module-state migration.
         node {
             init: func(config: string, now: u64) -> result<tuple<list<u8>, list<u8>>, string>,
-            resume: func(bytes: list<u8>, config: string) -> result<tuple<list<u8>, list<u8>>, string>,
+            resume: func(events: list<list<u8>>, config: string) -> result<tuple<list<u8>, list<u8>>, string>,
             on-connect: func(state: list<u8>, conn: string, dialed: bool, peer: string) -> tuple<list<u8>, list<list<u8>>>,
             on-bytes: func(state: list<u8>, conn: string, data: list<u8>, now: u64) -> tuple<list<u8>, list<list<u8>>>,
             on-close: func(state: list<u8>, conn: string) -> list<u8>,
@@ -148,7 +148,7 @@ fn store_at_label(store_id: String, label: String, content: Vec<u8>) -> Result<S
 #[import_from("node", name = "init")]
 fn node_init(config: String, now: u64) -> Result<(Vec<u8>, Vec<u8>), String>;
 #[import_from("node", name = "resume")]
-fn node_resume(bytes: Vec<u8>, config: String) -> Result<(Vec<u8>, Vec<u8>), String>;
+fn node_resume(events: Vec<Vec<u8>>, config: String) -> Result<(Vec<u8>, Vec<u8>), String>;
 #[import_from("node", name = "on-connect")]
 fn node_on_connect(state: Vec<u8>, conn: String, dialed: bool, peer: String) -> (Vec<u8>, Vec<Vec<u8>>);
 #[import_from("node", name = "on-bytes")]
@@ -198,8 +198,10 @@ fn err_result(msg: &str) -> Value {
 // ---- effect + init-plan decoders (mirror the node's encoders) ----
 
 /// Perform each effect the node returned: `[kind:u8][id-len:u16 BE][id][payload]`
-/// (0=tcp send, 1=message-server send to app, 2=tcp close).
-fn perform(effects: Vec<Vec<u8>>) {
+/// (0=tcp send, 1=message-server send to app, 2=tcp close, 4=persist event, 5=persist index).
+/// `store_id` is the durable store (empty = persistence off). Dials (kind 3) are handled by the
+/// caller (they re-enter the node), not here.
+fn perform(effects: Vec<Vec<u8>>, store_id: &str) {
     for e in effects {
         if e.len() < 3 {
             continue;
@@ -220,6 +222,14 @@ fn perform(effects: Vec<Vec<u8>>) {
             }
             2 => {
                 let _ = tcp_close(id);
+            }
+            // Incremental persistence: store the event (id = its hash) / the boot index (id =
+            // the index label) under its label. Content-addressed + immutable, so each event is
+            // written once; no whole-DAG snapshot. No-op if persistence is off.
+            4 | 5 if !store_id.is_empty() => {
+                if let Err(err) = store_at_label(store_id.to_string(), id, payload) {
+                    log(format!("[mesh-system] persist (kind {}) failed: {}", kind, err));
+                }
             }
             _ => {}
         }
@@ -251,7 +261,7 @@ fn take_dials(effects: Vec<Vec<u8>>) -> (Vec<(String, String)>, Vec<Vec<u8>>) {
 /// Execute a self-healing re-dial the node asked for on tick: connect, then let the node
 /// emit its HELLO via `on-connect(dialed=true)`. Mirrors the init dial sequence; not
 /// expressible as a `perform` effect because it re-enters the node and mutates the cell.
-fn execute_dial(pubkey: String, address: String) {
+fn execute_dial(pubkey: String, address: String, store_id: &str) {
     match tcp_connect(address.clone()) {
         Ok(conn_id) => {
             let _ = tcp_activate(conn_id.clone());
@@ -262,7 +272,7 @@ fn execute_dial(pubkey: String, address: String) {
                 s.node = node;
                 out
             });
-            perform(out);
+            perform(out, store_id);
         }
         Err(e) => log(format!("[mesh-system] re-dial {} failed: {}", address, e)),
     }
@@ -310,30 +320,40 @@ fn decode_init_plan(b: &[u8]) -> (String, u64, alloc::vec::Vec<(String, String)>
 }
 
 // ---- durable persistence (cold-boot recovery) ----
+//
+// INCREMENTAL model: the node emits a Persist effect per admitted event (stored once under a
+// label = its 64-char hash hex, immutable + content-addressed) and a PersistIndex effect (the
+// concatenated hash list) when the admitted set grows — both performed in `perform()`. There is
+// NO whole-DAG snapshot. On cold boot we load the index, fetch each event blob by its hash
+// label, and hand the blobs to `node_resume` to rebuild. This replaces the old O(n²)
+// whole-state-snapshot-per-event (71KB of chat → 2.1GB) with O(1)-per-event writes.
 
-/// The store label under which this node's state blob lives.
-const NODE_STATE_LABEL: &str = "node-state";
+/// The store label the boot index (admitted event-hash list) lives under. Must match the node's.
+const PERSIST_INDEX_LABEL: &str = "node-index";
 
-/// Write the node blob to the durable store. No-op if persistence is off (store_id empty).
-/// Content-addressed store: store-at-label stores the new bytes + repoints the label at them.
-fn persist(store_id: &str, node: &[u8]) {
-    if store_id.is_empty() {
-        return;
-    }
-    if let Err(e) = store_at_label(store_id.to_string(), NODE_STATE_LABEL.to_string(), node.to_vec()) {
-        log(format!("[mesh-system] persist failed: {}", e));
-    }
-}
-
-/// Read a previously-persisted node blob, if any. None on first boot or persistence-off.
-fn load_persisted(store_id: &str) -> Option<Vec<u8>> {
+/// Load the persisted event blobs for cold-boot resume: read the index, chunk it into 64-char
+/// hash labels, fetch each event. None on first boot (no index) or persistence-off.
+fn load_events(store_id: &str) -> Option<Vec<Vec<u8>>> {
     if store_id.is_empty() {
         return None;
     }
-    match store_get_by_label(store_id.to_string(), NODE_STATE_LABEL.to_string()) {
-        Ok(Some(content_ref)) => store_get(store_id.to_string(), content_ref).ok(),
-        _ => None,
+    let index_ref = store_get_by_label(store_id.to_string(), PERSIST_INDEX_LABEL.to_string()).ok()??;
+    let index = store_get(store_id.to_string(), index_ref).ok()?;
+    let index = String::from_utf8(index).ok()?;
+    let mut events = Vec::new();
+    for chunk in index.as_bytes().chunks(64) {
+        let label = String::from_utf8_lossy(chunk).into_owned();
+        if let Ok(Some(ev_ref)) = store_get_by_label(store_id.to_string(), label.clone()) {
+            if let Ok(bytes) = store_get(store_id.to_string(), ev_ref) {
+                events.push(bytes);
+            } else {
+                log(format!("[mesh-system] resume: event blob {} unreadable", label));
+            }
+        } else {
+            log(format!("[mesh-system] resume: event {} missing from store", label));
+        }
     }
+    Some(events)
 }
 
 // ---- theater lifecycle handlers (the entry: own I/O, drive the node) ----
@@ -351,13 +371,12 @@ fn init(config: Value) -> Value {
 
     // Cold-boot recovery: resume from the persisted blob if present (keeps identity + chain +
     // frontier), else first-boot init (fresh genesis).
-    let (mut node, plan) = match load_persisted(&store_id) {
-        Some(bytes) => match node_resume(bytes, config.clone()) {
+    let (mut node, plan) = match load_events(&store_id) {
+        Some(events) => match node_resume(events, config.clone()) {
             Ok(v) => {
-                log("[mesh-system] resumed from persisted node-state".to_string());
+                log("[mesh-system] resumed from persisted events".to_string());
                 v
             }
-            // A corrupt / seed-mismatched blob is a hard error — fail loud, don't silently re-genesis.
             Err(e) => return err_result(&format!("resume failed: {}", e)),
         },
         None => match node_init(config, now()) {
@@ -389,14 +408,14 @@ fn init(config: Value) -> Value {
                 let _ = tcp_set_active(conn_id.clone(), "active".to_string());
                 let (n2, out) = node_on_connect(node, conn_id, true, pk);
                 node = n2;
-                perform(out);
+                perform(out, &store_id);
             }
             Err(e) => log(format!("[mesh-system] dial {} failed: {}", addr, e)),
         }
     }
 
-    // Persist the initial/rehydrated state so a subsequent cold boot finds it.
-    persist(&store_id, &node);
+    // No explicit persist here: the node persists each event incrementally via Persist effects
+    // (the genesis lands on the first tick). SysState holds the store id for perform() to use.
     SysState::set(SysState { listener_id, store_id, node });
     ok_unit()
 }
@@ -409,28 +428,28 @@ fn handle_connection(conn_id: String) -> Value {
         let _ = tcp_close(conn_id);
         return ok_unit();
     }
-    let out = SysState::with_mut(|s| {
+    let (out, store_id) = SysState::with_mut(|s| {
         let node = core::mem::take(&mut s.node);
         let (node, out) = node_on_connect(node, conn_id, false, String::new());
         s.node = node;
-        out
+        (out, s.store_id.clone())
     });
-    perform(out);
+    perform(out, &store_id);
     ok_unit()
 }
 
 #[export(name = "theater:simple/tcp-client.on-data")]
 fn on_data(conn_id: String, data: Vec<u8>) -> Value {
     let now = now();
-    let out = SysState::with_mut(|s| {
+    let (out, store_id) = SysState::with_mut(|s| {
         let node = core::mem::take(&mut s.node);
         let (node, out) = node_on_bytes(node, conn_id, data, now);
         s.node = node;
-        // Ingested gossip grows the DAG — persist so a cold boot has the synced events.
-        persist(&s.store_id, &s.node);
-        out
+        // Ingested gossip grows the DAG — the node emits a Persist effect per new event, stored
+        // incrementally by perform() below (no whole-DAG snapshot).
+        (out, s.store_id.clone())
     });
-    perform(out);
+    perform(out, &store_id);
     ok_unit()
 }
 
@@ -445,17 +464,17 @@ fn on_close(conn_id: String, _reason: String) -> Value {
 
 #[export(name = "theater:simple/timer.handle-tick")]
 fn handle_tick(_timer_name: String) -> Value {
-    let out = SysState::with_mut(|s| {
+    let (out, store_id) = SysState::with_mut(|s| {
         let node = core::mem::take(&mut s.node);
         let (node, out) = node_tick(node);
         s.node = node;
-        out
+        (out, s.store_id.clone())
     });
     // Re-dials re-enter the node, so they can't ride `perform` — split and run them after.
     let (dials, rest) = take_dials(out);
-    perform(rest);
+    perform(rest, &store_id);
     for (pubkey, address) in dials {
-        execute_dial(pubkey, address);
+        execute_dial(pubkey, address, &store_id);
     }
     ok_unit()
 }
@@ -472,15 +491,14 @@ fn author_rpc(input: Value) -> Value {
     // so it IS the event's canonical timestamp — returned so a caller can apply optimistically
     // with the same ts every replica will fold (mesh-client Session::author).
     let ts = now();
-    let (ok, data, out) = SysState::with_mut(|s| {
+    let (ok, data, out, store_id) = SysState::with_mut(|s| {
         let node = core::mem::take(&mut s.node);
         let (node, ok, data, out) = node_author(node, payload, ts);
         s.node = node;
-        // A new local event advanced self_head + the DAG — persist for cold-boot durability.
-        persist(&s.store_id, &s.node);
-        (ok, data, out)
+        // The authored event is persisted incrementally via a Persist effect in `out`.
+        (ok, data, out, s.store_id.clone())
     });
-    perform(out);
+    perform(out, &store_id);
     // A validation rejection is carried IN-BAND as tuple<ok, data, ts> (never result::err,
     // which theater would treat as a fault). data = hash on success, reason on rejection.
     ok_result(Value::Tuple(alloc::vec![Value::Bool(ok), Value::from(data), Value::U64(ts)]))
@@ -514,12 +532,12 @@ fn subscribe_rpc(input: Value) -> Value {
         Ok(s) => s,
         Err(e) => return err_result(&format!("rpc subscribe: actor-id not a string: {:?}", e)),
     };
-    let out = SysState::with_mut(|s| {
+    let (out, store_id) = SysState::with_mut(|s| {
         let node = core::mem::take(&mut s.node);
         let (node, out) = node_subscribe(node, actor_id);
         s.node = node;
-        out
+        (out, s.store_id.clone())
     });
-    perform(out);
+    perform(out, &store_id);
     ok_result(Value::Bool(true))
 }

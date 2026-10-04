@@ -86,14 +86,10 @@ pub struct NodeState {
     /// Monotonic tick counter — re-dial rate-limiting is tick-relative (node_tick has no clock).
     #[serde(default)]
     pub tick_count: u64,
-    /// The frontier (sorted head hashes, JSON) last re-advertised on tick. The tick
-    /// re-advertises FRAME_FRONTIER only when the local frontier CHANGES vs this — push-on-
-    /// change, not every tick — so a stable/forked/idle frontier is never re-advertised, which
-    /// stops the receiving peers from recomputing + re-streaming their catch-up delta each
-    /// tick (the 9c9b44a CPU-peg loop). Connect-time frontier exchange is separate + unconditional,
-    /// so cold-join is unaffected.
+    /// Event hashes already emitted as a Persist effect (durable-write watermark), so each
+    /// admitted event is stored exactly once incrementally — not re-serialized per event.
     #[serde(default)]
-    pub last_adv_frontier_json: String,
+    pub persisted_json: String,
 }
 
 fn ns_load(bytes: &[u8]) -> Result<NodeState, String> {
@@ -118,6 +114,15 @@ enum Effect {
     /// init-style dial sequence (connect → `on-connect(dialed=true)` → HELLO) so the node
     /// re-enters the handshake. Emitted by `node_tick` for self-healing reconnect.
     Dial(String, String),
+    /// Durably persist one admitted event: `Persist(event_hash_hex, encoded_event)`. The
+    /// system stores the (immutable, content-addressed) event under a label = its hash. Emitted
+    /// once per event as it's admitted — incremental, O(1), replacing the old whole-DAG
+    /// snapshot-per-event (the O(n²) persistence). Events are the only durable state.
+    Persist(String, Vec<u8>),
+    /// Persist the small boot index (the list of admitted event-hashes) so a cold boot knows
+    /// which event blobs to reload. Emitted when the admitted set grows. Everything else
+    /// (signing key, self_head, finality, dials) is re-derived or reset on resume.
+    PersistIndex(Vec<u8>),
 }
 
 type Outbox = Vec<Effect>;
@@ -157,7 +162,7 @@ pack_types! {
         // boundary. Pure: state in/out is opaque bytes, effects come back as data.
         node {
             init: func(config: string, now: u64) -> result<tuple<list<u8>, list<u8>>, string>,
-            resume: func(bytes: list<u8>, config: string) -> result<tuple<list<u8>, list<u8>>, string>,
+            resume: func(events: list<list<u8>>, config: string) -> result<tuple<list<u8>, list<u8>>, string>,
             on-connect: func(state: list<u8>, conn: string, dialed: bool, peer: string) -> tuple<list<u8>, list<list<u8>>>,
             on-bytes: func(state: list<u8>, conn: string, data: list<u8>, now: u64) -> tuple<list<u8>, list<list<u8>>>,
             on-close: func(state: list<u8>, conn: string) -> list<u8>,
@@ -201,6 +206,8 @@ fn sm_members(state: Value) -> Vec<Vec<u8>>;
 
 const LISTEN_ADDR: &str = "127.0.0.1:9447";
 const DEFAULT_INTERVAL_MS: u64 = 2000;
+/// Store label the boot index (admitted event-hash list) is persisted under.
+const PERSIST_INDEX_LABEL: &str = "node-index";
 
 #[derive(serde::Deserialize)]
 struct InitConfig {
@@ -234,8 +241,8 @@ fn export_init(config: String, now: u64) -> Result<(Vec<u8>, Vec<u8>), String> {
 }
 
 #[export(name = "resume")]
-fn export_resume(bytes: Vec<u8>, config: String) -> Result<(Vec<u8>, Vec<u8>), String> {
-    let (state, plan) = node_resume(&bytes, &config)?;
+fn export_resume(events: Vec<Vec<u8>>, config: String) -> Result<(Vec<u8>, Vec<u8>), String> {
+    let (state, plan) = node_resume(events, &config)?;
     Ok((ns_save(&state), encode_init_plan(&plan)))
 }
 
@@ -373,6 +380,10 @@ fn encode_effect(e: &Effect) -> Vec<u8> {
         Effect::App(i, b) => (1, i.as_str(), b),
         Effect::Close(c) => (2, c.as_str(), &[]),
         Effect::Dial(pk, addr) => (3, addr.as_str(), pk.as_bytes()),
+        // id = store label (event hash hex), payload = the encoded event.
+        Effect::Persist(hash_hex, event) => (4, hash_hex.as_str(), event),
+        // id = the fixed index label, payload = the encoded boot index.
+        Effect::PersistIndex(index) => (5, PERSIST_INDEX_LABEL, index),
     };
     let mut v = Vec::with_capacity(3 + id.len() + payload.len());
     v.push(kind);
@@ -441,18 +452,22 @@ fn node_init(config: &str, now: u64) -> Result<(NodeState, InitPlan), String> {
         dials_json,
         redial_json: "{}".to_string(),
         tick_count: 0,
-        last_adv_frontier_json: String::new(),
+        // Nothing persisted yet — the genesis (and later events) get Persist effects on the
+        // first Outbox-producing call (tick/author/on_bytes) via persist_new_events.
+        persisted_json: "[]".to_string(),
     };
     Ok((state, InitPlan { listen_addr, tick_ms, dials }))
 }
 
-/// Cold-start rehydrate (node.pact `resume`): rebuild from PERSISTED node-state bytes instead
-/// of re-authoring genesis. The init plan (listen/tick/dials) comes from `config` exactly like
-/// `init` — the system re-establishes sockets — but the node-state is the persisted blob, so
-/// identity + chain + finality frontier are kept intact (the node reconciles with peers on
-/// rejoin). Validates the blob, checks its identity matches config's node_seed, and resets the
-/// transient fields (connections + subscriber don't survive a restart).
-fn node_resume(bytes: &[u8], config: &str) -> Result<(NodeState, InitPlan), String> {
+/// Cold-start rehydrate (node.pact `resume`): rebuild the DAG from the PERSISTED EVENT BLOBS
+/// (the system loaded them from the store by the boot index) instead of re-authoring genesis.
+/// Each event was stored once, immutably + content-addressed — so this is just
+/// decode-and-ingest; the DAG's orphan buffer resolves any out-of-order deps. Identity is
+/// RE-DERIVED from config's `node_seed` (the signing key is never persisted — no key-at-rest);
+/// self_head + finality are recomputed from the events; dials come from config; the transient
+/// fields (connections, subscriber, redial timing) start fresh. The init plan (listen/tick/
+/// dials) comes from `config` exactly like `init`.
+fn node_resume(events: Vec<Vec<u8>>, config: &str) -> Result<(NodeState, InitPlan), String> {
     let cfg: InitConfig =
         serde_json::from_str(config).map_err(|e| format!("parse resume config: {}", e))?;
     let tick_ms = cfg.tick_ms.unwrap_or(DEFAULT_INTERVAL_MS);
@@ -460,37 +475,44 @@ fn node_resume(bytes: &[u8], config: &str) -> Result<(NodeState, InitPlan), Stri
     let dials: Vec<(String, String)> =
         cfg.dial.iter().map(|p| (p.pubkey.clone(), p.address.clone())).collect();
 
-    let mut state = ns_load(bytes)?;
-
-    // Identity integrity: the persisted signing key MUST match config's node_seed. A mismatch
-    // means a wrong data-dir / seed pairing, which would silently fork the identity — fail loud.
+    // Re-derive identity from config — the key never touches disk.
     let mut h = Sha256::new();
     h.update(cfg.node_seed.as_bytes());
     let key_bytes: [u8; 32] = h.finalize().into();
-    if state.signing_key_hex != hex(&key_bytes) {
-        return Err("resume: persisted signing key != config node_seed (wrong data-dir or seed?)".to_string());
-    }
-    // Fail loud on a corrupt blob: the persisted DAG must decode and carry a head.
-    dag_from_json(&state.dag_json)?;
-    if state.self_head_hex.is_empty() {
-        return Err("resume: persisted state has no self_head".to_string());
-    }
+    let self_pubkey = SigningKey::from_bytes(&key_bytes).verifying_key().to_bytes();
 
-    // Reset transient fields — the sockets and the subscribed app are gone across a restart;
-    // the system re-dials the plan's peers and the app re-subscribes.
-    state.connections_json = connections_to_json(&BTreeMap::new());
-    state.app_id = String::new();
-    state.ready_sent = false;
-    // Refresh the dial set from config (authoritative for peers) + reset the tick-relative
-    // re-dial timing, so self-healing dial re-establishes the mesh cleanly after a restart.
-    state.dials_json = serde_json::to_string(&dials).unwrap_or_else(|_| "[]".to_string());
-    state.redial_json = "{}".to_string();
-    state.tick_count = 0;
-    // Force a fresh frontier re-advertise on the first post-resume tick (connections were just
-    // reset, so the reconnected peers should hear our frontier again).
-    state.last_adv_frontier_json = String::new();
+    // Rebuild the DAG from the persisted event blobs. They're already written, so they seed the
+    // persist-watermark (never re-stored). Ingest tolerates any order (the buffer resolves deps).
+    let mut dag = Dag::new();
+    let mut persisted: BTreeSet<Hash> = BTreeSet::new();
+    for blob in &events {
+        match Event::decode(blob) {
+            Ok(ev) => {
+                persisted.insert(ev.event_hash());
+                let _ = dag.ingest(ev);
+            }
+            Err(e) => log(format!("[mesh] resume: skipping undecodable event blob: {}", e)),
+        }
+    }
+    // Our own chain head = a head among events we authored (empty if we've authored none yet).
+    let self_head = dag.heads_of(&self_pubkey).into_iter().next();
+    log(format!("[mesh] resume self={} events={}", hex(&self_pubkey), dag.events.len()));
 
-    log(format!("[mesh] resume self_head={}", state.self_head_hex));
+    let state = NodeState {
+        signing_key_hex: hex(&key_bytes),
+        self_head_hex: self_head.map(|h| hex(&h)).unwrap_or_default(),
+        dag_json: dag_to_json(&dag),
+        pending_json: events_to_json(&dag.pending_events()),
+        delivered_json: "[]".to_string(),
+        final_json: "{}".to_string(),
+        connections_json: connections_to_json(&BTreeMap::new()),
+        app_id: String::new(),
+        ready_sent: false,
+        dials_json: serde_json::to_string(&dials).unwrap_or_else(|_| "[]".to_string()),
+        redial_json: "{}".to_string(),
+        tick_count: 0,
+        persisted_json: hashes_to_json(&persisted.iter().copied().collect::<Vec<_>>()),
+    };
     Ok((state, InitPlan { listen_addr, tick_ms, dials }))
 }
 
@@ -528,6 +550,8 @@ fn node_on_bytes(state: NodeState, conn_id: String, data: Vec<u8>, now: u64) -> 
     };
     let mut delivered: BTreeSet<Hash> =
         hashes_from_json(&state.delivered_json).into_iter().collect();
+    let mut persisted: BTreeSet<Hash> =
+        hashes_from_json(&state.persisted_json).into_iter().collect();
     let mut finality: BTreeMap<Hash, bool> = finality_from_json(&state.final_json);
     let mut out: Outbox = Vec::new();
 
@@ -620,6 +644,7 @@ fn node_on_bytes(state: NodeState, conn_id: String, data: Vec<u8>, now: u64) -> 
         conns.insert(conn_id.clone(), conn_state);
     }
     deliver_committed(&dag, &conns, &state.app_id, &mut delivered, &mut finality, &mut out);
+    persist_new_events(&dag, &mut persisted, &mut out);
     let ready_sent = maybe_emit_ready(&state.app_id, state.ready_sent, &mut out);
 
     let delivered_vec: Vec<Hash> = delivered.iter().copied().collect();
@@ -628,6 +653,7 @@ fn node_on_bytes(state: NodeState, conn_id: String, data: Vec<u8>, now: u64) -> 
             dag_json: dag_to_json(&dag),
             pending_json: events_to_json(&dag.pending_events()),
             delivered_json: hashes_to_json(&delivered_vec),
+            persisted_json: hashes_to_json(&persisted.iter().copied().collect::<Vec<_>>()),
             final_json: finality_to_json(&finality),
             connections_json: connections_to_json(&conns),
             self_head_hex: self_head.map(|h| hex(&h)).unwrap_or_default(),
@@ -708,28 +734,26 @@ fn node_tick(state: NodeState) -> Result<(NodeState, Outbox), String> {
     let conns = connections_from_json(&state.connections_json);
     let mut delivered: BTreeSet<Hash> =
         hashes_from_json(&state.delivered_json).into_iter().collect();
+    let mut persisted: BTreeSet<Hash> =
+        hashes_from_json(&state.persisted_json).into_iter().collect();
     let mut finality: BTreeMap<Hash, bool> = finality_from_json(&state.final_json);
     let mut out: Outbox = Vec::new();
 
     deliver_committed(&dag, &conns, &state.app_id, &mut delivered, &mut finality, &mut out);
+    persist_new_events(&dag, &mut persisted, &mut out);
 
-    // Anti-entropy: re-advertise our frontier ONLY when it changed since the last tick
-    // (push-on-change). Re-advertising a stable frontier every tick is what let a forked/behind
-    // peer recompute + re-stream its full catch-up delta every tick — the CPU-peg loop. New
-    // peers still get the frontier unconditionally at connect, so cold-join is unaffected.
-    let mut frontier = all_heads(&dag);
-    frontier.sort_unstable();
-    let frontier_json = hashes_to_json(&frontier);
-    let frontier_changed = frontier_json != state.last_adv_frontier_json;
-    if !frontier.is_empty() && frontier_changed {
+    // Anti-entropy: re-advertise our frontier every tick to authed peers. It's cheap (just the
+    // head hashes; the peer WANTs what it lacks), and it doubles as a liveness keepalive — both
+    // directions see a packet each tick, so a NAT/conntrack idle-eviction can't drop a quiet
+    // (e.g. one-directional cold-sync) conn once the node isn't blocked on a long write.
+    let frontier = all_heads(&dag);
+    if !frontier.is_empty() {
         for (cid, cs) in &conns {
             if matches!(cs.phase, Phase::Authed { .. }) {
                 out.push(Effect::Send(cid.clone(), encode_hashes(FRAME_FRONTIER, &frontier)));
             }
         }
     }
-    let last_adv_frontier_json =
-        if frontier_changed { frontier_json } else { state.last_adv_frontier_json.clone() };
     let ready_sent = maybe_emit_ready(&state.app_id, state.ready_sent, &mut out);
 
     // Self-healing re-dial: for every configured peer with no live/in-flight connection,
@@ -755,11 +779,11 @@ fn node_tick(state: NodeState) -> Result<(NodeState, Outbox), String> {
             dag_json: dag_to_json(&dag),
             pending_json: events_to_json(&dag.pending_events()),
             delivered_json: hashes_to_json(&delivered_vec),
+            persisted_json: hashes_to_json(&persisted.iter().copied().collect::<Vec<_>>()),
             final_json: finality_to_json(&finality),
             ready_sent,
             tick_count,
             redial_json,
-            last_adv_frontier_json,
             ..state
         },
         out,
@@ -778,6 +802,7 @@ fn node_author(state: NodeState, payload: Vec<u8>, now: u64) -> Result<(NodeStat
         Some(from_hex32(&state.self_head_hex)?)
     };
     let mut delivered: BTreeSet<Hash> = hashes_from_json(&state.delivered_json).into_iter().collect();
+    let mut persisted: BTreeSet<Hash> = hashes_from_json(&state.persisted_json).into_iter().collect();
     let mut finality: BTreeMap<Hash, bool> = finality_from_json(&state.final_json);
     let mut out: Outbox = Vec::new();
 
@@ -786,11 +811,13 @@ fn node_author(state: NodeState, payload: Vec<u8>, now: u64) -> Result<(NodeStat
     if result.is_ok() {
         deliver_committed(&dag, &conns, &state.app_id, &mut delivered, &mut finality, &mut out);
     }
+    persist_new_events(&dag, &mut persisted, &mut out);
     let delivered_vec: Vec<Hash> = delivered.iter().copied().collect();
     let new_state = NodeState {
         dag_json: dag_to_json(&dag),
         pending_json: events_to_json(&dag.pending_events()),
         delivered_json: hashes_to_json(&delivered_vec),
+        persisted_json: hashes_to_json(&persisted.iter().copied().collect::<Vec<_>>()),
         final_json: finality_to_json(&finality),
         self_head_hex: new_self_head.map(|h| hex(&h)).unwrap_or_default(),
         ..state
@@ -927,9 +954,8 @@ fn step_accepted(
         out.push(Effect::Close(conn_id.to_string()));
         return Step::Close;
     }
-    // Batch the initial head-WANT into one frame (the peer frontier the server sent in
-    // ACCEPTED); the full catch-up then arrives as the server's frontier-delta stream once it
-    // sees our frontier below.
+    // WANT the heads from the peer's ACCEPTED frontier that we lack, batched into one frame;
+    // the backward catch-up walk then pulls their missing deps as the events arrive.
     let want: Vec<Hash> =
         decode_hashes(&frame.payload).into_iter().filter(|h| !dag.has(h)).collect();
     if !want.is_empty() {
@@ -989,27 +1015,16 @@ fn handle_authed_frame(
             self_head
         }
         FRAME_FRONTIER => {
-            // The peer advertised its heads. Everything reachable from them is what it already
-            // has; stream the COMPLEMENT (our events it lacks) in topological order so it
-            // ingests deps-first in ONE burst — collapsing the old O(depth) backward
-            // WANT-per-layer catch-up walk to ~1 round trip. Pruned by the peer's frontier, so
-            // a warm re-sync (routine under self-healing dial) ships only the genuinely-new
-            // events, not the whole history; a cold join (peer frontier = just its genesis)
-            // gets the whole room at once. Safe because the peer buffers out-of-order and the
-            // SM apply is confluent, so a bulk topological stream folds to identical state.
-            let peer_frontier = decode_hashes(&frame.payload);
-            let peer_set: BTreeSet<Hash> = peer_frontier.iter().copied().collect();
-            // Skip the full ancestry walk when the peer already holds all our heads (the
-            // steady-state synced case — every 2s tick) so anti-entropy stays cheap.
-            if !all_heads(dag).iter().all(|h| peer_set.contains(h)) {
-                let peer_has = dag.ancestors_of(&peer_frontier);
-                let missing: BTreeSet<Hash> =
-                    dag.events.keys().copied().filter(|h| !peer_has.contains(h)).collect();
-                for h in dag.topo_sort(&missing) {
-                    if let Some(ev) = dag.events.get(&h) {
-                        out.push(Effect::Send(conn_id.to_string(), encode_deliver(&ev.encode())));
-                    }
-                }
+            // The peer advertised its heads; WANT the ones we lack. The peer answers each with
+            // the event, and as events arrive we discover + WANT their missing deps — a
+            // backward catch-up walk. (A one-burst ancestry-delta is the deferred scale
+            // optimization; not needed now that persistence no longer stalls the sync.)
+            let missing: Vec<Hash> = decode_hashes(&frame.payload)
+                .into_iter()
+                .filter(|h| !dag.has(h))
+                .collect();
+            if !missing.is_empty() {
+                out.push(Effect::Send(conn_id.to_string(), encode_hashes(FRAME_WANT, &missing)));
             }
             self_head
         }
@@ -1321,6 +1336,31 @@ fn apply_final(dag: &Dag, frontier: &[Hash], is_final: &BTreeMap<Hash, bool>) ->
     state
 }
 
+/// Incremental durable persistence: emit a `Persist` effect for each admitted event not yet
+/// written (O(new), each event stored once/immutable), plus one `PersistIndex` carrying the
+/// full admitted hash-list if anything new was written (so a cold boot knows what to reload).
+/// Replaces the old whole-DAG snapshot-per-event (the O(n²) stall). `persisted` is the
+/// write-watermark, mutated in place.
+fn persist_new_events(dag: &Dag, persisted: &mut BTreeSet<Hash>, out: &mut Outbox) {
+    let mut wrote = false;
+    for h in dag.ordered() {
+        if !persisted.contains(&h) {
+            if let Some(ev) = dag.events.get(&h) {
+                out.push(Effect::Persist(hex(&h), ev.encode()));
+                persisted.insert(h);
+                wrote = true;
+            }
+        }
+    }
+    if wrote {
+        // The index is just the admitted event-hashes concatenated as 64-char hex (no JSON, so
+        // the entry can parse it with a trivial chunk-by-64 and no serde dependency). The entry
+        // loads each event blob by this hash-label on cold boot.
+        let index: String = persisted.iter().map(|h| hex(h)).collect();
+        out.push(Effect::PersistIndex(index.into_bytes()));
+    }
+}
+
 /// Emit the Interface 3 stream: a `finalized` dag-node for each newly-final payload event
 /// (to authed TCP peers AND the subscribed app), or a fail-loud `conflict` for an admitted
 /// event invalid against its own ancestry (the checked "conflict-free" safety net).
@@ -1478,19 +1518,58 @@ mod redial_tests {
 
     #[test]
     fn resume_rehydrates_the_dial_set() {
-        // init with one dial peer, persist, then resume (same seed) with the same config:
-        // the dial-set must be rehydrated + the redial timing reset, so re-dial still works.
+        // init with one dial peer, take the persisted event blobs (just the genesis here), then
+        // resume (same seed) from them: the DAG rebuilds, the dial-set rehydrates from config +
+        // the redial timing resets, so re-dial still works.
         let (state, _) = node_init(&cfg(&[("aa", "1.1.1.1:9")]), 1).unwrap();
-        let persisted = ns_save(&state);
-        let (resumed, _) = node_resume(&persisted, &cfg(&[("aa", "1.1.1.1:9")])).unwrap();
+        let dag = dag_from_json(&state.dag_json).unwrap();
+        let events: Vec<Vec<u8>> = dag.events.values().map(|e| e.encode()).collect();
+        assert_eq!(events.len(), 1, "init produced one (genesis) event");
+        let (resumed, _) = node_resume(events, &cfg(&[("aa", "1.1.1.1:9")])).unwrap();
+
+        // The genesis survived the round-trip + seeds the persist-watermark (won't be re-stored).
+        let rebuilt = dag_from_json(&resumed.dag_json).unwrap();
+        assert_eq!(rebuilt.events.len(), 1, "resume rebuilt the DAG from the event blobs");
+        assert_eq!(
+            hashes_from_json(&resumed.persisted_json).len(),
+            1,
+            "resumed events seed the persist-watermark"
+        );
 
         let dials: Vec<(String, String)> = serde_json::from_str(&resumed.dials_json).unwrap();
-        assert_eq!(dials, vec![d("aa", "1.1.1.1:9")], "resume rehydrated the dial-set");
+        assert_eq!(dials, vec![d("aa", "1.1.1.1:9")], "resume rehydrated the dial-set from config");
         assert_eq!(resumed.redial_json, "{}", "resume reset per-peer redial timing");
         assert_eq!(resumed.tick_count, 0, "resume reset the tick counter");
 
         // And the rehydrated set drives a re-dial on the next tick.
         let (eff, _) = redial_plan(&dials, &BTreeMap::new(), BTreeMap::new(), 1);
         assert_eq!(dialed(&eff), vec![d("aa", "1.1.1.1:9")], "rehydrated dial-set re-dials");
+    }
+
+    #[test]
+    fn persist_new_events_is_incremental_and_idempotent() {
+        use ed25519_dalek::SigningKey;
+        let sk = SigningKey::from_bytes(&[7u8; 32]);
+        let mut dag = Dag::new();
+        let g = Event::sign(&sk, 0, None, Vec::new(), Vec::new());
+        let gh = g.event_hash();
+        dag.ingest(g).unwrap();
+        dag.ingest(Event::sign(&sk, 1, Some(gh), Vec::new(), b"x".to_vec())).unwrap();
+
+        // First drain: each event emitted once + a single index — O(new), not a whole-DAG blob.
+        let mut persisted = BTreeSet::new();
+        let mut out: Outbox = Vec::new();
+        persist_new_events(&dag, &mut persisted, &mut out);
+        let persists = out.iter().filter(|e| matches!(e, Effect::Persist(..))).count();
+        let indexes = out.iter().filter(|e| matches!(e, Effect::PersistIndex(..))).count();
+        assert_eq!(persists, 2, "both events emitted exactly one Persist each");
+        assert_eq!(indexes, 1, "one PersistIndex emitted when the admitted set grew");
+        assert_eq!(persisted.len(), 2, "watermark advanced to cover both events");
+
+        // Second drain, nothing new admitted: ZERO effects. This idempotence is what replaces
+        // the O(n²) whole-DAG-snapshot-per-event with O(1)-amortised incremental writes.
+        let mut out2: Outbox = Vec::new();
+        persist_new_events(&dag, &mut persisted, &mut out2);
+        assert!(out2.is_empty(), "no re-persist when nothing new — the O(n^2) is gone");
     }
 }

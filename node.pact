@@ -43,7 +43,7 @@ interface node {
         // restart), and KEEPS the persisted chain (self_head + DAG + finality) so identity +
         // frontier are intact and the node reconciles with peers on rejoin. Returns the
         // rehydrated `node-state` + the encoded init plan (same shape as `init`).
-        resume: func(bytes: list<u8>, config: string) -> result<tuple<list<u8>, list<u8>>, string>
+        resume: func(events: list<list<u8>>, config: string) -> result<tuple<list<u8>, list<u8>>, string>
 
         // A raw connection now exists: `dialed`=true for a peer WE dialed (the system
         // just `connect`ed it), false for an inbound accept. `peer` is the expected peer
