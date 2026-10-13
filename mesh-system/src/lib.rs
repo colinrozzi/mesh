@@ -371,7 +371,7 @@ fn init(config: Value) -> Value {
 
     // Cold-boot recovery: resume from the persisted blob if present (keeps identity + chain +
     // frontier), else first-boot init (fresh genesis).
-    let (mut node, plan) = match load_events(&store_id) {
+    let (node, plan) = match load_events(&store_id) {
         Some(events) => match node_resume(events, config.clone()) {
             Ok(v) => {
                 log("[mesh-system] resumed from persisted events".to_string());
@@ -384,13 +384,18 @@ fn init(config: Value) -> Value {
             Err(e) => return err_result(&e),
         },
     };
-    let (listen_addr, tick_ms, dials) = decode_init_plan(&plan);
+    let (listen_addr, tick_ms, _dials) = decode_init_plan(&plan);
 
-    let listener_id = match tcp_listen(listen_addr.clone()) {
-        Ok(id) => id,
-        Err(e) => return err_result(&format!("listen failed: {}", e)),
-    };
-    log(format!("[mesh-system] listening on {} (id={})", listen_addr, listener_id));
+    // FLOOD-ON-INIT FIX (A): init must do NO slow/dialing host I/O and return FAST. The op-loop
+    // is sequential — any inbound that lands while init is still the in-flight op is serviced
+    // *ahead* of init completing, so a reconnect storm (N fleet peers dialing the hub on restart)
+    // saturates the loop and starves init ("init has not returned"). The old inline dial loop
+    // (connect + on-connect + HELLO per peer) was the long pole in that window AND was fully
+    // redundant: node_tick's self-healing redial_plan dials every configured peer with no
+    // connection on the first tick (via execute_dial, byte-identical to the old loop). So we do
+    // NOT dial here; dialing + the resulting flood are handled in steady-state where the loop
+    // drains normally. Invariant for the whole node: handlers return effects fast, the executor
+    // does I/O, nothing synchronous-and-slow ever sits on the op-loop.
     if let Err(e) = timer_set_interval("tick".to_string(), tick_ms) {
         log(format!("[mesh-system] set-interval failed: {}", e));
     }
@@ -400,19 +405,13 @@ fn init(config: Value) -> Value {
         }
     }
 
-    // Dial each planned peer, then let the node emit its HELLO via on-connect.
-    for (pk, addr) in dials {
-        match tcp_connect(addr.clone()) {
-            Ok(conn_id) => {
-                let _ = tcp_activate(conn_id.clone());
-                let _ = tcp_set_active(conn_id.clone(), "active".to_string());
-                let (n2, out) = node_on_connect(node, conn_id, true, pk);
-                node = n2;
-                perform(out, &store_id);
-            }
-            Err(e) => log(format!("[mesh-system] dial {} failed: {}", addr, e)),
-        }
-    }
+    // Bind the listener LAST — inbound can only arrive once the timer + message-server are wired
+    // and init is about to return, so the starvation window is as small as possible.
+    let listener_id = match tcp_listen(listen_addr.clone()) {
+        Ok(id) => id,
+        Err(e) => return err_result(&format!("listen failed: {}", e)),
+    };
+    log(format!("[mesh-system] listening on {} (id={})", listen_addr, listener_id));
 
     // No explicit persist here: the node persists each event incrementally via Persist effects
     // (the genesis lands on the first tick). SysState holds the store id for perform() to use.
